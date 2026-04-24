@@ -135,7 +135,7 @@ Undefined variables stay literal and emit a warning.
 
 ## Multi-Instance Deployment
 
-Use a systemd template unit for running multiple instances:
+Use a `systemd` template unit for running multiple instances:
 
 ```ini
 # /etc/systemd/system/agent-daemon@.service
@@ -151,6 +151,10 @@ WantedBy=multi-user.target
 ```
 
 Enable instances: `systemctl enable --now agent-daemon@myteam.service`
+
+For a full production setup, including server layout, manual installation of
+the bundled template from `examples/deploy/agent-daemon@.service`, and update
+flow, see [docs/deployment.md](docs/deployment.md).
 
 ## Development
 
