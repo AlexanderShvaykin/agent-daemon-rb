@@ -177,3 +177,5 @@ systemctl start agent-daemon@support
 The `%i` specifier maps to a config file:
 `<install_dir>/configs_decrypted/%i.yml`. Configs with secrets are typically
 encrypted with SOPS and decrypted at deploy time.
+
+For an operator-oriented setup guide, see [deployment.md](deployment.md).
