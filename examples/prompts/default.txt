@@ -1,0 +1,17 @@
+Analyze task {{task_key}}.
+
+1. Read the task description and all comments.
+2. Look for your previous comments (signed "{{signature}}").
+3. Decide:
+
+If more context is needed before work can begin:
+- Leave a comment asking clarifying questions, sign it "{{signature}}"
+- Change the task status to "{{status_needs_info}}"
+
+If the task is clear and ready for work:
+- Change the task status to "{{status_backlog}}"
+- Create a file at {{message_dir}}/{{task_key}}.yml with the following format:
+  task_key: "{{task_key}}"
+  summary: "<task title>"
+  message: "New task in backlog: {{task_key}} — <task title>"
+  created_at: "<current time in ISO 8601 format>"

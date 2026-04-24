@@ -1,0 +1,162 @@
+# frozen_string_literal: true
+
+require "yaml"
+require "time"
+require "fileutils"
+
+module AgentDaemon
+  module Runner
+    class Base
+      MAX_CONSECUTIVE_ERRORS = 3
+
+      attr_reader :name
+
+      def initialize(runner_config, message_dir, project_path, shutdown_flag)
+        @runner_config = runner_config
+        @message_dir = message_dir
+        @project_path = project_path
+        @shutdown_flag = shutdown_flag
+        @name = runner_config.fetch("name")
+        @max_attempts = runner_config.fetch("max_attempts")
+        @interval = runner_config.fetch("trigger").fetch("interval")
+        @attempts = Hash.new(0)
+        @consecutive_errors = 0
+        @backend = Backend.for(runner_config, shutdown_flag,
+                               message_dir: message_dir, project_path: project_path)
+        @prompt_template = PromptTemplate.new(runner_config.fetch("prompt_template_path"))
+      end
+
+      def run
+        Log.info("[#{log_tag}] Thread started")
+
+        until @shutdown_flag.value
+          iterate
+          wait_interval(@interval)
+        end
+
+        Log.info("[#{log_tag}] Thread stopping gracefully")
+      end
+
+      private
+
+      def log_tag
+        "Runner #{@name}"
+      end
+
+      def iterate
+        items = fetch_work_items_with_escalation
+        return if items.nil? || items.empty?
+
+        Log.info("[#{log_tag}] Found #{items.size} work item(s)")
+
+        items.each do |item|
+          break if @shutdown_flag.value
+          process_item(item)
+        end
+      rescue => e
+        Log.error("[#{log_tag}] Unexpected error: #{e.message}\n#{e.backtrace&.first(5)&.join("\n")}")
+        raise
+      end
+
+      def fetch_work_items_with_escalation
+        items = fetch_work_items
+        @consecutive_errors = 0
+        items
+      rescue => e
+        @consecutive_errors += 1
+        Log.error("[#{log_tag}] trigger error (#{@consecutive_errors}/#{MAX_CONSECUTIVE_ERRORS}): #{e.message}")
+
+        if @consecutive_errors >= MAX_CONSECUTIVE_ERRORS
+          create_error_message(e.message)
+          @consecutive_errors = 0
+        end
+
+        []
+      end
+
+      def process_item(item)
+        key = work_item_key(item)
+
+        if @attempts[key] >= @max_attempts
+          Log.error("[#{log_tag}] #{key} skipped: exhausted #{@max_attempts} attempts")
+          after_exhausted(item)
+          return
+        end
+
+        prompt = render_prompt(item)
+        @attempts[key] += 1
+        attempt_no = @attempts[key]
+        Log.info("[#{log_tag}] Running #{@runner_config['backend']} for #{key} (attempt #{attempt_no}/#{@max_attempts})")
+
+        result = @backend.run(prompt)
+
+        case result.reason
+        when :ok
+          @attempts.delete(key)
+          Log.info("[#{log_tag}] #{key} done: #{result.stdout.lines.first&.strip}")
+          Log.debug("[#{log_tag}] Full output:\n#{result.stdout}")
+          after_success(item)
+        when :timeout
+          Log.error("[#{log_tag}] CLI timeout for #{key} (attempt #{attempt_no}/#{@max_attempts})")
+          after_failure(item)
+        when :failed
+          Log.error("[#{log_tag}] CLI failed for #{key} (attempt #{attempt_no}/#{@max_attempts}): #{result.stderr.strip}")
+          after_failure(item)
+        when :killed
+          @attempts[key] -= 1
+          Log.info("[#{log_tag}] CLI killed for #{key} (shutdown), attempt rolled back")
+          after_killed(item)
+        end
+      end
+
+      # --- Extension points ---
+
+      def fetch_work_items
+        raise NotImplementedError, "#{self.class}#fetch_work_items"
+      end
+
+      def work_item_key(_item)
+        raise NotImplementedError, "#{self.class}#work_item_key"
+      end
+
+      def render_prompt(_item)
+        raise NotImplementedError, "#{self.class}#render_prompt"
+      end
+
+      def after_success(_item); end
+      def after_failure(_item); end
+      def after_killed(_item); end
+      def after_exhausted(_item); end
+
+      # --- Shared helpers ---
+
+      def create_error_message(error_text)
+        FileUtils.mkdir_p(@message_dir)
+        filename = "error-#{@name}-#{Time.now.strftime('%Y%m%d%H%M%S%L')}.yml"
+        path = ::File.join(@message_dir, filename)
+        content = {
+          "task_key"   => "SYSTEM:#{@name}",
+          "summary"    => "Runner #{@name} error",
+          "message"    => "Runner #{@name}: #{error_text.to_s.slice(0, 500)}",
+          "created_at" => Time.now.iso8601
+        }
+        ::File.write(path, content.to_yaml)
+        Log.warn("[#{log_tag}] Created error message file: #{path}")
+      end
+
+      def base_template_variables
+        vars = @runner_config.transform_keys(&:to_s).merge("message_dir" => @message_dir)
+        vars["output_dir"] = @runner_config["output_dir"] if @runner_config["output_dir"]
+        vars
+      end
+
+      def wait_interval(seconds)
+        elapsed = 0
+        while elapsed < seconds && !@shutdown_flag.value
+          sleep(1)
+          elapsed += 1
+        end
+      end
+    end
+  end
+end

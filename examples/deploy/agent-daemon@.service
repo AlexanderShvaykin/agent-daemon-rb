@@ -1,0 +1,25 @@
+# agent-daemon systemd template unit
+#
+# Do not install directly — use your deployment tool (e.g. ctl setup).
+# Placeholders __USER__ and __DIR__ are replaced during installation.
+
+[Unit]
+Description=Agent Daemon (%i)
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+Environment=PATH=/home/__USER__/.local/bin:/home/__USER__/.rbenv/shims:/usr/local/bin:/usr/bin:/bin
+ExecStart=__DIR__/bin/agent-daemon __DIR__/configs_decrypted/%i.yml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-daemon-%i
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+$stdout.sync = true
+
+require_relative "../lib/agent_daemon"
+
+config_path = ARGV[0] || File.join(__dir__, "..", "config.yml")
+
+unless File.exist?(config_path)
+  warn "Config not found: #{config_path}"
+  warn "Usage: #{$PROGRAM_NAME} [config.yml]"
+  exit 1
+end
+
+config = AgentDaemon::Config.new(config_path)
+AgentDaemon::Log.setup(config)
+AgentDaemon::Log.info("Loaded config from #{config_path}")
+
+daemon = AgentDaemon::Daemon.new(config)
+daemon.start

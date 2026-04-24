@@ -1,0 +1,81 @@
+# Agent Daemon — example configuration
+#
+# Copy this file, fill in your values, and pass the path to bin/agent-daemon:
+#   bin/agent-daemon /path/to/config.yml
+
+# Absolute path to the project where your agent CLI (Claude Code / OpenCode)
+# is configured (CLAUDE.md, .opencode.json, MCP settings, etc.).
+project_path: /home/deploy/my-project
+
+# Directory for YAML message files exchanged between runners and the Messenger.
+# Relative to project_path (or absolute). Default: "to_message".
+# When running multiple systemd instances, each MUST have a unique message_dir.
+# message_dir: to_message
+
+# Yandex Tracker API credentials (required only if you have tracker-type runners).
+tracker:
+  token: "your-oauth-token"
+  org_id: "your-cloud-org-id"
+  # base_url: "https://api.tracker.yandex.net"  # default
+
+# Each runner is a separate daemon thread with its own trigger, agent,
+# backend, and prompt template.
+runners:
+  # --- Example 1: Tracker runner (polls Yandex Tracker via JQL) ---
+  - name: triage
+    backend: claude            # "claude" (default) or "opencode"
+    agent: task-analyst        # --agent flag passed to the CLI
+    # extra_flags: ""          # additional CLI flags
+    # timeout: 1200            # single backend invocation timeout (seconds), default 20 min
+    # max_attempts: 3          # max retries per work item before skipping
+    trigger:
+      type: tracker
+      # Raw JQL query passed verbatim to /v2/issues/_search.
+      query: 'Queue: PROJ AND Status: "New"'
+      interval: 300            # polling interval in seconds (default 60)
+    prompt_template: prompts/default.txt
+    # output_dir: to_message   # set if the agent writes message files
+    #
+    # Any extra key here is available in the prompt template as {{key}}.
+    signature: "Best regards, Bot"
+    status_needs_info: "Needs Info"
+    status_backlog: "Backlog"
+
+  # --- Example 2: File runner (polls a directory for YAML work items) ---
+  - name: reviewer
+    backend: claude
+    agent: reviewer
+    max_attempts: 2
+    trigger:
+      type: file
+      input_dir: review_inbox            # relative to project_path
+      archive_dir: review_inbox/processed
+      failed_dir: review_inbox/failed
+      interval: 10                       # polling interval in seconds (default 10)
+    prompt_template: prompts/default.txt
+
+  # --- Example 3: OpenCode backend ---
+  # - name: support
+  #   backend: opencode
+  #   agent: support-agent
+  #   opencode:
+  #     model: anthropic/claude-sonnet-4-20250514
+  #     extra_flags: ""
+  #   trigger:
+  #     type: tracker
+  #     query: 'Queue: HELP AND Status: "Open"'
+  #     interval: 300
+  #   prompt_template: prompts/default.txt
+
+# Messenger thread — picks up YAML files from message_dir and POSTs them
+# to an incoming webhook (any service accepting JSON {text: "..."}).
+messenger:
+  interval: 30
+  webhook_url: "https://chat.example.com/hooks/your-webhook-token"
+
+logging:
+  level: info
+  # output: stdout or file (default: file)
+  # Use "stdout" when running under systemd/journald.
+  output: file
+  file: logs/agent-daemon.log

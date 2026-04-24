@@ -1,0 +1,9 @@
+*.gem
+*.rbc
+.bundle/
+vendor/
+Gemfile.lock
+pkg/
+tmp/
+.ruby-version
+.ruby-gemset
