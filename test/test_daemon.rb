@@ -23,14 +23,14 @@ class TestDaemon < Minitest::Test
     FileUtils.remove_entry(@tmpdir)
   end
 
-  def make_config(runners)
+  def make_config(runners, messenger: { "webhook_url" => "https://example.com/h" })
     path = File.join(@tmpdir, "config.yml")
     data = {
       "project_path" => @project_path,
       "tracker" => { "token" => "t", "org_id" => "o" },
-      "runners" => runners,
-      "messenger" => { "webhook_url" => "https://example.com/h" }
+      "runners" => runners
     }
+    data["messenger"] = messenger if messenger
     File.write(path, data.to_yaml)
     AgentDaemon::Config.new(path)
   end
@@ -66,6 +66,17 @@ class TestDaemon < Minitest::Test
     assert factories.key?(:"runner:a")
     assert factories.key?(:"runner:b")
     assert factories.key?(:messenger)
+  end
+
+  def test_daemon_skips_messenger_when_webhook_url_missing
+    config = make_config([tracker_runner("a")], messenger: nil)
+    daemon = AgentDaemon::Daemon.new(config)
+    daemon.send(:build_runner_factories)
+
+    factories = daemon.instance_variable_get(:@runner_factories)
+    assert_equal 1, factories.size
+    assert factories.key?(:"runner:a")
+    refute factories.key?(:messenger)
   end
 
   def test_runner_factory_for_tracker_returns_tracker_runner

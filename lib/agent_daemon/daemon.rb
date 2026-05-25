@@ -52,7 +52,11 @@ module AgentDaemon
         @runner_factories[thread_key(name)] = factory
       end
 
-      @runner_factories[:messenger] = -> { Messenger.new(@config, @shutdown_flag) }
+      if @config.messenger["webhook_url"].to_s.empty?
+        Log.info("[Messenger] webhook_url is not configured, messenger thread will not start")
+      else
+        @runner_factories[:messenger] = -> { Messenger.new(@config, @shutdown_flag) }
+      end
     end
 
     def runner_factory_for(runner_config)

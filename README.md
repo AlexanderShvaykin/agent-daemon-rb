@@ -38,7 +38,7 @@ runners:
       interval: 120
 
 messenger:
-  url: https://example.com/webhook
+  webhook_url: https://example.com/webhook
 ```
 
 2. Create a prompt template (`prompts/default.txt`):
@@ -66,7 +66,8 @@ Stop with `Ctrl+C` or `kill <pid>` -- graceful shutdown waits for current iterat
 | `tracker.org_id` | Yandex Tracker organization ID |
 | `tracker.base_url` | API base URL (default: `https://api.tracker.yandex.net`) |
 | `runners` | List of runner configurations (see below) |
-| `messenger.url` | Webhook URL for notifications |
+| `messenger.webhook_url` | Webhook URL for notifications (optional; if omitted, the messenger thread is not started) |
+| `messenger.interval` | Polling interval for outgoing messages in seconds (default: `30`) |
 | `logging.level` | Log level: `debug`, `info`, `warn`, `error` (default: `info`) |
 | `logging.file` | Log file path (default: stdout) |
 
