@@ -77,11 +77,30 @@ runners:
   #     interval: 300
   #   prompt_template: prompts/default.txt
 
-# Messenger thread — picks up YAML files from message_dir and POSTs them
-# to an incoming webhook (any service accepting JSON {text: "..."}).
+# Messenger thread — picks up YAML files from message_dir and delivers them
+# via the configured transport. Select the transport with `type` (default
+# "webhook"). The thread only starts when the selected transport is fully
+# configured.
 messenger:
   interval: 30
+
+  # --- webhook transport (default) ---
+  # POSTs JSON {text: "..."} to a single incoming webhook URL. Any `channel`
+  # or `user` routing fields in a message are ignored (one fixed destination).
+  type: webhook
   webhook_url: <%= secret('WEBHOOK_URL') %>   # or inline: "https://chat.example.com/hooks/..."
+
+  # --- mattermost transport (Loop bot REST API) ---
+  # Reaches any channel by name and DMs any user with one bot token. Messages
+  # may carry an optional `channel` or `user` field (resolved to ids and
+  # cached); messages with neither — including SYSTEM:<runner> errors — go to
+  # default_channel. The bot must be a member of (or allowed to post to) the
+  # target channels.
+  # type: mattermost
+  # base_url: "https://chat.example.com"      # Mattermost/Loop server root
+  # token: <%= secret('MM_BOT_TOKEN') %>      # bot access token
+  # team: your-team-slug                      # channel names resolve within this team
+  # default_channel: alerts                   # fallback for unaddressed messages
 
 logging:
   level: info

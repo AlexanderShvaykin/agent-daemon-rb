@@ -20,7 +20,14 @@ tracker:
   token: <%= secret('TRACKER_TOKEN') %>
 messenger:
   webhook_url: <%= secret('WEBHOOK_URL') %>
+  # or, for the mattermost transport, the bot access token:
+  # token: <%= secret('MM_BOT_TOKEN') %>
 ```
+
+The `mattermost` messenger transport authenticates with a Mattermost/Loop bot
+access token. Treat it like any other secret — resolve it via
+`token: <%= secret('MM_BOT_TOKEN') %>` rather than inlining it, and provision it
+through the same `sops exec-env` flow described below.
 
 `secret('KEY')`:
 

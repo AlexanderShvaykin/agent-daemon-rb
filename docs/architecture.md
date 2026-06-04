@@ -104,12 +104,47 @@ Requires `opencode.model` in the runner config.
 ## Messenger
 
 Polls `message_dir` for `*.yml` files every `messenger.interval` seconds. Each
-file must contain at least a `message` key. The Messenger POSTs
-`{"text": "<message>"}` to the configured `webhook_url`, then moves the file to
-a `sent/` subdirectory.
+file must contain at least a `message` key. The Messenger delegates delivery to
+a **transport** chosen by `messenger.type`, then moves the file to a `sent/`
+subdirectory on success.
 
 Three consecutive send failures log a critical warning but do not escalate
 further (there is no meta-notification path for the notifier itself).
+
+### Transports
+
+`Transport.for(messenger_config)` (`transport/base.rb`) dispatches on
+`messenger.type` — mirroring `Backend.for` — and returns a transport whose
+`deliver(message_data)` raises on failure (the Messenger's consecutive-error
+counting is unchanged). The `else` branch raises `ArgumentError` listing the
+valid values. Adding a transport means a new `transport/<name>.rb` plus a
+`when` clause.
+
+- **`webhook`** (default, `transport/webhook.rb`): POSTs `{"text": "<message>"}`
+  to `webhook_url`. Ignores any `channel`/`user` routing fields — a webhook is
+  a single fixed destination — so the same message YAML is portable across
+  transports.
+- **`mattermost`** (`transport/mattermost.rb`): posts via the Loop/Mattermost
+  bot REST API with one bot `token`. Resolves the bot id (`GET /users/me`),
+  `team` id (`GET /teams/name/{team}`), channel ids
+  (`GET /teams/{team_id}/channels/name/{name}`) and user ids /
+  direct-channel ids (`GET /users/username/{name}` +
+  `POST /channels/direct`), caching each resolution for the daemon's lifetime
+  (ids are stable). Posts via `POST /api/v4/posts` with `{channel_id, message}`.
+  stdlib only (`Net::HTTP`, `json`, `uri`).
+
+### Message routing
+
+A message YAML may carry optional routing fields the agent fills in from the
+context it already has:
+
+- `channel: <name>` — post to that named channel (within the configured `team`).
+- `user: <username>` — send a direct message to that user.
+- neither — post to `messenger.default_channel`. `SYSTEM:<runner>` error
+  messages always fall here, since the runner does not set routing fields.
+
+Specifying both `channel` and `user` is an error — the `mattermost` transport
+raises rather than silently picking one. The `webhook` transport ignores both.
 
 ## Prompt Templates
 
@@ -125,6 +160,12 @@ at render time. Available variables:
   - File: `{{input_file}}` (absolute path to the YAML work item).
 
 Undefined variables remain literal and produce a log warning.
+
+When the agent writes a message YAML into `message_dir`, the prompt template
+should teach it the contract: a required `message` key plus, for the
+`mattermost` transport, optional `channel: <name>` or `user: <username>` to
+route the notification (set at most one — both is an error). Omitting both
+sends to `messenger.default_channel`.
 
 ## Error Handling and Escalation
 

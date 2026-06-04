@@ -2,9 +2,6 @@
 
 require "yaml"
 require "fileutils"
-require "net/http"
-require "json"
-require "uri"
 
 module AgentDaemon
   class Messenger
@@ -14,7 +11,7 @@ module AgentDaemon
       @config = config
       @shutdown_flag = shutdown_flag
       @messenger_config = config.messenger
-      @webhook_url = URI(@messenger_config["webhook_url"])
+      @transport = Transport.for(@messenger_config)
       @consecutive_errors = 0
     end
 
@@ -51,7 +48,7 @@ module AgentDaemon
       task_key = message_data["task_key"]
       Log.info("[Messenger] Sending message for #{task_key}")
 
-      send_to_loop(message_data)
+      @transport.deliver(message_data)
 
       @consecutive_errors = 0
       move_to_sent(file)
@@ -61,30 +58,9 @@ module AgentDaemon
       Log.error("[Messenger] Failed to send #{message_data&.dig('task_key')} (#{@consecutive_errors}/#{MAX_CONSECUTIVE_ERRORS}): #{e.message}")
 
       if @consecutive_errors >= MAX_CONSECUTIVE_ERRORS
-        Log.error("[Messenger] CRITICAL: #{MAX_CONSECUTIVE_ERRORS} consecutive failures, Loop API may be unavailable")
+        Log.error("[Messenger] CRITICAL: #{MAX_CONSECUTIVE_ERRORS} consecutive failures, message transport may be unavailable")
         @consecutive_errors = 0
       end
-    end
-
-    def send_to_loop(message_data)
-      payload = { text: message_data["message"] }
-
-      http = Net::HTTP.new(@webhook_url.host, @webhook_url.port)
-      http.use_ssl = @webhook_url.scheme == "https"
-      http.open_timeout = 10
-      http.read_timeout = 10
-
-      req = Net::HTTP::Post.new(@webhook_url)
-      req["Content-Type"] = "application/json"
-      req.body = payload.to_json
-
-      response = http.request(req)
-
-      unless response.is_a?(Net::HTTPSuccess)
-        raise "Loop webhook returned #{response.code}: #{response.body}"
-      end
-
-      Log.debug("[Messenger] Loop webhook response: #{response.body}")
     end
 
     def move_to_sent(file)

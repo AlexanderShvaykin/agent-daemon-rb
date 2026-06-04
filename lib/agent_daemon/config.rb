@@ -12,6 +12,7 @@ module AgentDaemon
       "message_dir" => "to_message",
       "runners" => [],
       "messenger" => {
+        "type" => "webhook",
         "interval" => 30
       },
       "logging" => {
@@ -33,8 +34,10 @@ module AgentDaemon
     TRACKER_TRIGGER_DEFAULTS = { "interval" => 60 }.freeze
     FILE_TRIGGER_DEFAULTS    = { "interval" => 10 }.freeze
 
-    VALID_TRIGGER_TYPES = %w[tracker file].freeze
-    VALID_BACKENDS      = %w[claude opencode].freeze
+    VALID_TRIGGER_TYPES   = %w[tracker file].freeze
+    VALID_BACKENDS        = %w[claude opencode].freeze
+    VALID_MESSENGER_TYPES = %w[webhook mattermost].freeze
+    MATTERMOST_REQUIRED   = %w[base_url token team default_channel].freeze
 
     attr_reader :data, :config_dir, :config_path
 
@@ -152,7 +155,30 @@ module AgentDaemon
         @runners.each { |runner| errors.concat(validate_runner(runner)) }
       end
 
+      errors.concat(validate_messenger)
+
       raise ConfigError, errors.join("\n") unless errors.empty?
+    end
+
+    # Validate the messenger block per its transport type. The webhook type
+    # keeps webhook_url optional (an absent URL leaves the messenger thread
+    # disabled — see daemon.rb), preserving prior behavior. The mattermost
+    # type is opt-in and strict: all connection keys must be present.
+    def validate_messenger
+      messenger = @data["messenger"] || {}
+      type = messenger["type"]
+
+      unless VALID_MESSENGER_TYPES.include?(type)
+        return ["messenger.type must be one of #{VALID_MESSENGER_TYPES.join(', ')} (got #{type.inspect})"]
+      end
+
+      return [] unless type == "mattermost"
+
+      MATTERMOST_REQUIRED.filter_map do |key|
+        next if messenger[key].is_a?(String) && !messenger[key].empty?
+
+        "messenger.#{key} is required when messenger.type is mattermost"
+      end
     end
 
     def validate_duplicate_names

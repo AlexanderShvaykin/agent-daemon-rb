@@ -89,6 +89,13 @@ runners:
 messenger:
   interval: 30
   webhook_url: "https://chat.example.com/hooks/support"
+  # Or use the mattermost transport with a bot token (keep it in ENV, see
+  # docs/secrets.md):
+  #   type: mattermost
+  #   base_url: "https://chat.example.com"
+  #   token: <%= secret('MM_BOT_TOKEN') %>
+  #   team: support
+  #   default_channel: alerts
 
 logging:
   level: info
