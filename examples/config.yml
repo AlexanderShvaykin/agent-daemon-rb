@@ -2,6 +2,16 @@
 #
 # Copy this file, fill in your values, and pass the path to bin/agent-daemon:
 #   bin/agent-daemon /path/to/config.yml
+#
+# This file is rendered as an ERB template before YAML parsing, so secrets can
+# stay out of the file and come from the process environment instead:
+#   token: <%%= secret('TRACKER_TOKEN') %>   # fail-fast, YAML-safe
+#   org_id: <%%= ENV['TRACKER_ORG_ID'] %>    # raw, lenient (unset -> empty)
+# `secret('KEY')` reads ENV['KEY'], raises a ConfigError naming the key when it
+# is unset, and quotes the value so tokens/URLs with #, :, ?, & or quotes parse
+# intact. Populate ENV however you like, e.g.:
+#   sops exec-env secrets.enc.yml -- bin/agent-daemon config.yml
+# See docs/secrets.md for details.
 
 # Absolute path to the project where your agent CLI (Claude Code / OpenCode)
 # is configured (CLAUDE.md, .opencode.json, MCP settings, etc.).
@@ -14,7 +24,7 @@ project_path: /home/deploy/my-project
 
 # Yandex Tracker API credentials (required only if you have tracker-type runners).
 tracker:
-  token: "your-oauth-token"
+  token: <%= secret('TRACKER_TOKEN') %>   # or inline: "your-oauth-token"
   org_id: "your-cloud-org-id"
   # base_url: "https://api.tracker.yandex.net"  # default
 
@@ -71,7 +81,7 @@ runners:
 # to an incoming webhook (any service accepting JSON {text: "..."}).
 messenger:
   interval: 30
-  webhook_url: "https://chat.example.com/hooks/your-webhook-token"
+  webhook_url: <%= secret('WEBHOOK_URL') %>   # or inline: "https://chat.example.com/hooks/..."
 
 logging:
   level: info

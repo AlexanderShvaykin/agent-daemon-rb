@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require "yaml"
+require "erb"
+require "json"
 
 module AgentDaemon
   class ConfigError < StandardError; end
@@ -39,7 +41,7 @@ module AgentDaemon
     def initialize(path)
       @config_path = File.expand_path(path)
       @config_dir  = File.dirname(@config_path)
-      raw = YAML.safe_load_file(path) || {}
+      raw = YAML.safe_load(render(File.read(path))) || {}
       @data = deep_merge(DEFAULTS, raw)
       @runners = build_runners(raw["runners"])
       validate!
@@ -70,6 +72,28 @@ module AgentDaemon
     end
 
     private
+
+    # Render the config file as an ERB template before YAML parsing. The
+    # binding exposes `secret` and `ENV`. Render-time failures (ERB syntax
+    # errors, missing secrets) surface as ConfigError so callers keep relying
+    # on the single-exception-type contract.
+    def render(src)
+      ERB.new(src).result(binding)
+    rescue ConfigError
+      raise
+    rescue StandardError, SyntaxError => e
+      raise ConfigError, "failed to render #{@config_path}: #{e.message}"
+    end
+
+    # Resolve a secret from the environment as a YAML-safe, quoted scalar.
+    # Fails fast (ConfigError) when the variable is unset. `.to_json` produces
+    # a double-quoted, escaped string so values containing YAML-significant
+    # characters (#, :, ?, &, quotes) parse intact.
+    def secret(key)
+      ENV.fetch(key).to_json
+    rescue KeyError
+      raise ConfigError, "secret #{key} is not set in environment"
+    end
 
     def build_runners(raw_runners)
       return [] unless raw_runners.is_a?(Array)

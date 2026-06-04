@@ -37,6 +37,8 @@ Loaded from a YAML path (CLI arg to `bin/agent-daemon`). Config is validated eag
 - `prompt_template` resolves relative to the **config file's directory**, and the resolved value is stored as `prompt_template_path` (this is the key the runner reads, not `prompt_template`).
 - Defaults live in `DEFAULTS` / `RUNNER_DEFAULTS` / trigger default constants; new config keys should get a default there and validation in `validate!`.
 
+The config file is rendered through ERB before YAML parsing (`read → ERB.result(binding) → safe_load`), so secrets can come from the environment via `<%= secret('KEY') %>` (fail-fast + `.to_json` YAML-safe quoting) or raw `<%= ENV['KEY'] %>` (lenient). Render-time failures are wrapped as `ConfigError`. The daemon stays sops-agnostic — operators populate `ENV` themselves (e.g. `sops exec-env secrets.enc.yml -- bin/agent-daemon config.yml`). See `docs/secrets.md`.
+
 `examples/config.yml` is a fully commented reference.
 
 ## Prompt templates
