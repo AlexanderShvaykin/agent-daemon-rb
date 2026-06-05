@@ -11,6 +11,9 @@ module AgentDaemon
     DEFAULTS = {
       "message_dir" => "to_message",
       "runners" => [],
+      "tracker" => {
+        "default_backoff" => 60
+      },
       "messenger" => {
         "type" => "webhook",
         "interval" => 30
@@ -31,8 +34,8 @@ module AgentDaemon
       "trigger" => {}
     }.freeze
 
-    TRACKER_TRIGGER_DEFAULTS = { "interval" => 60 }.freeze
-    FILE_TRIGGER_DEFAULTS    = { "interval" => 10 }.freeze
+    TRACKER_TRIGGER_DEFAULTS = { "interval" => 60, "jitter" => 5 }.freeze
+    FILE_TRIGGER_DEFAULTS    = { "interval" => 10, "jitter" => 5 }.freeze
 
     VALID_TRIGGER_TYPES   = %w[tracker file].freeze
     VALID_BACKENDS        = %w[claude opencode].freeze
@@ -155,9 +158,23 @@ module AgentDaemon
         @runners.each { |runner| errors.concat(validate_runner(runner)) }
       end
 
+      errors.concat(validate_tracker)
       errors.concat(validate_messenger)
 
       raise ConfigError, errors.join("\n") unless errors.empty?
+    end
+
+    # Validate the tracker block's default backoff (seconds used when a 429
+    # response carries no usable Retry-After). The key always has a default, so
+    # we only guard against an operator overriding it with a negative number.
+    def validate_tracker
+      tracker = @data["tracker"]
+      return [] unless tracker.is_a?(Hash)
+
+      backoff = tracker["default_backoff"]
+      return [] if backoff.is_a?(Numeric) && backoff >= 0
+
+      ["tracker.default_backoff must be a non-negative number (got #{backoff.inspect})"]
     end
 
     # Validate the messenger block per its transport type. The webhook type
@@ -227,6 +244,11 @@ module AgentDaemon
       type = trigger["type"]
       unless VALID_TRIGGER_TYPES.include?(type)
         return ["runner #{runner_label.inspect}: trigger.type must be one of #{VALID_TRIGGER_TYPES.join(', ')} (got #{type.inspect})"]
+      end
+
+      jitter = trigger["jitter"]
+      unless jitter.is_a?(Numeric) && jitter >= 0
+        errors << "runner #{runner_label.inspect}: trigger.jitter must be a non-negative number (got #{jitter.inspect})"
       end
 
       case type

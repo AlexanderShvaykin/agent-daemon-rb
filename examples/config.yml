@@ -27,6 +27,9 @@ tracker:
   token: <%= secret('TRACKER_TOKEN') %>   # or inline: "your-oauth-token"
   org_id: "your-cloud-org-id"
   # base_url: "https://api.tracker.yandex.net"  # default
+  # Seconds to back off after a 429 when the server sends no usable
+  # Retry-After header. Default: 60.
+  # default_backoff: 60
 
 # Each runner is a separate daemon thread with its own trigger, agent,
 # backend, and prompt template.
@@ -43,6 +46,8 @@ runners:
       # Raw JQL query passed verbatim to /v2/issues/_search.
       query: 'Queue: PROJ AND Status: "New"'
       interval: 300            # polling interval in seconds (default 60)
+      # jitter: 5              # random 0..jitter s added per cycle to de-phase
+                               # parallel pollers; 0 disables (default 5)
     prompt_template: prompts/default.txt
     # output_dir: to_message   # set if the agent writes message files
     #
@@ -62,6 +67,7 @@ runners:
       archive_dir: review_inbox/processed
       failed_dir: review_inbox/failed
       interval: 10                       # polling interval in seconds (default 10)
+      # jitter: 5                        # random 0..jitter s added per cycle (default 5)
     prompt_template: prompts/default.txt
 
   # --- Example 3: OpenCode backend ---

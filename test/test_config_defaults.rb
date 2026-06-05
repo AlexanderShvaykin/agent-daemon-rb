@@ -43,6 +43,13 @@ class TestConfigDefaults < Minitest::Test
       assert_equal 3, runner["max_attempts"]
       assert_equal "", runner["extra_flags"]
       assert_equal 60, runner["trigger"]["interval"]
+      assert_equal 5, runner["trigger"]["jitter"]
+    end
+  end
+
+  def test_tracker_default_backoff_applied
+    with_config do |config, _|
+      assert_equal 60, config.tracker["default_backoff"]
     end
   end
 

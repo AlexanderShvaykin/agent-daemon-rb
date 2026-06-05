@@ -36,6 +36,16 @@ class FailingTracker
   end
 end
 
+class RateLimitedTracker
+  def initialize(retry_after)
+    @retry_after = retry_after
+  end
+
+  def search_issues(_query)
+    raise AgentDaemon::Tracker::RateLimitError, @retry_after
+  end
+end
+
 class TestRunnerTracker < Minitest::Test
   def setup
     @tmpdir = Dir.mktmpdir
@@ -129,6 +139,44 @@ class TestRunnerTracker < Minitest::Test
 
     # Counter resets after escalation
     assert_equal 0, runner.instance_variable_get(:@consecutive_errors)
+  end
+
+  def test_rate_limit_does_not_escalate_and_sets_backoff
+    tracker = RateLimitedTracker.new(30)
+    runner = build_runner([], tracker_stub: tracker)
+
+    3.times { runner.send(:fetch_work_items_with_escalation) }
+
+    error_files = Dir.glob(File.join(@message_dir, "error-*.yml"))
+    assert_empty error_files
+    assert_equal 0, runner.instance_variable_get(:@consecutive_errors)
+    assert_equal 30, runner.instance_variable_get(:@backoff)
+  end
+
+  def test_rate_limit_backoff_drives_next_wait
+    tracker = RateLimitedTracker.new(30)
+    runner = build_runner([], tracker_stub: tracker)
+
+    runner.send(:fetch_work_items_with_escalation)
+    assert_equal 30, runner.send(:next_wait_seconds)
+    # One-shot: backoff is consumed, next wait returns to the base interval.
+    assert_equal 60, runner.send(:next_wait_seconds)
+  end
+
+  def test_jitter_zero_waits_exactly_interval
+    runner = build_runner([])
+    # Default runner_config has no jitter key → jitter 0.
+    assert_equal 60, runner.send(:next_wait_seconds)
+  end
+
+  def test_jitter_stays_within_bound
+    @runner_config["trigger"]["jitter"] = 5
+    runner = build_runner([])
+    20.times do
+      wait = runner.send(:next_wait_seconds)
+      assert_operator wait, :>=, 60
+      assert_operator wait, :<, 65
+    end
   end
 
   def test_intermittent_failure_does_not_escalate

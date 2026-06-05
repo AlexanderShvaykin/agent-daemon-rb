@@ -19,8 +19,10 @@ module AgentDaemon
         @name = runner_config.fetch("name")
         @max_attempts = runner_config.fetch("max_attempts")
         @interval = runner_config.fetch("trigger").fetch("interval")
+        @jitter = runner_config.fetch("trigger").fetch("jitter", 0)
         @attempts = Hash.new(0)
         @consecutive_errors = 0
+        @backoff = nil
         @backend = Backend.for(runner_config, shutdown_flag,
                                message_dir: message_dir, project_path: project_path)
         @prompt_template = PromptTemplate.new(runner_config.fetch("prompt_template_path"))
@@ -31,7 +33,7 @@ module AgentDaemon
 
         until @shutdown_flag.value
           iterate
-          wait_interval(@interval)
+          wait_interval(next_wait_seconds)
         end
 
         Log.info("[#{log_tag}] Thread stopping gracefully")
@@ -62,6 +64,13 @@ module AgentDaemon
         items = fetch_work_items
         @consecutive_errors = 0
         items
+      rescue AgentDaemon::Tracker::RateLimitError => e
+        # A throttle is the server pacing us, not a trigger failure: back off for
+        # the suggested duration without touching the consecutive-error counter,
+        # so it never escalates to a SYSTEM:<runner> message.
+        @backoff = e.retry_after
+        Log.warn("[#{log_tag}] rate limited, backing off #{e.retry_after}s")
+        []
       rescue => e
         @consecutive_errors += 1
         Log.error("[#{log_tag}] trigger error (#{@consecutive_errors}/#{MAX_CONSECUTIVE_ERRORS}): #{e.message}")
@@ -148,6 +157,25 @@ module AgentDaemon
         vars = @runner_config.transform_keys(&:to_s).merge("message_dir" => @message_dir)
         vars["output_dir"] = @runner_config["output_dir"] if @runner_config["output_dir"]
         vars
+      end
+
+      # Duration to wait before the next poll. A pending rate-limit backoff wins
+      # (one-shot); otherwise the base interval plus a fresh per-cycle jitter so
+      # parallel pollers de-phase instead of firing in the same instant.
+      def next_wait_seconds
+        if @backoff
+          seconds = @backoff
+          @backoff = nil
+          seconds
+        else
+          @interval + jitter_amount
+        end
+      end
+
+      def jitter_amount
+        return 0 if @jitter <= 0
+
+        rand * @jitter
       end
 
       def wait_interval(seconds)

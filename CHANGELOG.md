@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.0] - 2026-06-05
+
+### Added
+- Per-cycle **poll interval jitter** in the runner loop (`trigger.jitter`, seconds, default `5`, `0` disables). A fresh random `0..jitter` is added to each wait so independently running pollers — threads or separate daemon processes sharing a trigger source — de-phase instead of firing in the same instant. Shutdown responsiveness is unchanged (the existing chunked, `ShutdownFlag`-polling wait is reused).
+- Typed **rate-limit handling** for the Tracker client: an HTTP 429 raises `AgentDaemon::Tracker::RateLimitError` carrying a retry-after duration, taken from the `Retry-After` header (integer-seconds form) or a configured fallback (`tracker.default_backoff`, seconds, default `60`) when the header is absent or unparseable.
+- The runner **backs off** for the suggested duration (interruptible by shutdown) on a rate-limit signal and logs it at WARN. A throttle does **not** increment the consecutive-error counter, so it never escalates to a `SYSTEM:<runner>` message — genuine errors still escalate as before.
+- Eager validation for both new keys (non-negative numbers), documented in `examples/config.yml`.
+
 ## [0.3.0] - 2026-06-04
 
 ### Added

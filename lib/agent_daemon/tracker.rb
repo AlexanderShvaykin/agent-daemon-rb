@@ -7,11 +7,23 @@ require "uri"
 module AgentDaemon
   class Tracker
     DEFAULT_BASE_URL = "https://api.tracker.yandex.net"
+    DEFAULT_BACKOFF  = 60
+
+    # Raised on an HTTP 429, carrying how long to wait before polling again.
+    class RateLimitError < StandardError
+      attr_reader :retry_after
+
+      def initialize(retry_after)
+        @retry_after = retry_after
+        super("Tracker API 429: rate limited, retry after #{retry_after}s")
+      end
+    end
 
     def initialize(tracker_config)
       @token = tracker_config.fetch("token")
       @org_id = tracker_config.fetch("org_id")
       @base_url = tracker_config.fetch("base_url", DEFAULT_BASE_URL)
+      @default_backoff = tracker_config.fetch("default_backoff", DEFAULT_BACKOFF)
     end
 
     # Returns an array of issues (hashes with keys "key", "summary", etc.)
@@ -21,6 +33,10 @@ module AgentDaemon
 
       response = post(uri, body)
 
+      if response.is_a?(Net::HTTPTooManyRequests)
+        raise RateLimitError, retry_after_seconds(response)
+      end
+
       unless response.is_a?(Net::HTTPSuccess)
         raise "Tracker API #{response.code}: #{response.body&.slice(0, 500)}"
       end
@@ -29,6 +45,16 @@ module AgentDaemon
     end
 
     private
+
+    # Parse the Retry-After header (integer-seconds form only). Anything absent,
+    # blank, or non-numeric (e.g. an HTTP-date) falls back to the configured
+    # default backoff so the caller always gets a usable duration.
+    def retry_after_seconds(response)
+      value = response["Retry-After"]
+      return value.to_i if value.is_a?(String) && value.match?(/\A\d+\z/)
+
+      @default_backoff
+    end
 
     def post(uri, body)
       http = Net::HTTP.new(uri.host, uri.port)

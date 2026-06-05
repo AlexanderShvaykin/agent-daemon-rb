@@ -210,6 +210,29 @@ class TestConfigRunners < Minitest::Test
     end
   end
 
+  def test_rejects_negative_jitter
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runner = tracker_runner("trigger" => {
+        "type" => "tracker", "query" => "Queue: TI", "jitter" => -1
+      })
+      path = write_config(dir, base_config(project_path, [runner]))
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      assert_includes err.message, "trigger.jitter"
+    end
+  end
+
+  def test_rejects_negative_default_backoff
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      data = base_config(project_path, [tracker_runner])
+      data["tracker"]["default_backoff"] = -5
+      path = write_config(dir, data)
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      assert_includes err.message, "tracker.default_backoff"
+    end
+  end
+
   def test_accepts_valid_config
     Dir.mktmpdir do |dir|
       project_path = with_project(dir)
