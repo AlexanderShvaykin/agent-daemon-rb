@@ -93,7 +93,7 @@ On timeout or shutdown, the entire process group receives `SIGTERM`, then
 
 ### Backend::Claude
 
-Builds: `cd <project_path> && claude -p <prompt> --agent <agent> --allowedTools '*' --add-dir <dirs> --dangerously-skip-permissions --output-format text`
+Builds: `cd <project_path> && claude -p <prompt> --agent <agent> --add-dir <dirs> --dangerously-skip-permissions --output-format text`
 
 ### Backend::OpenCode
 

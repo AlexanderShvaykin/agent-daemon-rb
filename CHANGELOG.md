@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.1] - 2026-06-09
+
+### Fixed
+- Dropped the hardcoded `--allowedTools '*'` flag from the Claude backend command. Recent Claude CLI versions reject `*` as an allow rule and exit non-zero, which the daemon surfaced as `CLI failed` and moved the task to `failed_dir`. The flag was redundant — `--dangerously-skip-permissions` already bypasses all permission checks.
+
 ## [0.4.0] - 2026-06-05
 
 ### Added

@@ -16,7 +16,6 @@ module AgentDaemon
         cmd = "cd #{@project_path.shellescape}" \
               " && claude -p #{prompt.shellescape}" \
               " --agent #{agent.shellescape}" \
-              " --allowedTools '*'" \
               " #{add_dir_flags}" \
               " --dangerously-skip-permissions" \
               " --output-format text"
