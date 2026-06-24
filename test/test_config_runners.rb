@@ -51,6 +51,20 @@ class TestConfigRunners < Minitest::Test
     }.merge(overrides)
   end
 
+  def mattermost_runner(overrides = {})
+    {
+      "name" => "mention-bot",
+      "prompt_template" => "prompts/default.txt",
+      "trigger" => {
+        "type" => "mattermost",
+        "base_url" => "https://mm.example.com",
+        "token" => "bot-token",
+        "team" => "engineering",
+        "channels" => %w[general dev]
+      }
+    }.merge(overrides)
+  end
+
   def test_rejects_missing_runners_key
     Dir.mktmpdir do |dir|
       project_path = with_project(dir)
@@ -240,6 +254,57 @@ class TestConfigRunners < Minitest::Test
       config = AgentDaemon::Config.new(path)
       assert_equal 1, config.runners.size
       assert_equal "default", config.runners.first["name"]
+    end
+  end
+
+  def test_mattermost_trigger_defaults_and_dir_resolution
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      path = write_config(dir, base_config(project_path, [mattermost_runner]))
+      config = AgentDaemon::Config.new(path)
+
+      trigger = config.runners.first["trigger"]
+      assert_equal 2, trigger["interval"]
+      assert_equal 0, trigger["jitter"]
+      assert_equal File.join(project_path, "mentions/mention-bot/inbox"),  trigger["input_dir"]
+      assert_equal File.join(project_path, "mentions/mention-bot/done"),   trigger["archive_dir"]
+      assert_equal File.join(project_path, "mentions/mention-bot/failed"), trigger["failed_dir"]
+    end
+  end
+
+  def test_mattermost_explicit_dir_resolves_under_project_path
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runner = mattermost_runner
+      runner["trigger"]["input_dir"] = "custom/in"
+      path = write_config(dir, base_config(project_path, [runner]))
+      config = AgentDaemon::Config.new(path)
+
+      trigger = config.runners.first["trigger"]
+      assert_equal File.join(project_path, "custom/in"), trigger["input_dir"]
+    end
+  end
+
+  def test_rejects_mattermost_missing_connection_keys
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runner = mattermost_runner("trigger" => { "type" => "mattermost", "channels" => %w[general] })
+      path = write_config(dir, base_config(project_path, [runner]))
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      assert_includes err.message, "trigger.base_url"
+      assert_includes err.message, "trigger.token"
+      assert_includes err.message, "trigger.team"
+    end
+  end
+
+  def test_rejects_mattermost_empty_channels
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runner = mattermost_runner
+      runner["trigger"]["channels"] = []
+      path = write_config(dir, base_config(project_path, [runner]))
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      assert_includes err.message, "trigger.channels"
     end
   end
 end
