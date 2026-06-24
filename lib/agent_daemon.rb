@@ -15,6 +15,7 @@ require_relative "agent_daemon/runner/base"
 require_relative "agent_daemon/runner/tracker"
 require_relative "agent_daemon/runner/file"
 require_relative "agent_daemon/runner/mattermost"
+require_relative "agent_daemon/mattermost/listener"
 require_relative "agent_daemon/messenger"
 require_relative "agent_daemon/daemon"
 
