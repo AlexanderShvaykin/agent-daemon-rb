@@ -41,6 +41,13 @@ class TestTransportMattermost < Minitest::Test
     http.requests.select { |r| r.path == "/api/v4/posts" }
   end
 
+  # Answers posts only; any name/user resolution request is an assertion failure.
+  def posts_only_http
+    FakeHttp.new do |req|
+      req.path == "/api/v4/posts" ? fake(id: "post1") : raise("unexpected resolution request: #{req.method} #{req.path}")
+    end
+  end
+
   def test_posts_to_named_channel
     with_transport(FakeHttp.new(&handler)) do |t, http|
       t.deliver("channel" => "dev-alerts", "message" => "Build green")
@@ -99,6 +106,43 @@ class TestTransportMattermost < Minitest::Test
     with_transport(failing) do |t, _http|
       err = assert_raises(RuntimeError) { t.deliver("channel" => "dev-alerts", "message" => "x") }
       assert_includes err.message, "503"
+    end
+  end
+
+  def test_channel_id_used_verbatim_without_resolution
+    with_transport(posts_only_http) do |t, http|
+      t.deliver("channel_id" => "chanXYZ", "message" => "in thread")
+
+      assert_equal [["POST", "/api/v4/posts"]], http.requests.map { |r| [r.method, r.path] }
+      assert_equal({ "channel_id" => "chanXYZ", "message" => "in thread" }, JSON.parse(posts(http).first.body))
+    end
+  end
+
+  def test_channel_id_takes_precedence_over_channel_name
+    with_transport(posts_only_http) do |t, http|
+      t.deliver("channel_id" => "chanXYZ", "channel" => "dev-alerts", "message" => "in thread")
+
+      assert_equal [["POST", "/api/v4/posts"]], http.requests.map { |r| [r.method, r.path] }
+      assert_equal({ "channel_id" => "chanXYZ", "message" => "in thread" }, JSON.parse(posts(http).first.body))
+    end
+  end
+
+  def test_root_id_included_in_post_body
+    with_transport(posts_only_http) do |t, http|
+      t.deliver("channel_id" => "chanXYZ", "root_id" => "root123", "message" => "reply")
+
+      assert_equal(
+        { "channel_id" => "chanXYZ", "root_id" => "root123", "message" => "reply" },
+        JSON.parse(posts(http).first.body)
+      )
+    end
+  end
+
+  def test_root_id_omitted_when_absent
+    with_transport(FakeHttp.new(&handler)) do |t, http|
+      t.deliver("channel" => "dev-alerts", "message" => "Build green")
+
+      refute_includes JSON.parse(posts(http).first.body).keys, "root_id"
     end
   end
 end
