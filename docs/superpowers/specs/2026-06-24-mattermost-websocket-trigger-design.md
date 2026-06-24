@@ -17,6 +17,12 @@ poll-based. The push→pull bridge is the **filesystem**, consistent with the co
 architectural invariant ("threads communicate only through the filesystem; no
 in-process queue or shared mutable state").
 
+The WebSocket protocol itself is handled by **`faye-websocket`** running on an
+**EventMachine** reactor — a deliberate, owner-approved exception to the project's
+prior "stdlib only" stance (see Dependencies). Hand-rolling RFC 6455 (handshake,
+framing, ping/pong, close handshake, TLS) was judged the riskiest part of the
+work; a mature library removes that risk.
+
 ## Goals
 
 - @-mention the bot in an allowed channel → an agent task runs.
@@ -24,7 +30,8 @@ in-process queue or shared mutable state").
   (`{{message}}`); the template decides how to use it (hybrid model — neither a
   pure fixed prompt nor a raw passthrough).
 - The agent's result is posted back as a **threaded reply** to the mention.
-- Stdlib-only; no new runtime gem dependencies.
+- Use battle-tested WebSocket protocol handling (faye-websocket / EventMachine)
+  rather than hand-rolling RFC 6455.
 - Reuse the existing runner / file-trigger machinery and crash-restart model.
 
 ## Non-goals
@@ -40,41 +47,64 @@ in-process queue or shared mutable state").
   messenger transport credentials). The trigger carries its own connection keys;
   operators typically point both at the same `MM_BOT_TOKEN`.
 
+## Dependencies (exception to "stdlib only")
+
+The project previously declared **zero runtime gem dependencies** (AGENTS.md,
+`architecture.md`). Ruby stdlib has no WebSocket client, and the owner chose a
+library over a hand-rolled implementation. This change therefore adds two runtime
+dependencies to the gemspec:
+
+- **`eventmachine`** — the C-extension reactor (event loop).
+- **`faye-websocket`** — the WebSocket client/protocol layer that runs on it.
+
+`AGENTS.md` and `architecture.md` must be updated to state that the daemon is
+stdlib-only **except** for these two gems, which back the `mattermost` trigger.
+
+### Consequence: a single shared reactor
+
+EventMachine's reactor is a **process singleton** (`EM.run` runs once per
+process). The daemon's "one thread per runner" model cannot give each Mattermost
+listener its own `EM.run`. Therefore **all** Mattermost listeners share one
+Daemon-managed reactor thread (`Mattermost::Reactor`). The per-runner *logic*
+(allowlist, bot id, work-item writing) lives in a per-runner `Mattermost::Listener`
+handler object hosted inside that single reactor.
+
 ## Architecture decision
 
-Three approaches were considered:
+The chosen shape (after rejecting an in-process-queue runner and a pure-push
+runner that discards the Base loop) is:
 
-- **A — Daemon-managed listener thread + file bridge + file-style consumer
-  (chosen).** A listener thread (peer to the Messenger) holds the WebSocket and
-  writes each qualifying mention as a YAML work-item into an inbox directory; a
-  file-poll consumer runner processes them. Honors the filesystem-IPC invariant,
-  reuses the tested File-runner machinery, and both threads are Daemon-owned so
-  crash-restart is uniform with no orphaned socket. Cost: the Daemon expands one
-  `trigger.type: mattermost` config entry into two managed threads.
-- **B — single `mattermost` runner with an internal `Queue`.** Cleaner config,
-  but introduces an in-process queue (the one thing the architecture doc says to
-  avoid) and risks an orphaned WebSocket reader thread on crash-restart.
-  Rejected.
-- **C — pure-push runner overriding `run`.** Lowest latency but discards the
-  Base loop's attempt/escalation/shutdown machinery. Rejected.
+- A **single Daemon-managed reactor thread** holds the EventMachine loop and one
+  `faye-websocket` client per `mattermost` runner.
+- Each client, on a qualifying mention, writes a YAML **work-item** into that
+  runner's inbox directory.
+- A **file-poll consumer runner** (`Runner::Mattermost < Runner::File`) processes
+  the work-items sequentially through the backend — reusing the entire tested
+  File-runner machinery.
+
+This honors the filesystem-IPC invariant (listeners and consumers share no
+in-process state — only files), keeps the consumer side identical to the existing
+file trigger, and confines all EventMachine/faye specifics to two small files.
 
 ## Data flow
 
 ```
-Mattermost  ──wss event──▶  Listener thread  ──writes YAML──▶  inbox dir
- (bot @-mentioned)            (Daemon-managed)                     │
-                                                                   ▼
+Mattermost  ──ws event──▶  Reactor thread        ──writes YAML──▶  inbox dir
+ (bot @-mentioned)          (one EM loop, faye                         │
+                             client + Listener                         │
+                             handler per runner)                       ▼
    thread reply  ◀── Messenger ◀── message_dir ◀── agent ◀── Consumer runner
    (root_id)        (mattermost     (reply YAML)            (file-poll, backend)
                      transport)
 ```
 
-1. The **listener** receives a `posted` event and applies three filters:
+1. A `faye-websocket` client receives a `posted` event; its `Listener` applies
+   three filters:
    - **not self:** `post.user_id != bot_id`,
    - **allowlisted channel:** `data.channel_name` ∈ configured `channels`,
    - **mentioned:** `bot_id` ∈ `data.mentions`.
    Survivors are written as `<post_id>.yml` into the inbox dir (the post id also
-   de-dupes).
+   de-dupes against inbox/done/failed).
 2. The **consumer** (file-poll runner) picks the oldest `*.yml`, renders the
    prompt with its fields, runs the backend — sequential, one at a time. Success
    → archive dir; exhausted attempts → failed dir.
@@ -84,42 +114,38 @@ Mattermost  ──wss event──▶  Listener thread  ──writes YAML──�
 
 ## Components
 
-### WebSocket client — `lib/agent_daemon/mattermost/web_socket.rb`
+### WebSocket via faye-websocket + EventMachine
 
-Stdlib-only RFC 6455 client over `TCPSocket` + `OpenSSL::SSL::SSLSocket` (for
-`wss`). Uses `socket`, `openssl`, `securerandom`, `digest`, `base64`, `uri` —
-all stdlib.
+`faye-websocket` handles the RFC 6455 handshake, framing, masking, ping/pong
+(`ping: 30` keepalive), close handshake, and `wss://` TLS — none of which we
+implement ourselves. We supply only: the auth challenge on open, the message
+filter, and reconnection scheduling.
 
-- **Handshake:** HTTP `GET` Upgrade with a random `Sec-WebSocket-Key` and
-  `Sec-WebSocket-Version: 13`; verify the response is `101 Switching Protocols`
-  and that `Sec-WebSocket-Accept` equals `base64(sha1(key + RFC6455-GUID))`.
-- **Framing:** parse fin/opcode/payload-length; handle **text** (0x1, delivered
-  to the caller), **ping** (0x9, reply with **pong** 0xA), **pong** (0xA),
-  **close** (0x8, tear down). Client→server frames are masked (spec
-  requirement); server→client frames are not.
-- **Shutdown-aware reads:** the read loop blocks on `IO.select` with a ~1s
-  timeout so it polls `shutdown_flag` between reads (no blocking call that
-  ignores the flag). On shutdown it sends a close frame and returns.
-- **Surface:** `connect`, `send_text(str)`, `each_message { |text| ... }`,
-  `close`. Frame encode/decode is split from IO so it is unit-testable without a
-  live socket.
+### Reactor — `lib/agent_daemon/mattermost/reactor.rb`
+
+A single Daemon-managed thread, peer to the Messenger. Its `run`:
+
+1. Resolves every listener's bot id up front (`prepare`, a blocking
+   `GET /api/v4/users/me`) **before** `EM.run`, so the reactor thread never
+   blocks on network IO. A listener that fails to prepare is logged and skipped
+   (it does not take down the other bots).
+2. Enters `EM.run`, registers a 1s periodic timer that calls `EM.stop` once the
+   shutdown flag flips (bridging the daemon's cooperative shutdown into the
+   reactor), and starts each prepared listener.
+
+Crash-restart is uniform: if the reactor thread dies, `monitor_threads` rebuilds
+it after `RESTART_DELAY`, reconnecting all clients fresh.
 
 ### Listener — `lib/agent_daemon/mattermost/listener.rb`
 
-A Daemon-managed thread, peer to the Messenger.
+A per-runner handler hosted in the reactor (not a thread).
 
-- **Bot id:** resolved once via `GET /api/v4/users/me` (Net::HTTP) and cached;
-  used for the self-ignore and mention filters.
-- **Auth:** after connecting, send the `authentication_challenge` action with the
-  bot token, then read the `hello` event.
-- **Loop:** `until shutdown { connect → auth → stream events → on drop,
-  reconnect with capped exponential backoff (e.g. 1s → 30s) }`. Transient network
-  errors are handled internally with backoff (not by crashing), so a blip does
-  not incur the 60s `RESTART_DELAY`; only genuinely unexpected exceptions bubble
-  to the Daemon's restart path.
-- **Event handling:** a pure `handle_event(parsed_hash)` method (separate from
-  IO) applies the filters and writes the work-item YAML — unit-testable by
-  feeding it event hashes.
+- **Bot id:** resolved once via `GET /api/v4/users/me` (Net::HTTP), cached.
+- **`start`** (called inside the reactor): creates the `faye-websocket` client and
+  wires `:open` → send `authentication_challenge`, `:message` → `on_message`,
+  `:close` → schedule reconnect with capped exponential backoff (1s → 30s).
+- **`on_message(raw)` / `handle_event(hash)`:** pure of EventMachine — decode the
+  JSON, apply the filters, write the work-item. Unit-testable by direct calls.
 
 **Work-item YAML** (keys become prompt template variables):
 
@@ -187,17 +213,15 @@ runners:
 
 ## Daemon wiring
 
-`runner_factory_for` currently returns a single factory keyed `runner:<name>`. It
-will return **one-or-more** `{key => factory}` entries that `build_runner_factories`
-merges:
+- For **every** runner, register the consumer thread `runner:<name>` as today
+  (`runner_factory_for` gains a `when "mattermost"` returning a
+  `Runner::Mattermost`).
+- If **any** `mattermost` runner exists, register **one** extra thread,
+  `:mattermost_reactor`, whose factory builds a `Mattermost::Reactor` with one
+  `Mattermost::Listener` per mattermost runner.
 
-- `tracker` / `file` → one entry (unchanged).
-- `mattermost` → two entries: `runner:<name>` (the consumer) and
-  `listener:<name>` (the listener).
-
-Both entries live in `@runner_factories`, so `start_threads` and
-`monitor_threads` start and independently restart each with no change to the
-monitor loop.
+`monitor_threads` restarts the reactor and each consumer independently, with no
+change to the monitor loop.
 
 ## Edge cases
 
@@ -209,27 +233,33 @@ monitor loop.
   `posted` events in allowlisted named channels trigger.
 - **`root_id` logic:** reply to `post.root_id` when the mention is already in a
   thread, otherwise to `post.id` (open a thread on the mention).
+- **EM reactor reuse:** a crashed reactor thread is restarted by
+  `monitor_threads`; `EM.run` is re-entered fresh in the new thread.
 
 ## Testing
 
-- **WebSocket client** (highest risk): a fake server via `TCPServer` in a thread
-  performs the upgrade and emits frames — assert handshake verification,
-  text-frame parse, masking, ping→pong, close handling, and shutdown-flag
-  responsiveness.
-- **Listener:** drive `handle_event(hash)` directly — mention hit/miss, allowlist
-  in/out, self-ignore, and correct work-item YAML (including the `root_id`
-  thread-vs-root logic). No live socket.
+- **Listener logic** (no EventMachine needed): drive `on_message(raw)` /
+  `handle_event(hash)` directly — mention hit/miss, allowlist in/out,
+  self-ignore, de-dup, and correct work-item YAML (including the `root_id`
+  thread-vs-root logic). `GET /api/v4/users/me` is stubbed via the existing
+  `stub_net_http` / `FakeHttp` helpers.
 - **Consumer:** `render_prompt` maps YAML fields to template variables.
 - **Transport:** `deliver` with `channel_id` + `root_id` builds the correct
   `POST /api/v4/posts` body (existing Net::HTTP-stub pattern).
 - **Config:** mattermost validation errors, defaults, and dir resolution.
-- **Daemon:** a `mattermost` runner yields two thread factories
-  (`runner:<name>` + `listener:<name>`).
+- **Daemon:** a `mattermost` runner yields a `runner:<name>` consumer factory and
+  a single `:mattermost_reactor` factory.
+- **Reactor / faye wiring:** the EventMachine-driven connect/reconnect path is
+  covered by a manual smoke test against a real bot token, not in CI (spinning a
+  real reactor in unit tests is flaky). The reactor's shutdown bridge and
+  per-listener `prepare` skip-on-failure are the testable seams.
 
 ## Documentation & release
 
-- Update `docs/architecture.md` (new trigger type, listener component, transport
-  reply fields).
+- Update `AGENTS.md` and `docs/architecture.md`: the daemon is stdlib-only
+  **except** `eventmachine` + `faye-websocket`, which back the `mattermost`
+  trigger; document the new trigger, the shared reactor, the listener, and the
+  transport reply fields.
 - Update `examples/config.yml` with a commented `mattermost` trigger block and an
   example mention prompt under `examples/prompts/`.
 - Update `CHANGELOG.md` and bump `lib/agent_daemon/version.rb`.
