@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [0.5.0] - 2026-06-24
 
 ### Added
-- `mattermost` **trigger**: an @-mention push trigger that drives an agent run and replies in-thread. A per-runner `Mattermost::Listener` connects over a WebSocket, resolves the bot id once up front, filters `posted` events (not-self + allowlisted `channels` + bot mentioned), de-dups by post id, and writes `<post_id>.yml` work-items into an inbox; reconnects use capped backoff (1s→30s, reset on the server `hello`).
+- `mattermost` **trigger**: an @-mention push trigger that drives an agent run and replies in-thread. A per-runner `Mattermost::Listener` connects over a WebSocket, resolves the bot id and team id once up front, filters `posted` events (not-self + event `team_id` matches the configured `team` + allowlisted `channels` + bot mentioned, so a like-named channel in another team cannot trigger), de-dups by post id, and writes `<post_id>.yml` work-items into an inbox; reconnects use capped backoff (1s→30s, reset on the server `hello`).
 - A single shared `Mattermost::Reactor` thread (`:mattermost_reactor`, a peer to the Messenger) hosting every listener — one per process because EventMachine's reactor is a singleton — restarted by `monitor_threads` like any other thread.
 - `Runner::Mattermost < Runner::File` consumes those work-items, reusing the file-poll machinery wholesale and exposing the captured fields (`message`, `channel_id`, `root_id`, `sender`, `channel_name`, `post_id`) as `{{...}}` prompt variables.
 - `channel_id` (posted verbatim) and `root_id` (threads the post as a reply) reply fields in the message YAML, honored by the `mattermost` transport so a mentioned agent answers back in its originating channel and thread.

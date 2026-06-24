@@ -87,11 +87,14 @@ is split across two cooperating pieces plus the shared reactor:
 - **`Mattermost::Listener`** — a per-runner WebSocket handler. It does *not* own
   a thread: the reactor creates its faye-websocket client and drives the
   callbacks. Before the reactor loop starts, `#prepare` resolves the bot id once
-  with a blocking `GET /api/v4/users/me` (so the reactor thread never blocks on
-  IO inside the loop). It then connects, sends an `authentication_challenge`,
-  and for each incoming `posted` event applies three filters — not the bot
-  itself, channel in the runner's `channels` allowlist, and the bot id present
-  in the event's `mentions` — before de-duplicating by post id (checked across
+  with a blocking `GET /api/v4/users/me` and the team id with
+  `GET /api/v4/teams/name/{team}` (so the reactor thread never blocks on IO
+  inside the loop). It then connects, sends an `authentication_challenge`,
+  and for each incoming `posted` event applies four filters — not the bot
+  itself, the event's `team_id` matching the configured team (so a like-named
+  channel in another team cannot trigger), channel in the runner's `channels`
+  allowlist, and the bot id present in the event's `mentions` — before
+  de-duplicating by post id (checked across
   the inbox, done, and failed dirs). A qualifying mention is written as a
   `<post_id>.yml` work-item into the inbox, carrying `message`, `channel_id`,
   `root_id` (the post's thread root, falling back to its own id for a top-level

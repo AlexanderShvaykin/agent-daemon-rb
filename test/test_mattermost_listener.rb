@@ -40,12 +40,16 @@ class TestMattermostListener < Minitest::Test
     AgentDaemon::Mattermost::Listener.new(trigger_config(overrides), AgentDaemon::ShutdownFlag.new)
   end
 
-  # Resolves bot id via GET /api/v4/users/me, then runs the block.
+  TEAM_ID = "team1"
+
+  # Resolves bot id via GET /api/v4/users/me and team id via
+  # GET /api/v4/teams/name/{team}, then runs the block.
   def prepared_listener(overrides = {})
     listener = build_listener(overrides)
     http = FakeHttp.new do |req|
       case [req.method, req.path]
       when ["GET", "/api/v4/users/me"] then FakeSuccess.new(JSON.generate(id: BOT_ID))
+      when ["GET", "/api/v4/teams/name/eng"] then FakeSuccess.new(JSON.generate(id: TEAM_ID))
       else raise "unexpected request: #{req.method} #{req.path}"
       end
     end
@@ -56,7 +60,7 @@ class TestMattermostListener < Minitest::Test
 
   # Builds a `posted` event frame matching the Mattermost wire format: data.post
   # and data.mentions are themselves JSON-encoded strings.
-  def posted_frame(post: {}, mentions: [BOT_ID], channel_name: "town-square", sender_name: "@alice", include_mentions: true)
+  def posted_frame(post: {}, mentions: [BOT_ID], channel_name: "town-square", sender_name: "@alice", team_id: "team1", include_mentions: true)
     post_obj = {
       "id" => "POSTID",
       "user_id" => "UID",
@@ -71,7 +75,7 @@ class TestMattermostListener < Minitest::Test
       "channel_display_name" => "Town Square",
       "channel_type" => "O",
       "sender_name" => sender_name,
-      "team_id" => "team1",
+      "team_id" => team_id,
       "post" => JSON.generate(post_obj)
     }
     data["mentions"] = JSON.generate(mentions) if include_mentions
@@ -128,6 +132,15 @@ class TestMattermostListener < Minitest::Test
     listener.on_message(posted_frame(post: { "id" => "p500" }, channel_name: "random"))
 
     refute ::File.exist?(item_path("p500")), "non-allowlisted channel must be ignored"
+  end
+
+  def test_allowlisted_channel_in_other_team_ignored
+    listener = prepared_listener
+    # Same channel name, different team — the allowlist is scoped to the
+    # configured team, so a like-named channel elsewhere must not trigger.
+    listener.on_message(posted_frame(post: { "id" => "p550" }, team_id: "other-team"))
+
+    refute ::File.exist?(item_path("p550")), "mention in a same-named channel of another team must be ignored"
   end
 
   def test_bot_not_mentioned_ignored
@@ -211,15 +224,32 @@ class TestMattermostListener < Minitest::Test
     assert ::File.exist?(item_path("p1000")), "handle_event should write a qualifying work-item"
   end
 
-  def test_prepare_resolves_bot_id_via_users_me
-    requests = []
+  def test_prepare_resolves_bot_id_and_team_id
     http = FakeHttp.new do |req|
-      requests << [req.method, req.path, req["Authorization"]]
-      FakeSuccess.new(JSON.generate(id: BOT_ID))
+      case [req.method, req.path]
+      when ["GET", "/api/v4/users/me"] then FakeSuccess.new(JSON.generate(id: BOT_ID))
+      when ["GET", "/api/v4/teams/name/eng"] then FakeSuccess.new(JSON.generate(id: TEAM_ID))
+      else raise "unexpected request: #{req.method} #{req.path}"
+      end
     end
     listener = build_listener
     stub_net_http(http) { listener.prepare }
 
-    assert_equal [["GET", "/api/v4/users/me", "Bearer secret-token"]], requests
+    assert_equal BOT_ID, listener.bot_id
+    assert_equal TEAM_ID, listener.team_id
+    assert_equal(
+      [["GET", "/api/v4/users/me", "Bearer secret-token"],
+       ["GET", "/api/v4/teams/name/eng", "Bearer secret-token"]],
+      http.requests.map { |req| [req.method, req.path, req["Authorization"]] }
+    )
+  end
+
+  def test_write_creates_missing_input_dir
+    listener = prepared_listener
+    FileUtils.remove_entry(@input_dir)
+
+    listener.on_message(posted_frame(post: { "id" => "p1100" }))
+
+    assert ::File.exist?(item_path("p1100")), "listener must create the inbox dir before writing"
   end
 end

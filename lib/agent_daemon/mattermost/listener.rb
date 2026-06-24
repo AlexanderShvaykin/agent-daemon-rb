@@ -29,6 +29,7 @@ module AgentDaemon
       def initialize(trigger_config, shutdown_flag)
         @base_url = URI(trigger_config.fetch("base_url"))
         @token = trigger_config.fetch("token")
+        @team = trigger_config.fetch("team")
         @channels = Array(trigger_config.fetch("channels"))
         @input_dir = trigger_config.fetch("input_dir")
         @archive_dir = trigger_config.fetch("archive_dir")
@@ -36,17 +37,19 @@ module AgentDaemon
         @shutdown_flag = shutdown_flag
 
         @bot_id = nil
+        @team_id = nil
         @backoff = INITIAL_BACKOFF
         @ws = nil
       end
 
-      attr_reader :bot_id, :backoff
+      attr_reader :bot_id, :team_id, :backoff
 
-      # Blocking bot-id resolution. Called by the reactor BEFORE EM.run so the
-      # reactor thread never blocks on network IO. Raises on failure so the
-      # reactor can log-and-skip this listener.
+      # Blocking bot-id + team-id resolution. Called by the reactor BEFORE EM.run
+      # so the reactor thread never blocks on network IO. Raises on failure so
+      # the reactor can log-and-skip this listener.
       def prepare
         @bot_id = resolve_bot_id
+        @team_id = resolve_team_id
         self
       end
 
@@ -94,6 +97,7 @@ module AgentDaemon
         return unless post_id.is_a?(String) && !post_id.empty?
 
         return if post["user_id"] == @bot_id
+        return unless data["team_id"] == @team_id
         return unless @channels.include?(data["channel_name"])
         return unless mentions(data).include?(@bot_id)
         return if already_seen?(post_id)
@@ -104,6 +108,8 @@ module AgentDaemon
       private
 
       def write_work_item(post, data)
+        FileUtils.mkdir_p(@input_dir)
+
         root_id = post["root_id"]
         root_id = post["id"] if root_id.nil? || root_id.empty?
 
@@ -191,16 +197,28 @@ module AgentDaemon
       # ---- blocking HTTP (prepare only) ----
 
       def resolve_bot_id
-        req = Net::HTTP::Get.new("/api/v4/users/me")
+        get_json("/api/v4/users/me").fetch("id")
+      end
+
+      def resolve_team_id
+        get_json("/api/v4/teams/name/#{escape(@team)}").fetch("id")
+      end
+
+      def get_json(path)
+        req = Net::HTTP::Get.new(path)
         req["Authorization"] = "Bearer #{@token}"
         req["Content-Type"] = "application/json"
 
         response = http.request(req)
         unless response.is_a?(Net::HTTPSuccess)
-          raise "Mattermost GET /api/v4/users/me returned #{response.code}: #{response.body}"
+          raise "Mattermost GET #{path} returned #{response.code}: #{response.body}"
         end
 
-        JSON.parse(response.body.to_s).fetch("id")
+        JSON.parse(response.body.to_s)
+      end
+
+      def escape(segment)
+        URI.encode_www_form_component(segment)
       end
 
       def http
