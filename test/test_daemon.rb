@@ -56,6 +56,20 @@ class TestDaemon < Minitest::Test
     }
   end
 
+  def mattermost_runner(name)
+    {
+      "name" => name,
+      "prompt_template" => File.basename(@template),
+      "trigger" => {
+        "type" => "mattermost",
+        "base_url" => "https://mm.example.com",
+        "token" => "tok",
+        "team" => "eng",
+        "channels" => ["town-square"]
+      }
+    }
+  end
+
   def test_daemon_builds_factory_per_runner
     config = make_config([tracker_runner("a"), file_runner("b")])
     daemon = AgentDaemon::Daemon.new(config)
@@ -93,5 +107,45 @@ class TestDaemon < Minitest::Test
     factory = daemon.send(:runner_factory_for, config.runners.first)
     instance = factory.call
     assert_instance_of AgentDaemon::Runner::File, instance
+  end
+
+  def test_runner_factory_for_mattermost_returns_mattermost_runner
+    config = make_config([mattermost_runner("m")])
+    daemon = AgentDaemon::Daemon.new(config)
+    factory = daemon.send(:runner_factory_for, config.runners.first)
+    instance = factory.call
+    assert_instance_of AgentDaemon::Runner::Mattermost, instance
+  end
+
+  def test_daemon_registers_one_shared_reactor_for_multiple_mattermost_runners
+    config = make_config([mattermost_runner("m1"), mattermost_runner("m2")])
+    daemon = AgentDaemon::Daemon.new(config)
+    daemon.send(:build_runner_factories)
+
+    factories = daemon.instance_variable_get(:@runner_factories)
+    # one consumer per runner + one shared reactor + messenger
+    assert factories.key?(:"runner:m1")
+    assert factories.key?(:"runner:m2")
+    assert factories.key?(:mattermost_reactor)
+    assert_equal 1, factories.keys.count { |k| k == :mattermost_reactor },
+                 "exactly one shared reactor thread"
+  end
+
+  def test_daemon_registers_no_reactor_without_mattermost_runners
+    config = make_config([tracker_runner("a"), file_runner("b")])
+    daemon = AgentDaemon::Daemon.new(config)
+    daemon.send(:build_runner_factories)
+
+    factories = daemon.instance_variable_get(:@runner_factories)
+    refute factories.key?(:mattermost_reactor)
+  end
+
+  def test_reactor_factory_builds_mattermost_reactor
+    config = make_config([mattermost_runner("m1"), mattermost_runner("m2")])
+    daemon = AgentDaemon::Daemon.new(config)
+    mattermost_runners = config.runners.select { |r| r.dig("trigger", "type") == "mattermost" }
+    factory = daemon.send(:reactor_factory_for, mattermost_runners)
+    instance = factory.call
+    assert_instance_of AgentDaemon::Mattermost::Reactor, instance
   end
 end
