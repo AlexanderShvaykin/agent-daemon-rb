@@ -8,9 +8,10 @@ module AgentDaemon
   module Transport
     # Delivers via the Mattermost (Loop) bot REST API using one bot token.
     # Resolves human-readable channel names and usernames to ids, caching each
-    # resolution for the lifetime of the daemon (ids are stable). Routes by the
-    # message's optional `user` (DM) / `channel` (named channel) fields, falling
-    # back to `default_channel`. stdlib only — Net::HTTP + json + uri.
+    # resolution for the lifetime of the daemon (ids are stable). Routes by
+    # precedence: `channel_id` (posted verbatim, skipping name resolution) →
+    # `user` (DM) → `channel` (named channel) → `default_channel`. An optional
+    # `root_id` threads the post as a reply. stdlib only — Net::HTTP + json + uri.
     class Mattermost < Base
       def initialize(messenger_config)
         super
@@ -22,15 +23,19 @@ module AgentDaemon
       end
 
       def deliver(message_data)
+        explicit_id = presence(message_data["channel_id"])
         channel = presence(message_data["channel"])
         user = presence(message_data["user"])
+        root_id = presence(message_data["root_id"])
 
         if channel && user
           raise "message specifies both channel (#{channel.inspect}) and user (#{user.inspect}); refusing to guess a destination"
         end
 
         channel_id =
-          if user
+          if explicit_id
+            explicit_id
+          elsif user
             dm_channel_id(user)
           elsif channel
             channel_id_by_name(channel)
@@ -38,7 +43,9 @@ module AgentDaemon
             channel_id_by_name(@default_channel)
           end
 
-        post("/api/v4/posts", { channel_id: channel_id, message: message_data["message"] })
+        body = { channel_id: channel_id, message: message_data["message"] }
+        body[:root_id] = root_id if root_id
+        post("/api/v4/posts", body)
       end
 
       private

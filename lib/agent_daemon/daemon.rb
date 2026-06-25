@@ -52,6 +52,14 @@ module AgentDaemon
         @runner_factories[thread_key(name)] = factory
       end
 
+      # EventMachine's reactor is a process singleton, so all mattermost
+      # listeners share exactly one reactor thread (a peer to the Messenger).
+      # Register it only when at least one mattermost runner exists.
+      mattermost_runners = @config.runners.select { |r| r.dig("trigger", "type") == "mattermost" }
+      unless mattermost_runners.empty?
+        @runner_factories[:mattermost_reactor] = reactor_factory_for(mattermost_runners)
+      end
+
       if messenger_configured?
         @runner_factories[:messenger] = -> { Messenger.new(@config, @shutdown_flag) }
       else
@@ -84,8 +92,23 @@ module AgentDaemon
         -> { Runner::Tracker.new(runner_config, message_dir, project_path, @shutdown_flag, tracker_config) }
       when "file"
         -> { Runner::File.new(runner_config, message_dir, project_path, @shutdown_flag) }
+      when "mattermost"
+        -> { Runner::Mattermost.new(runner_config, message_dir, project_path, @shutdown_flag) }
       else
         raise ArgumentError, "Unknown trigger type #{type.inspect} in runner #{runner_config['name'].inspect}"
+      end
+    end
+
+    # Builds the single shared reactor: one Mattermost::Listener per mattermost
+    # runner (from its trigger config + the shared shutdown flag), all hosted in
+    # one Mattermost::Reactor. The factory is re-invoked fresh by monitor_threads
+    # on crash-restart, rebuilding the listeners and re-entering EM.run.
+    def reactor_factory_for(mattermost_runners)
+      lambda do
+        listeners = mattermost_runners.map do |runner_config|
+          Mattermost::Listener.new(runner_config.fetch("trigger"), @shutdown_flag)
+        end
+        Mattermost::Reactor.new(listeners, @shutdown_flag)
       end
     end
 

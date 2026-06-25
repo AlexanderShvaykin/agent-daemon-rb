@@ -28,5 +28,8 @@ Gem::Specification.new do |spec|
   spec.executables = ["agent-daemon"]
   spec.require_paths = ["lib"]
 
+  spec.add_dependency "eventmachine"
+  spec.add_dependency "faye-websocket"
+
   spec.add_development_dependency "minitest"
 end

@@ -83,6 +83,35 @@ runners:
   #     interval: 300
   #   prompt_template: prompts/default.txt
 
+  # --- Example 4: Mattermost mention trigger (WebSocket, push) ---
+  # Listens over a WebSocket for @-mentions of the bot in the listed channels,
+  # writes each one as a work item, and runs the agent on it. The agent replies
+  # back into the originating thread by writing a message YAML (see
+  # prompts/mention.txt) that the Messenger's `mattermost` transport delivers.
+  # Requires the `eventmachine` + `faye-websocket` gems (the daemon's only
+  # runtime deps, used solely by this trigger).
+  # - name: mentions
+  #   backend: claude
+  #   agent: assistant
+  #   trigger:
+  #     type: mattermost
+  #     base_url: "https://chat.example.com"   # Mattermost/Loop server root
+  #     token: <%= secret('MM_BOT_TOKEN') %>   # bot access token
+  #     team: your-team-slug                   # channel names resolve within this team
+  #     channels:                              # only @-mentions in these channels trigger
+  #       - support
+  #       - general
+  #     # interval: 2          # inbox poll interval, seconds (default 2)
+  #     # jitter: 0            # random 0..jitter s added per cycle (default 0)
+  #     # Work dirs default to mentions/<name>/{inbox,done,failed} under
+  #     # project_path; override any of them explicitly if you like:
+  #     # input_dir: mentions/mentions/inbox
+  #     # archive_dir: mentions/mentions/done
+  #     # failed_dir: mentions/mentions/failed
+  #   prompt_template: prompts/mention.txt
+  #   message_dir: to_message   # where the reply YAML is written (default to_message)
+  #   # output_dir: to_message  # set if the agent writes other message files
+
 # Messenger thread — picks up YAML files from message_dir and delivers them
 # via the configured transport. Select the transport with `type` (default
 # "webhook"). The thread only starts when the selected transport is fully
@@ -102,6 +131,9 @@ messenger:
   # cached); messages with neither — including SYSTEM:<runner> errors — go to
   # default_channel. The bot must be a member of (or allowed to post to) the
   # target channels.
+  # A message YAML may also carry a `channel_id` + `root_id` pair to post a
+  # threaded reply verbatim — this is how the `mattermost` mention trigger
+  # answers in-thread (see Example 4 above).
   # type: mattermost
   # base_url: "https://chat.example.com"      # Mattermost/Loop server root
   # token: <%= secret('MM_BOT_TOKEN') %>      # bot access token

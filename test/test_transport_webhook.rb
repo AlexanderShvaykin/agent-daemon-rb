@@ -23,9 +23,17 @@ class TestTransportWebhook < Minitest::Test
     assert_equal({ "text" => "Done" }, JSON.parse(req.body))
   end
 
-  def test_ignores_channel_and_user_fields
+  def test_ignores_routing_fields
     http = FakeHttp.new { FakeSuccess.new }
-    build(http) { |t| t.deliver("message" => "Done", "channel" => "dev", "user" => "ivan") }
+    build(http) do |t|
+      t.deliver(
+        "message" => "Done",
+        "channel" => "dev",
+        "user" => "ivan",
+        "channel_id" => "chanXYZ",
+        "root_id" => "root123"
+      )
+    end
 
     assert_equal 1, http.requests.size
     assert_equal({ "text" => "Done" }, JSON.parse(http.requests.first.body))

@@ -4,8 +4,13 @@
 
 AgentDaemon is a Ruby daemon that runs one thread per configured runner plus a
 dedicated Messenger thread. Threads communicate exclusively through the
-filesystem (YAML files in a shared directory). The daemon has zero external gem
-dependencies — it uses only the Ruby standard library.
+filesystem (YAML files in a shared directory). The daemon is stdlib-only with
+two exceptions: `eventmachine` and `faye-websocket`. Those two are runtime
+dependencies used *only* by the `mattermost` trigger, which needs a WebSocket
+client to receive @-mentions; rather than hand-roll RFC 6455 over a raw socket,
+that one trigger leans on faye-websocket running inside an EventMachine reactor.
+Everything else — tracker/file triggers, backends, the Messenger and its
+transports — stays on the standard library alone.
 
 ## Component Map
 
@@ -28,9 +33,13 @@ dependencies — it uses only the Ruby standard library.
 ## Threading Model
 
 `Daemon` starts one `Thread` per runner entry in the config, plus one for
-`Messenger`. All threads share a single `ShutdownFlag` instance — a lightweight
-object whose `@value` boolean flips from `false` to `true` on shutdown. Because
-MRI's GIL makes boolean reads/writes atomic, no mutex is needed.
+`Messenger`. When at least one `mattermost` runner exists it also starts a single
+shared `Mattermost::Reactor` thread (`:mattermost_reactor`) — one for *all*
+mattermost runners, because EventMachine's reactor is a process singleton (see
+[Runner::Mattermost](#runnermattermost)). All threads share a single
+`ShutdownFlag` instance — a lightweight object whose `@value` boolean flips from
+`false` to `true` on shutdown. Because MRI's GIL makes boolean reads/writes
+atomic, no mutex is needed.
 
 The `Daemon#monitor_threads` loop checks every second whether any thread has
 crashed (marked via `Thread.current[:crashed]`). A crashed thread is restarted
@@ -68,6 +77,55 @@ string. Each returned issue becomes a work item keyed by its issue key.
 
 Polls `input_dir` for `*.yml` files. On success the file moves to
 `archive_dir`; after exhausting `max_attempts` it moves to `failed_dir`.
+
+### Runner::Mattermost
+
+A `mattermost` runner turns Mattermost @-mentions into agent runs and posts the
+answer back as a threaded reply. It is the only **push**-driven trigger, so it
+is split across two cooperating pieces plus the shared reactor:
+
+- **`Mattermost::Listener`** — a per-runner WebSocket handler. It does *not* own
+  a thread: the reactor creates its faye-websocket client and drives the
+  callbacks. Before the reactor loop starts, `#prepare` resolves the bot id once
+  with a blocking `GET /api/v4/users/me` and the team id with
+  `GET /api/v4/teams/name/{team}` (so the reactor thread never blocks on IO
+  inside the loop). It then connects, sends an `authentication_challenge`,
+  and for each incoming `posted` event applies four filters — not the bot
+  itself, the event's `team_id` matching the configured team (so a like-named
+  channel in another team cannot trigger), channel in the runner's `channels`
+  allowlist, and the bot id present in the event's `mentions` — before
+  de-duplicating by post id (checked across
+  the inbox, done, and failed dirs). A qualifying mention is written as a
+  `<post_id>.yml` work-item into the inbox, carrying `message`, `channel_id`,
+  `root_id` (the post's thread root, falling back to its own id for a top-level
+  post), `sender`, `channel_name`, `post_id`, and `created_at`. On socket close
+  it reconnects with capped exponential backoff (1s → 30s); the backoff resets
+  only on the server's `hello` event (auth confirmed), so a bad token — which
+  still opens the socket — keeps backing off instead of hot-looping.
+
+- **`Mattermost::Reactor`** — the single shared EventMachine reactor thread that
+  hosts *every* listener. EventMachine's reactor is a process singleton
+  (`EM.run` runs once per process), so the daemon registers exactly one reactor
+  (`:mattermost_reactor`), a peer to the Messenger, regardless of how many
+  mattermost runners are configured. It resolves every listener's bot id up
+  front; a listener that fails to prepare is logged and skipped without blocking
+  the others. Inside `EM.run` each prepared listener opens its connection and a
+  1-second periodic timer bridges the cooperative `ShutdownFlag` into `EM.stop`.
+  The thread holds no un-recreatable state, so `monitor_threads` can restart it
+  exactly like the runner/Messenger threads — it re-enters `EM.run` fresh and
+  all clients reconnect.
+
+- **`Runner::Mattermost < Runner::File`** — the consumer. It reuses the
+  file-trigger machinery wholesale (oldest-first poll of the inbox, per-item
+  attempt tracking, archive on success, move to failed on exhausted) and only
+  overrides `render_prompt` to expose the work-item fields (`message`,
+  `channel_id`, `root_id`, `sender`, `channel_name`, `post_id`) as `{{...}}`
+  prompt variables alongside `input_file`.
+
+The reply path is the ordinary Messenger contract: the prompt instructs the
+agent to write a message YAML into `message_dir` with `channel_id` and `root_id`
+copied from the work-item, which the `mattermost` transport posts verbatim into
+the originating thread (see [Transports](#transports)).
 
 ## Backends
 
@@ -130,21 +188,31 @@ valid values. Adding a transport means a new `transport/<name>.rb` plus a
   (`GET /teams/{team_id}/channels/name/{name}`) and user ids /
   direct-channel ids (`GET /users/username/{name}` +
   `POST /channels/direct`), caching each resolution for the daemon's lifetime
-  (ids are stable). Posts via `POST /api/v4/posts` with `{channel_id, message}`.
-  stdlib only (`Net::HTTP`, `json`, `uri`).
+  (ids are stable). Destination is chosen by precedence: a verbatim
+  `channel_id` (skips all name resolution) → `user` (DM) → `channel` (named) →
+  `default_channel`. An optional `root_id` threads the post as a reply. Posts
+  via `POST /api/v4/posts` with `{channel_id, message}` (plus `root_id` when
+  set). The `channel_id`/`root_id` pair is what the mattermost *trigger*
+  consumer copies from a mention work-item so the agent's answer lands back in
+  the originating thread. stdlib only (`Net::HTTP`, `json`, `uri`).
 
 ### Message routing
 
 A message YAML may carry optional routing fields the agent fills in from the
 context it already has:
 
+- `channel_id: <id>` — post verbatim to that channel id (no name resolution).
+  Combined with `root_id: <id>` it threads the reply. This is the pair the
+  mattermost mention trigger surfaces, letting a replying agent answer in the
+  exact channel and thread it was mentioned in.
 - `channel: <name>` — post to that named channel (within the configured `team`).
 - `user: <username>` — send a direct message to that user.
-- neither — post to `messenger.default_channel`. `SYSTEM:<runner>` error
-  messages always fall here, since the runner does not set routing fields.
+- none of the above — post to `messenger.default_channel`. `SYSTEM:<runner>`
+  error messages always fall here, since the runner does not set routing fields.
 
 Specifying both `channel` and `user` is an error — the `mattermost` transport
-raises rather than silently picking one. The `webhook` transport ignores both.
+raises rather than silently picking one. The `webhook` transport ignores all of
+these routing fields (a webhook is a single fixed destination).
 
 ## Prompt Templates
 
@@ -158,14 +226,20 @@ at render time. Available variables:
 - **Trigger-specific runtime vars**:
   - Tracker: `{{task_key}}` (the issue key).
   - File: `{{input_file}}` (absolute path to the YAML work item).
+  - Mattermost: `{{input_file}}` plus the captured work-item fields
+    `{{message}}`, `{{channel_id}}`, `{{root_id}}`, `{{sender}}`,
+    `{{channel_name}}`, `{{post_id}}`.
 
 Undefined variables remain literal and produce a log warning.
 
 When the agent writes a message YAML into `message_dir`, the prompt template
 should teach it the contract: a required `message` key plus, for the
-`mattermost` transport, optional `channel: <name>` or `user: <username>` to
-route the notification (set at most one — both is an error). Omitting both
-sends to `messenger.default_channel`.
+`mattermost` transport, optional routing fields. To reply to a mention in its
+originating thread, the prompt copies `channel_id: {{channel_id}}` and
+`root_id: {{root_id}}` straight from the work-item. To notify a named
+destination instead, set at most one of `channel: <name>` or `user: <username>`
+(both is an error). Omitting all routing fields sends to
+`messenger.default_channel`.
 
 ## Error Handling and Escalation
 
@@ -194,6 +268,11 @@ fully commented example.
 
 Absolute paths are used verbatim.
 
+A `mattermost` trigger reuses the same `input_dir`/`archive_dir`/`failed_dir`
+resolution as the file trigger; when those keys are omitted they default to
+`mentions/<runner-name>/inbox`, `mentions/<runner-name>/done`, and
+`mentions/<runner-name>/failed` (each then resolved relative to `project_path`).
+
 ### Validation
 
 Config loading fails immediately with descriptive errors when:
@@ -201,8 +280,9 @@ Config loading fails immediately with descriptive errors when:
 - `runners` is missing, not a list, or empty.
 - Runner names are duplicated.
 - A runner is missing `name`, `prompt_template`, or `trigger`.
-- `trigger.type` is not `tracker` or `file`.
-- Trigger-specific required keys are missing.
+- `trigger.type` is not `tracker`, `file`, or `mattermost`.
+- Trigger-specific required keys are missing (e.g. a `mattermost` trigger
+  requires `base_url`, `token`, `team`, and a non-empty `channels` list).
 - A prompt template file does not exist on disk.
 
 ## Deployment

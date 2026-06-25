@@ -34,10 +34,11 @@ module AgentDaemon
       "trigger" => {}
     }.freeze
 
-    TRACKER_TRIGGER_DEFAULTS = { "interval" => 60, "jitter" => 5 }.freeze
-    FILE_TRIGGER_DEFAULTS    = { "interval" => 10, "jitter" => 5 }.freeze
+    TRACKER_TRIGGER_DEFAULTS    = { "interval" => 60, "jitter" => 5 }.freeze
+    FILE_TRIGGER_DEFAULTS       = { "interval" => 10, "jitter" => 5 }.freeze
+    MATTERMOST_TRIGGER_DEFAULTS = { "interval" => 2, "jitter" => 0 }.freeze
 
-    VALID_TRIGGER_TYPES   = %w[tracker file].freeze
+    VALID_TRIGGER_TYPES   = %w[tracker file mattermost].freeze
     VALID_BACKENDS        = %w[claude opencode].freeze
     VALID_MESSENGER_TYPES = %w[webhook mattermost].freeze
     MATTERMOST_REQUIRED   = %w[base_url token team default_channel].freeze
@@ -111,7 +112,7 @@ module AgentDaemon
       return raw unless raw.is_a?(Hash)
 
       runner = deep_merge(RUNNER_DEFAULTS, raw)
-      runner["trigger"] = build_trigger(runner["trigger"])
+      runner["trigger"] = build_trigger(runner["trigger"], runner["name"])
 
       if runner["output_dir"].is_a?(String) && !runner["output_dir"].empty?
         runner["output_dir"] = File.expand_path(runner["output_dir"], @data["project_path"] || "")
@@ -124,23 +125,35 @@ module AgentDaemon
       runner
     end
 
-    def build_trigger(raw_trigger)
+    def build_trigger(raw_trigger, runner_name = nil)
       return {} unless raw_trigger.is_a?(Hash)
 
       case raw_trigger["type"]
       when "tracker"
         deep_merge(TRACKER_TRIGGER_DEFAULTS, raw_trigger)
       when "file"
-        trigger = deep_merge(FILE_TRIGGER_DEFAULTS, raw_trigger)
-        %w[input_dir archive_dir failed_dir].each do |key|
-          if trigger[key].is_a?(String) && !trigger[key].empty?
-            trigger[key] = File.expand_path(trigger[key], @data["project_path"] || "")
-          end
-        end
-        trigger
+        resolve_trigger_dirs(deep_merge(FILE_TRIGGER_DEFAULTS, raw_trigger))
+      when "mattermost"
+        trigger = deep_merge(MATTERMOST_TRIGGER_DEFAULTS, raw_trigger)
+        name = runner_name.to_s
+        trigger["input_dir"]   ||= "mentions/#{name}/inbox"
+        trigger["archive_dir"] ||= "mentions/#{name}/done"
+        trigger["failed_dir"]  ||= "mentions/#{name}/failed"
+        resolve_trigger_dirs(trigger)
       else
         raw_trigger
       end
+    end
+
+    # Resolve a file-poll trigger's three work dirs relative to project_path.
+    # Shared by the file and mattermost triggers; leaves absolute paths verbatim.
+    def resolve_trigger_dirs(trigger)
+      %w[input_dir archive_dir failed_dir].each do |key|
+        if trigger[key].is_a?(String) && !trigger[key].empty?
+          trigger[key] = File.expand_path(trigger[key], @data["project_path"] || "")
+        end
+      end
+      trigger
     end
 
     def validate!
@@ -264,6 +277,20 @@ module AgentDaemon
           unless trigger[key].is_a?(String) && !trigger[key].empty?
             errors << "runner #{runner_label.inspect}: trigger.#{key} is required (String)"
           end
+        end
+        unless trigger["interval"].is_a?(Integer) && trigger["interval"] > 0
+          errors << "runner #{runner_label.inspect}: trigger.interval must be a positive Integer"
+        end
+      when "mattermost"
+        %w[base_url token team].each do |key|
+          unless trigger[key].is_a?(String) && !trigger[key].empty?
+            errors << "runner #{runner_label.inspect}: trigger.#{key} is required (String)"
+          end
+        end
+        channels = trigger["channels"]
+        unless channels.is_a?(Array) && !channels.empty? &&
+               channels.all? { |c| c.is_a?(String) && !c.empty? }
+          errors << "runner #{runner_label.inspect}: trigger.channels must be a non-empty Array of non-empty Strings"
         end
         unless trigger["interval"].is_a?(Integer) && trigger["interval"] > 0
           errors << "runner #{runner_label.inspect}: trigger.interval must be a positive Integer"

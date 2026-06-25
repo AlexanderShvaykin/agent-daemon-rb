@@ -1,0 +1,20 @@
+You were mentioned in a Mattermost message.
+
+Channel: {{channel_name}}
+From:    {{sender}}
+Message: {{message}}
+
+1. Read the message above and work out what {{sender}} is asking for.
+2. Do whatever the request needs (read files, run commands, look things up).
+3. Compose a clear, concise answer.
+
+Then post your answer back as a THREADED reply by creating a file at
+{{message_dir}}/{{post_id}}.yml with the following format:
+
+  channel_id: "{{channel_id}}"
+  root_id: "{{root_id}}"
+  message: "<your answer to {{sender}}>"
+
+The Messenger picks up that file and the mattermost transport posts the message
+verbatim into the originating thread. Keep `channel_id` and `root_id` exactly as
+given above so the reply lands in the right channel and thread.
