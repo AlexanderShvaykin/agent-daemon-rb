@@ -7,7 +7,7 @@ require_relative "base"
 module AgentDaemon
   module Runner
     class File < Base
-      def initialize(runner_config, message_dir, project_path, shutdown_flag)
+      def initialize(runner_config, message_dir, project_path, shutdown_flag, sinks: nil)
         super
         trigger = runner_config.fetch("trigger")
         @input_dir   = trigger.fetch("input_dir")

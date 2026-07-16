@@ -21,9 +21,10 @@ module AgentDaemon
     # logic is the pure, directly-testable seam; the EM.run body itself is
     # smoke-test-only.
     class Reactor
-      def initialize(listeners, shutdown_flag)
+      def initialize(listeners, shutdown_flag, sinks: nil)
         @listeners = listeners
         @shutdown_flag = shutdown_flag
+        @sinks = sinks || Sinks::Bundle.null("mattermost_reactor")
       end
 
       # Thread entrypoint. Resolves every listener's bot id, then enters the
@@ -31,10 +32,12 @@ module AgentDaemon
       # periodic timer bridges the cooperative shutdown flag into EM.stop.
       def run
         Log.info("[Mattermost::Reactor] Thread started")
+        @sinks.publish_state(status: :running)
         prepared = prepare_listeners
 
         if prepared.empty?
           Log.warn("[Mattermost::Reactor] no listeners prepared, nothing to run")
+          @sinks.publish_state(status: :stopped)
           return
         end
 
@@ -43,6 +46,7 @@ module AgentDaemon
           EM.add_periodic_timer(1) { EM.stop if @shutdown_flag.value }
         end
 
+        @sinks.publish_state(status: :stopped)
         Log.info("[Mattermost::Reactor] Thread stopping gracefully")
       end
 

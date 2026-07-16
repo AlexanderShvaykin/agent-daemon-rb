@@ -7,9 +7,10 @@ module AgentDaemon
   class Messenger
     MAX_CONSECUTIVE_ERRORS = 3
 
-    def initialize(config, shutdown_flag)
+    def initialize(config, shutdown_flag, sinks: nil)
       @config = config
       @shutdown_flag = shutdown_flag
+      @sinks = sinks || Sinks::Bundle.null("messenger")
       @messenger_config = config.messenger
       @transport = Transport.for(@messenger_config)
       @consecutive_errors = 0
@@ -17,12 +18,14 @@ module AgentDaemon
 
     def run
       Log.info("[Messenger] Thread started")
+      @sinks.publish_state(status: :running)
 
       until @shutdown_flag.value
         iterate
         wait_interval
       end
 
+      @sinks.publish_state(status: :stopped)
       Log.info("[Messenger] Thread stopping gracefully")
     end
 

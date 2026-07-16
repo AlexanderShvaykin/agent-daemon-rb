@@ -11,12 +11,13 @@ module AgentDaemon
 
       attr_reader :name
 
-      def initialize(runner_config, message_dir, project_path, shutdown_flag)
+      def initialize(runner_config, message_dir, project_path, shutdown_flag, sinks: nil)
         @runner_config = runner_config
         @message_dir = message_dir
         @project_path = project_path
         @shutdown_flag = shutdown_flag
         @name = runner_config.fetch("name")
+        @sinks = sinks || Sinks::Bundle.null(@name)
         @max_attempts = runner_config.fetch("max_attempts")
         @interval = runner_config.fetch("trigger").fetch("interval")
         @jitter = runner_config.fetch("trigger").fetch("jitter", 0)
@@ -24,18 +25,21 @@ module AgentDaemon
         @consecutive_errors = 0
         @backoff = nil
         @backend = Backend.for(runner_config, shutdown_flag,
-                               message_dir: message_dir, project_path: project_path)
+                               message_dir: message_dir, project_path: project_path,
+                               sinks: @sinks)
         @prompt_template = PromptTemplate.new(runner_config.fetch("prompt_template_path"))
       end
 
       def run
         Log.info("[#{log_tag}] Thread started")
+        @sinks.publish_state(status: :waiting)
 
         until @shutdown_flag.value
           iterate
           wait_interval(next_wait_seconds)
         end
 
+        @sinks.publish_state(status: :stopped)
         Log.info("[#{log_tag}] Thread stopping gracefully")
       end
 
@@ -92,11 +96,14 @@ module AgentDaemon
           return
         end
 
+        @sinks.publish_event(type: :picked_up, work_item: key, at: Time.now.utc.iso8601)
         prompt = render_prompt(item)
         @attempts[key] += 1
         attempt_no = @attempts[key]
         Log.info("[#{log_tag}] Running #{@runner_config['backend']} for #{key} (attempt #{attempt_no}/#{@max_attempts})")
 
+        @sinks.publish_event(type: :started, work_item: key, attempt: attempt_no, at: Time.now.utc.iso8601)
+        @sinks.publish_state(status: :in_progress, work_item: key, attempt: attempt_no)
         result = @backend.run(prompt)
 
         case result.reason
@@ -116,6 +123,9 @@ module AgentDaemon
           Log.info("[#{log_tag}] CLI killed for #{key} (shutdown), attempt rolled back")
           after_killed(item)
         end
+
+        @sinks.publish_event(type: :finished, work_item: key, reason: result.reason, attempt: attempt_no, at: Time.now.utc.iso8601)
+        @sinks.publish_state(status: :waiting)
       end
 
       # --- Extension points ---

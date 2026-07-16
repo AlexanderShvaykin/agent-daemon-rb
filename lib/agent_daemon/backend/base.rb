@@ -12,24 +12,25 @@ module AgentDaemon
     # Grace period between SIGTERM and SIGKILL when killing process group.
     TERM_GRACE_SECONDS = 2
 
-    def self.for(runner_config, shutdown_flag, message_dir:, project_path:)
+    def self.for(runner_config, shutdown_flag, message_dir:, project_path:, sinks: nil)
       name = runner_config.fetch("backend", "claude")
       case name
       when "claude"
-        Claude.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path)
+        Claude.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path, sinks: sinks)
       when "opencode"
-        OpenCode.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path)
+        OpenCode.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path, sinks: sinks)
       else
         raise ArgumentError, "Unsupported backend #{name.inspect} in runner #{runner_config['name'].inspect}. Valid values: claude, opencode"
       end
     end
 
     class Base
-      def initialize(runner_config, shutdown_flag, message_dir:, project_path:)
+      def initialize(runner_config, shutdown_flag, message_dir:, project_path:, sinks: nil)
         @runner_config = runner_config
         @shutdown_flag = shutdown_flag
         @message_dir = message_dir
         @project_path = project_path
+        @sinks = sinks || Sinks::Bundle.null
       end
 
       def run(prompt)
