@@ -1,0 +1,24 @@
+# Agent Daemon — example SUPERVISOR configuration
+#
+# A supervisor config enumerates existing per-workflow configs (the same files
+# you would pass to bin/agent-daemon) by a unique name. The master loads each
+# referenced config and keys every runner by a composite (workflow, runner)
+# identity.
+#
+# NOTE: there is no runnable supervisor entrypoint yet — `bin/agent-supervisor`
+# arrives in a later story. This file documents the config shape only.
+#
+# Like a per-workflow config, this file is rendered as an ERB template before
+# YAML parsing, so `<%%= secret('KEY') %>` / `<%%= ENV['KEY'] %>` work here too.
+
+# Each entry references an EXISTING per-workflow config by a name that must be
+# unique across this file. The `config` path resolves relative to THIS file's
+# directory. Two workflows may share a project_path, but must NOT resolve to the
+# same message_dir, the same runner output_dir, or the same trigger work-dir
+# (input_dir/archive_dir/failed_dir) — a collision is rejected at load with a
+# ConfigError.
+workflows:
+  - name: task-analyst                    # becomes the `workflow` half of every identity
+    config: workflows/task-analyst.yml     # path to a per-workflow config, relative to this file
+  - name: reviewer
+    config: workflows/reviewer.yml
