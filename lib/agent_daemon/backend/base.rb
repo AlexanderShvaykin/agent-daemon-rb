@@ -5,32 +5,37 @@ require "shellwords"
 
 module AgentDaemon
   module Backend
-    Result = Struct.new(:success, :stdout, :stderr, :reason)
+    Result = Struct.new(:success, :stdout, :stderr, :reason, :started_at, :finished_at, :pid)
 
     # How often to wake up from IO.select to check deadline / shutdown.
     POLL_INTERVAL = 0.5
     # Grace period between SIGTERM and SIGKILL when killing process group.
     TERM_GRACE_SECONDS = 2
 
-    def self.for(runner_config, shutdown_flag, message_dir:, project_path:, sinks: nil)
+    def self.for(runner_config, shutdown_flag, message_dir:, project_path:, sinks: nil, cancel_flag: nil)
       name = runner_config.fetch("backend", "claude")
       case name
       when "claude"
-        Claude.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path, sinks: sinks)
+        Claude.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path, sinks: sinks, cancel_flag: cancel_flag)
       when "opencode"
-        OpenCode.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path, sinks: sinks)
+        OpenCode.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path, sinks: sinks, cancel_flag: cancel_flag)
       else
         raise ArgumentError, "Unsupported backend #{name.inspect} in runner #{runner_config['name'].inspect}. Valid values: claude, opencode"
       end
     end
 
     class Base
-      def initialize(runner_config, shutdown_flag, message_dir:, project_path:, sinks: nil)
+      def initialize(runner_config, shutdown_flag, message_dir:, project_path:, sinks: nil, cancel_flag: nil)
         @runner_config = runner_config
         @shutdown_flag = shutdown_flag
         @message_dir = message_dir
         @project_path = project_path
         @sinks = sinks || Sinks::Bundle.null
+        # Optional per-runner cancel token: any object responding to #value
+        # (truthy = cancel), the same protocol as ShutdownFlag. Nothing sets
+        # it yet — the supervisor passes a real token when respawn/manual
+        # restart lands.
+        @cancel_flag = cancel_flag
       end
 
       def run(prompt)
@@ -46,14 +51,21 @@ module AgentDaemon
       end
 
       # Run cmd via popen3 with its own process group. Loop on IO.select with
-      # POLL_INTERVAL, draining stdout/stderr into buffers, checking the
-      # deadline and the shutdown flag on every wake. Returns a Result whose
-      # `reason` is one of :ok, :failed, :timeout, :killed.
+      # POLL_INTERVAL, appending stdout/stderr chunks to buffers and through
+      # the output sink, checking the deadline, the shutdown flag, and the
+      # optional cancel flag on every wake. Remaining output is drained on
+      # every terminal path — including :timeout and :killed — before the
+      # child is reaped. Returns a Result whose `reason` is one of :ok,
+      # :failed, :timeout, :killed, carrying start/end timestamps and the
+      # child pid.
       def execute(cmd, timeout:)
+        started_at = Time.now.utc
         deadline = Time.now + timeout
         stdout_buf = +""
         stderr_buf = +""
         reason = nil
+        pid = nil
+        finished_at = nil
 
         Open3.popen3(cmd, pgroup: true) do |stdin, out, err, wait_thr|
           stdin.close
@@ -61,7 +73,7 @@ module AgentDaemon
           streams = [out, err]
 
           loop do
-            if @shutdown_flag.value
+            if @shutdown_flag.value || @cancel_flag&.value
               reason = :killed
               kill_process_group(pid)
               break
@@ -79,9 +91,9 @@ module AgentDaemon
                 begin
                   chunk = io.read_nonblock(4096)
                   if io == out
-                    stdout_buf << chunk
+                    append_chunk(:stdout, chunk, stdout_buf)
                   else
-                    stderr_buf << chunk
+                    append_chunk(:stderr, chunk, stderr_buf)
                   end
                 rescue IO::WaitReadable
                   next
@@ -96,21 +108,31 @@ module AgentDaemon
             end
           end
 
-          # Drain whatever is left and reap the process.
-          drain_remaining(out, stdout_buf) if reason.nil? || reason == :ok
-          drain_remaining(err, stderr_buf) if reason.nil? || reason == :ok
+          # Drain whatever is left — on every terminal path, including
+          # :timeout and :killed — and reap the process.
+          drain_remaining(out, :stdout, stdout_buf)
+          drain_remaining(err, :stderr, stderr_buf)
 
           status = wait_thr.value
           reason ||= status.success? ? :ok : :failed
+          finished_at = Time.now.utc
         end
 
         success = reason == :ok
-        Result.new(success, stdout_buf, stderr_buf, reason)
+        Result.new(success, stdout_buf, stderr_buf, reason, started_at, finished_at, pid)
       end
 
-      def drain_remaining(io, buf)
+      # The single ingress for agent output: every chunk — read in the select
+      # loop or drained after it — lands in the buffer and goes through the
+      # output sink here.
+      def append_chunk(stream, chunk, buf)
+        buf << chunk
+        @sinks.append_output(stream, chunk)
+      end
+
+      def drain_remaining(io, stream, buf)
         loop do
-          buf << io.read_nonblock(4096)
+          append_chunk(stream, io.read_nonblock(4096), buf)
         rescue IO::WaitReadable, EOFError, IOError
           break
         end
