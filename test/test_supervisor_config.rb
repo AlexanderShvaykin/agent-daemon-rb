@@ -392,6 +392,22 @@ class TestSupervisorConfig < Minitest::Test
     end
   end
 
+  # Task 5 (1.4) — a ':' in a runner name is rejected (identity delimiter),
+  # closing the 1.1 review deferral ("runner names come from core and remain a
+  # Story 1.4 concern").
+  def test_runner_name_with_colon_raises
+    specs = [
+      { name: "wf", file: "wf",
+        data: sandboxed_workflow_data(runner_extra: { "name" => "a:b" }) }
+    ]
+    with_supervisor(specs) do |_dir, path|
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Supervisor::Config.new(path) }
+      assert_match(/must not contain ':'/, err.message)
+      assert_match(/wf/, err.message)
+      assert_match(/a:b/, err.message)
+    end
+  end
+
   # [R3 Patch LOW] stray trigger work-dir keys on a tracker trigger (which core
   # never resolves to absolute paths) must not enter the collision map — two
   # workflows with the same leftover relative input_dir do NOT collide.

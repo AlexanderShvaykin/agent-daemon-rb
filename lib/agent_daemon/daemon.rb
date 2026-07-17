@@ -67,18 +67,8 @@ module AgentDaemon
       end
     end
 
-    # The Messenger thread starts only when the selected transport has what it
-    # needs. config.rb validation already guarantees the mattermost keys are
-    # present (or the config raised); webhook_url stays optional, so an empty
-    # one simply leaves the messenger disabled.
     def messenger_configured?
-      messenger = @config.messenger
-      case messenger["type"]
-      when "mattermost"
-        Config::MATTERMOST_REQUIRED.all? { |key| !messenger[key].to_s.empty? }
-      else
-        !messenger["webhook_url"].to_s.empty?
-      end
+      Messenger.configured?(@config.messenger)
     end
 
     def runner_factory_for(runner_config)

@@ -1,0 +1,27 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+$stdout.sync = true
+
+require_relative "../lib/agent_daemon"
+require_relative "../lib/agent_daemon/supervisor/master"
+
+config_path = ARGV[0]
+
+unless config_path && File.exist?(config_path)
+  warn "Config not found: #{config_path}"
+  warn "Usage: #{$PROGRAM_NAME} <supervisor-config.yml>"
+  exit 1
+end
+
+config = AgentDaemon::Supervisor::Config.new(config_path)
+
+logger = ::Logger.new($stdout)
+logger.level = ::Logger::INFO
+logger.formatter = proc { |severity, _datetime, _progname, msg| "#{severity}: #{msg}\n" }
+AgentDaemon::Log.use(logger)
+
+AgentDaemon::Log.info("Loaded supervisor config from #{config_path}")
+
+master = AgentDaemon::Supervisor::Master.new(config)
+master.start

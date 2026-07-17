@@ -7,6 +7,19 @@ module AgentDaemon
   class Messenger
     MAX_CONSECUTIVE_ERRORS = 3
 
+    # The Messenger thread starts only when the selected transport has what it
+    # needs. config.rb validation already guarantees the mattermost keys are
+    # present (or the config raised); webhook_url stays optional, so an empty
+    # one simply leaves the messenger disabled.
+    def self.configured?(messenger_config)
+      case messenger_config["type"]
+      when "mattermost"
+        Config::MATTERMOST_REQUIRED.all? { |key| !messenger_config[key].to_s.empty? }
+      else
+        !messenger_config["webhook_url"].to_s.empty?
+      end
+    end
+
     def initialize(config, shutdown_flag, sinks: nil)
       @config = config
       @shutdown_flag = shutdown_flag

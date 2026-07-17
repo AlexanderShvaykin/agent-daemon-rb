@@ -113,6 +113,17 @@ module AgentDaemon
           return { name: name, load_error: "workflow #{name.inspect} (#{config_ref}): #{e.message} in #{@config_path}" }
         end
 
+        # RunnerIdentity::DELIMITER also joins the runner half of
+        # #thread_key/#log_tag; a runner name carrying it would make composite
+        # keys ambiguous to parse back apart. Runner names are core's concern,
+        # but the delimiter itself belongs to the supervisor (Story 1.1 review
+        # deferral), so the guard lives here alongside the workflow-name one.
+        colliding = config.runners.select { |r| r["name"].to_s.include?(RunnerIdentity::DELIMITER) }
+        unless colliding.empty?
+          bad_names = colliding.map { |r| r["name"].inspect }.join(", ")
+          return { name: name, load_error: "workflow #{name.inspect}: runner name(s) #{bad_names} must not contain '#{RunnerIdentity::DELIMITER}' in #{config.config_path}" }
+        end
+
         {
           name: name,
           config: config,

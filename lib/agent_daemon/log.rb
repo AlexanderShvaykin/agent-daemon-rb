@@ -31,6 +31,12 @@ module AgentDaemon
       @logger || ::Logger.new($stdout)
     end
 
+    # Install a pre-built logger directly (bypasses core #setup's Config
+    # dependency). Without this, callers without a core Config fall back to
+    # #logger's default, which allocates a fresh Logger.new($stdout) per call
+    # at DEBUG level — runner Log.debug full-output dumps would flood stdout.
+    def self.use(logger) = @logger = logger
+
     def self.info(msg)    = logger.info(msg)
     def self.warn(msg)    = logger.warn(msg)
     def self.error(msg)   = logger.error(msg)
