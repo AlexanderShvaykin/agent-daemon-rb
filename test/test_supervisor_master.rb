@@ -93,7 +93,7 @@ class TestSupervisorMaster < Minitest::Test
     ) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config)
       master.send(:build_factories)
-      factories = master.instance_variable_get(:@factories)
+      factories = master.instance_variable_get(:@entity_factories)
 
       assert factories.key?(:"runner:wfA:r")
       assert factories.key?(:"runner:wfB:r")
@@ -101,6 +101,9 @@ class TestSupervisorMaster < Minitest::Test
   end
 
   # --- Factory products --------------------------------------------------
+  # Factories are now 1-arg (Story 1.5: they receive the per-generation
+  # Sinks::Bundle a RunnerSupervisor builds), so each call site here passes
+  # one explicitly instead of relying on a captured null bundle.
 
   def test_factory_products_per_trigger_type
     with_config(
@@ -110,15 +113,16 @@ class TestSupervisorMaster < Minitest::Test
     ) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config)
       master.send(:build_factories)
-      factories = master.instance_variable_get(:@factories)
+      factories = master.instance_variable_get(:@entity_factories)
+      identity = master.instance_variable_get(:@entity_ids).fetch(:"runner:wf:t")
 
-      instance = factories.fetch(:"runner:wf:t").call
+      instance = factories.fetch(:"runner:wf:t").call(AgentDaemon::Sinks::Bundle.null(identity))
       assert_instance_of AgentDaemon::Runner::Tracker, instance
 
-      identity = instance.instance_variable_get(:@sinks).instance_variable_get(:@entity_id)
-      assert_instance_of AgentDaemon::Supervisor::RunnerIdentity, identity
-      assert_equal "wf", identity.workflow
-      assert_equal "t", identity.runner
+      sink_entity_id = instance.instance_variable_get(:@sinks).instance_variable_get(:@entity_id)
+      assert_instance_of AgentDaemon::Supervisor::RunnerIdentity, sink_entity_id
+      assert_equal "wf", sink_entity_id.workflow
+      assert_equal "t", sink_entity_id.runner
     end
   end
 
@@ -130,9 +134,9 @@ class TestSupervisorMaster < Minitest::Test
     ) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config)
       master.send(:build_factories)
-      factories = master.instance_variable_get(:@factories)
+      factories = master.instance_variable_get(:@entity_factories)
 
-      instance = factories.fetch(:"runner:wf:f").call
+      instance = factories.fetch(:"runner:wf:f").call(AgentDaemon::Sinks::Bundle.null)
       assert_instance_of AgentDaemon::Runner::File, instance
     end
   end
@@ -145,9 +149,9 @@ class TestSupervisorMaster < Minitest::Test
     ) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config)
       master.send(:build_factories)
-      factories = master.instance_variable_get(:@factories)
+      factories = master.instance_variable_get(:@entity_factories)
 
-      instance = factories.fetch(:"runner:wf:m").call
+      instance = factories.fetch(:"runner:wf:m").call(AgentDaemon::Sinks::Bundle.null)
       assert_instance_of AgentDaemon::Runner::Mattermost, instance
     end
   end
@@ -163,10 +167,10 @@ class TestSupervisorMaster < Minitest::Test
     ) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config)
       master.send(:build_factories)
-      factories = master.instance_variable_get(:@factories)
+      factories = master.instance_variable_get(:@entity_factories)
 
       assert factories.key?(:mattermost_reactor)
-      reactor = factories.fetch(:mattermost_reactor).call
+      reactor = factories.fetch(:mattermost_reactor).call(AgentDaemon::Sinks::Bundle.null("mattermost_reactor"))
       assert_instance_of AgentDaemon::Mattermost::Reactor, reactor
       listeners = reactor.instance_variable_get(:@listeners)
       assert_equal 2, listeners.size
@@ -181,7 +185,7 @@ class TestSupervisorMaster < Minitest::Test
     ) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config)
       master.send(:build_factories)
-      factories = master.instance_variable_get(:@factories)
+      factories = master.instance_variable_get(:@entity_factories)
 
       refute factories.key?(:mattermost_reactor)
     end
@@ -198,7 +202,7 @@ class TestSupervisorMaster < Minitest::Test
     ) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config)
       master.send(:build_factories)
-      factories = master.instance_variable_get(:@factories)
+      factories = master.instance_variable_get(:@entity_factories)
 
       assert factories.key?(:"messenger:wfA")
       refute factories.key?(:"messenger:wfB")
@@ -206,6 +210,9 @@ class TestSupervisorMaster < Minitest::Test
   end
 
   # --- Graceful-exit smoke (AC4) ------------------------------------------
+  # Story 1.5: threads are now spawned/tracked one layer down, inside each
+  # entity's RunnerSupervisor, so this drives build_supervisors/
+  # start_supervisors and asserts through the supervisors' #thread readers.
 
   def test_graceful_exit_smoke_with_empty_inbox
     with_config(
@@ -215,16 +222,17 @@ class TestSupervisorMaster < Minitest::Test
     ) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config)
       master.send(:build_factories)
-      master.send(:start_threads)
+      master.send(:build_supervisors)
+      master.send(:start_supervisors)
 
       master.instance_variable_get(:@shutdown_flag).set!
       master.send(:wait_for_threads)
 
-      threads = master.instance_variable_get(:@threads)
-      assert_equal 1, threads.size
-      threads.each_value do |thread|
-        refute thread.alive?
-        refute thread[:crashed]
+      supervisors = master.instance_variable_get(:@supervisors)
+      assert_equal 1, supervisors.size
+      supervisors.each_value do |supervisor|
+        refute supervisor.thread.alive?
+        refute supervisor.thread[:crashed]
       end
     end
   end
@@ -238,20 +246,83 @@ class TestSupervisorMaster < Minitest::Test
       ]
     ) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
       raising = Class.new { def run = raise("boom") }.new
-      master.instance_variable_get(:@factories)[:"runner:wf:a"] = -> { raising }
+      master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] = ->(_bundle) { raising }
 
-      # Drive the real production path (start_threads → factory.call.run), not a
+      # Drive the real production path (build_supervisors/start_supervisors ->
+      # RunnerSupervisor#spawn! -> factory.call(bundle).run), not a
       # hand-rolled spawn_thread block, so the injected factory is actually
-      # consumed — matches Task 6's "inject a raising fake factory into
-      # @factories, spawn, join".
-      master.send(:start_threads)
-      thread = master.instance_variable_get(:@threads).fetch(:"runner:wf:a")
-      thread.join
+      # consumed.
+      master.send(:build_supervisors)
+      master.send(:start_supervisors)
+      supervisor = master.instance_variable_get(:@supervisors).fetch(:"runner:wf:a")
+      supervisor.thread.join
 
-      refute thread.alive?
-      assert thread[:crashed]
-      assert_instance_of RuntimeError, thread[:crash_error]
+      refute supervisor.thread.alive?
+      assert supervisor.thread[:crashed]
+      assert_instance_of RuntimeError, supervisor.thread[:crash_error]
+    end
+  end
+
+  # --- Story 1.5: supervision wiring --------------------------------------
+
+  def test_supervisors_exist_for_every_thread_key
+    with_config(
+      [
+        {
+          name: "wf",
+          runners: [tracker_runner("a"), mattermost_runner("m")],
+          messenger: { "webhook_url" => "https://example.com/h" }
+        }
+      ]
+    ) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      master.send(:build_supervisors)
+      supervisors = master.instance_variable_get(:@supervisors)
+
+      expected = [:"runner:wf:a", :"runner:wf:m", :"messenger:wf", :mattermost_reactor]
+      assert_equal expected.sort_by(&:to_s), supervisors.keys.sort_by(&:to_s)
+      supervisors.each_value { |s| assert_instance_of AgentDaemon::Supervisor::RunnerSupervisor, s }
+    end
+  end
+
+  def test_crashed_runner_respawns_while_second_entity_keeps_ticking
+    with_config(
+      [
+        { name: "wf", runners: [tracker_runner("a"), tracker_runner("b")] }
+      ]
+    ) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] =
+        ->(_bundle) { Class.new { def run = raise("boom") }.new }
+      master.instance_variable_get(:@entity_factories)[:"runner:wf:b"] =
+        ->(_bundle) { Class.new { def run = nil }.new }
+
+      master.send(:build_supervisors)
+      supervisors = master.instance_variable_get(:@supervisors)
+      a = supervisors.fetch(:"runner:wf:a")
+      b = supervisors.fetch(:"runner:wf:b")
+      a.instance_variable_set(:@restart_delay, 0.02)
+
+      master.send(:start_supervisors)
+      a.thread.join(1)
+      b.thread.join(1)
+
+      a.tick
+      b.tick
+
+      assert_equal :restarting, a.state
+      assert_equal :exited, b.state # clean exit, never auto-restarted (AC2)
+
+      sleep(0.05)
+      a.tick
+
+      assert_equal :running, a.state
+      assert_equal 2, a.generation
+      a.thread.join(1)
     end
   end
 end
