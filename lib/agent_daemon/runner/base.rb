@@ -43,6 +43,13 @@ module AgentDaemon
         Log.info("[#{log_tag}] Thread stopping gracefully")
       end
 
+      # Master sweep entry point (Story 1.6 Task 4): reached only when this
+      # runner's thread survived the drain join — its own poll loop never
+      # observed the shared flag. Delegates to the backend's last-known pid.
+      def kill_in_flight_agent
+        @backend.kill_current_process_group
+      end
+
       private
 
       def log_tag

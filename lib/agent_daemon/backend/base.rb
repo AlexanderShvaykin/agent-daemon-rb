@@ -36,12 +36,22 @@ module AgentDaemon
         # it yet — the supervisor passes a real token when respawn/manual
         # restart lands.
         @cancel_flag = cancel_flag
+        @current_pid = nil
       end
 
       def run(prompt)
         cmd = build_command(prompt)
         timeout = @runner_config.fetch("timeout", 1200)
         execute(cmd, timeout: timeout)
+      end
+
+      # Last-resort sweep entry point (Story 1.6 Task 4): the master calls
+      # this on a thread that survived the join(30) drain, for a runner whose
+      # own select loop never got to observe the shared flag. Ivar read/write
+      # is GIL-atomic (same contract as ShutdownFlag) — no mutex needed.
+      def kill_current_process_group
+        pid = @current_pid
+        kill_process_group(pid) if pid
       end
 
       private
@@ -70,6 +80,7 @@ module AgentDaemon
         Open3.popen3(cmd, pgroup: true) do |stdin, out, err, wait_thr|
           stdin.close
           pid = wait_thr.pid
+          @current_pid = pid
           streams = [out, err]
 
           loop do
@@ -116,6 +127,12 @@ module AgentDaemon
           status = wait_thr.value
           reason ||= status.success? ? :ok : :failed
           finished_at = Time.now.utc
+          # Cleared only once the child is reaped, and deliberately NOT in an
+          # ensure: a block-level ensure fires BEFORE Open3's own wait_thr.join,
+          # so an exception escaping this block (a raising output sink, say)
+          # would drop the pid while the child is still alive — precisely the
+          # orphan the master's sweep exists to reap.
+          @current_pid = nil
         end
 
         success = reason == :ok

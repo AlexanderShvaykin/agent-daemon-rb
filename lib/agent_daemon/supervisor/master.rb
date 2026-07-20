@@ -21,8 +21,15 @@ module AgentDaemon
     # RunnerSupervisor (Story 1.5), and #start drives all of them through a
     # single non-blocking tick loop instead of the old idle wait.
     class Master
-      def initialize(supervisor_config)
+      # Per-thread join timeout for the drain (AC2). Exposed as the default of
+      # an initialize kwarg so tests can inject a short timeout instead of
+      # waiting out the real 30s — same pattern as RunnerSupervisor's
+      # RESTART_DELAY / restart_delay:.
+      JOIN_TIMEOUT = 30
+
+      def initialize(supervisor_config, join_timeout: JOIN_TIMEOUT)
         @config = supervisor_config
+        @join_timeout = join_timeout
         @shutdown_flag = AgentDaemon::ShutdownFlag.new
         @entity_factories = {}
         @entity_ids = {}
@@ -35,8 +42,16 @@ module AgentDaemon
         build_factories
         build_supervisors
         start_supervisors
-        supervise_until_shutdown
-        wait_for_threads
+        begin
+          supervise_until_shutdown
+          wait_for_threads
+        ensure
+          # The sweep is the last-resort orphan guard, so it must also run when
+          # supervision or the drain raised — that is exactly when an agent is
+          # most likely to be left behind.
+          finalize_supervisors
+          sweep_orphaned_agents
+        end
         Log.info("Supervisor stopped")
       end
 
@@ -76,9 +91,59 @@ module AgentDaemon
         end
       end
 
+      # AC2 fixes the timeout PER THREAD, so the worst case is sequential:
+      # N wedged entities take N * @join_timeout before the sweep below runs.
+      # Operator note: set the unit's TimeoutStopSec comfortably above that
+      # (90-120s for a ~20-runner fleet) or systemd's own SIGKILL preempts the
+      # drain and the orphan sweep.
       def wait_for_threads
         Log.info("Waiting for threads to finish...")
-        @supervisors.each_value { |supervisor| supervisor.thread&.join(30) }
+        @supervisors.each do |key, supervisor|
+          thread = supervisor.thread
+          next unless thread
+
+          thread.join(@join_timeout)
+          Log.warn("[#{key}] thread did not finish within #{@join_timeout}s") if thread.alive?
+        end
+      end
+
+      # One last tick after the drain: an entity whose thread ended during
+      # shutdown would otherwise stay frozen at {status: :running} in every
+      # state sink, because the supervision loop exits the moment the flag is
+      # set and never observes the death. Stragglers are still alive, so their
+      # tick is a no-op.
+      def finalize_supervisors
+        @supervisors.each do |key, supervisor|
+          supervisor.tick
+        rescue => e
+          Log.error("[#{key}] final tick failed: #{e.message}")
+        end
+      end
+
+      # Orphan sweep (Task 4): a thread still alive after the join above never
+      # observed the shared flag inside its own poll loop (wedged outside the
+      # backend's select loop). Force-kill its last known in-flight agent
+      # process group directly — never Thread#kill (AD-2a); the thread itself
+      # is abandoned to process exit.
+      def sweep_orphaned_agents
+        @supervisors.each do |key, supervisor|
+          thread = supervisor.thread
+          next unless thread&.alive?
+
+          entity = supervisor.entity
+          unless entity.respond_to?(:kill_in_flight_agent)
+            Log.warn("[#{key}] straggler #{entity.class} owns no agent to sweep, abandoning it to process exit")
+            next
+          end
+
+          Log.warn("[#{key}] sweeping orphaned agent after join timeout")
+          begin
+            entity.kill_in_flight_agent
+          rescue => e
+            # One entity's failure must not strand the rest of the fleet.
+            Log.error("[#{key}] sweep failed: #{e.message}")
+          end
+        end
       end
 
       def build_factories
