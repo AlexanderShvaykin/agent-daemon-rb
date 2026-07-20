@@ -55,6 +55,44 @@ class RunnerSupervisorLatePublishFake
   end
 end
 
+# Publishes through whatever bundle its generation was built with, so a test
+# can assert what the CURRENT (post-respawn) entity stamps.
+class RunnerSupervisorPublishingFake
+  def initialize(bundle)
+    @bundle = bundle
+  end
+
+  def run
+    @bundle.publish_state(status: :hello)
+    raise "boom"
+  end
+end
+
+# Loops until the flag like a real entity, then returns cleanly — the
+# cooperative-stop shape Epic 4's manual restart produces.
+class RunnerSupervisorStoppableFake
+  def initialize(stop_flag)
+    @stop_flag = stop_flag
+  end
+
+  def run
+    sleep(0.01) until @stop_flag.value
+  end
+end
+
+# Stays alive until the flag is set, then crashes — lets a test reach
+# :stopping with a live thread and still exercise the crash branch.
+class RunnerSupervisorDeferredCrashFake
+  def initialize(crash_flag)
+    @crash_flag = crash_flag
+  end
+
+  def run
+    sleep(0.01) until @crash_flag.value
+    raise "boom"
+  end
+end
+
 class TestRunnerSupervisor < Minitest::Test
   ISO8601_RE = /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/
 
@@ -202,6 +240,24 @@ class TestRunnerSupervisor < Minitest::Test
     supervisor&.thread&.join(1)
   end
 
+  def test_entity_publishes_carry_gen1_before_and_gen2_after_respawn
+    supervisor, state_recorder = build_supervisor("ent-1", ->(bundle) { RunnerSupervisorPublishingFake.new(bundle) })
+
+    supervisor.spawn!
+    supervisor.thread.join(1)
+    supervisor.tick
+    sleep(0.06)
+    supervisor.tick
+    supervisor.thread.join(1)
+
+    entity_publishes = state_recorder.calls.select { |_id, record| record[:status] == :hello }
+
+    assert_equal [["ent-1", { status: :hello, generation: 1 }], ["ent-1", { status: :hello, generation: 2 }]],
+                 entity_publishes
+  ensure
+    supervisor&.thread&.join(1)
+  end
+
   # --- AC4: single restart-intent queue, at-most-one live instance -------
 
   def test_coalesced_restart_intents_produce_one_respawn_with_merged_actors
@@ -243,6 +299,108 @@ class TestRunnerSupervisor < Minitest::Test
   ensure
     shutdown_flag&.set!
     first_thread&.join(1)
+  end
+
+  def test_clean_death_in_stopping_honours_the_queued_intent_and_respawns
+    stop_flag = AgentDaemon::ShutdownFlag.new
+    supervisor, state_recorder, event_recorder = build_supervisor(
+      "ent-1", ->(_bundle) { RunnerSupervisorStoppableFake.new(stop_flag) }
+    )
+    supervisor.spawn!
+    first_thread = supervisor.thread
+
+    supervisor.request_restart(:manual)
+    supervisor.tick
+
+    assert_equal :stopping, supervisor.state
+
+    stop_flag.set!
+    first_thread.join(1)
+    supervisor.tick
+
+    assert_equal :restarting, supervisor.state
+    assert_equal [["ent-1", { status: :exited, generation: 1 }]], state_recorder.calls
+
+    sleep(0.06)
+    supervisor.tick
+
+    assert_equal :running, supervisor.state
+    assert_equal 2, supervisor.generation
+    refute_same first_thread, supervisor.thread
+
+    _entity_id, event = event_recorder.calls.last
+
+    assert_equal :restart, event[:type]
+    assert_equal [:manual], event[:actor]
+  ensure
+    stop_flag&.set!
+    supervisor&.thread&.join(1)
+  end
+
+  def test_crash_in_stopping_still_takes_the_crash_path
+    crash_flag = AgentDaemon::ShutdownFlag.new
+    supervisor, state_recorder = build_supervisor(
+      "ent-1", ->(_bundle) { RunnerSupervisorDeferredCrashFake.new(crash_flag) }
+    )
+    supervisor.spawn!
+    first_thread = supervisor.thread
+
+    # Enter :stopping while the thread is still alive, then let it die by
+    # crashing rather than by returning cleanly.
+    supervisor.request_restart(:manual)
+    supervisor.tick
+
+    assert_equal :stopping, supervisor.state
+
+    crash_flag.set!
+    first_thread.join(1)
+    supervisor.tick
+
+    assert_equal :restarting, supervisor.state
+    assert_equal [["ent-1", { status: :crashed, generation: 1 }]], state_recorder.calls
+  ensure
+    crash_flag&.set!
+    supervisor&.thread&.join(1)
+  end
+
+  def test_spawn_is_refused_while_the_current_thread_is_still_alive
+    shutdown_flag = AgentDaemon::ShutdownFlag.new
+    supervisor, = build_supervisor(
+      "ent-1", ->(_bundle) { RunnerSupervisorLoopingFake.new(shutdown_flag) }, shutdown_flag: shutdown_flag
+    )
+    supervisor.spawn!
+    first_thread = supervisor.thread
+
+    refute supervisor.spawn!
+    assert_same first_thread, supervisor.thread
+    assert_equal 1, supervisor.generation
+  ensure
+    shutdown_flag&.set!
+    first_thread&.join(1)
+  end
+
+  def test_raising_factory_is_contained_and_retried_without_burning_a_generation
+    attempts = 0
+    factory = lambda do |_bundle|
+      attempts += 1
+      raise "cannot construct" if attempts == 1
+
+      RunnerSupervisorLoopingFake.new(AgentDaemon::ShutdownFlag.new)
+    end
+    supervisor, = build_supervisor("ent-1", factory)
+
+    refute supervisor.spawn!
+    assert_equal :restarting, supervisor.state
+    assert_equal 0, supervisor.generation
+    assert_nil supervisor.thread
+
+    sleep(0.06)
+    supervisor.tick
+
+    assert_equal :running, supervisor.state
+    assert_equal 1, supervisor.generation
+  ensure
+    supervisor&.thread&.kill
   end
 
   def test_request_restart_rejects_nil_actor

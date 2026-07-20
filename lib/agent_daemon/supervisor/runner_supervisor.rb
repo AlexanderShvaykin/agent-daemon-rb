@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "time"
+
 require_relative "../sinks"
 require_relative "../log"
 
@@ -83,13 +85,27 @@ module AgentDaemon
       # First spawn mints generation 1; every subsequent call (only ever from
       # #tick, on a confirmed-dead thread) increments it. Builds a FRESH
       # bundle so the dying instance's own (old) bundle reference is
-      # untouched (AC3).
+      # untouched (AC3). Returns true on success, false if the spawn was
+      # refused or the factories raised.
       def spawn!
-        @generation += 1
-        bundle = @sinks_factory.call(@generation)
+        # Task 2's at-most-one-live-instance is a checked precondition, not an
+        # invariant left to caller discipline: #tick only ever calls this on a
+        # confirmed-dead thread, but the method is public for Epic 4.
+        if @thread&.alive?
+          Log.warn("[#{thread_key}] spawn! refused: generation #{@generation} is still alive")
+          return false
+        end
+
+        # The factories run on the CALLER's thread, so a raise here would
+        # otherwise escape through Master#tick and abort supervision of every
+        # other entity. Treat a failed construction exactly like a crash: keep
+        # the generation unburned and retry on the normal restart deadline.
+        generation = @generation + 1
+        bundle = @sinks_factory.call(generation)
         entity = @entity_factory.call(bundle)
         key = thread_key
 
+        @generation = generation
         @entity = entity
         @bundle = bundle
         @thread = Thread.new do
@@ -101,6 +117,12 @@ module AgentDaemon
           Thread.current[:crash_error] = e
         end
         @state = :running
+        true
+      rescue => e
+        Log.error("[#{thread_key}] Spawn failed: #{e.message}\n#{e.backtrace&.first(10)&.join("\n")}")
+        @restart_at = monotonic_now + @restart_delay
+        @state = :restarting
+        false
       end
 
       def tick
@@ -125,11 +147,22 @@ module AgentDaemon
 
       # A pending intent only ever moves :running -> :stopping to passively
       # await a death it did not cause (E1: no Thread#kill, no active stop —
-      # that is Epic 4). Once dead, the outcome is identical to :running's.
+      # that is Epic 4).
       def tick_stopping
         return if @thread.alive?
 
-        handle_thread_death
+        # A crash here is indistinguishable from :running's and takes the
+        # shared path. A CLEAN death, however, must NOT fall through to AC2's
+        # terminal :exited: we only got here because a restart intent was
+        # queued, and AC4 requires that intent to be honoured. Dropping it
+        # would strand Epic 4's manual restart of a healthy entity — a
+        # cooperative stop is exactly a clean `run` return.
+        return handle_thread_death if @thread[:crashed]
+
+        @bundle.publish_state(status: :exited)
+        @pending_actors = drain_intents!
+        @restart_at = monotonic_now + @restart_delay
+        @state = :restarting
       end
 
       def handle_thread_death
@@ -151,10 +184,13 @@ module AgentDaemon
         return if monotonic_now < @restart_at
         return if @shutdown_flag.value # no respawn; expiry becomes a no-op
 
-        # At-most-one live instance holds by construction: :restarting is only
-        # entered after handle_thread_death observed @thread already dead.
-        actors = (@pending_actors + drain_intents!).uniq
-        spawn!
+        # Held across a failed spawn so a construction error does not swallow
+        # the requesters; spawn! itself re-arms the deadline for the retry.
+        @pending_actors = (@pending_actors + drain_intents!).uniq
+        return unless spawn!
+
+        actors = @pending_actors
+        @pending_actors = []
         @bundle.publish_event(type: :restart, actor: actors, at: Time.now.utc.iso8601)
       end
 
