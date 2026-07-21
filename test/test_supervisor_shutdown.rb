@@ -343,8 +343,7 @@ class TestSupervisorShutdown < Minitest::Test
       reap_after_test(supervisor.thread)
       assert supervisor.thread.alive?, "straggler thread should still be alive after its timeout"
       assert_operator elapsed, :<, 2
-      assert_match(/runner:wf:a/, io.string)
-      assert_match(/did not finish/, io.string)
+      assert_match(/\[wf:a gen1\] .*did not finish/, io.string)
     end
   end
 

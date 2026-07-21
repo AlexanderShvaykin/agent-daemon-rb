@@ -43,7 +43,10 @@ module AgentDaemon
       # sinks_factory: 1-arg callable (generation) -> Sinks::Bundle; defaults
       # to a gen-stamped Bundle over Null sinks (output stays plain Null —
       # there is no output record shape to stamp, AD-14 is Epic 3's call).
-      def initialize(entity_id, entity_factory:, shutdown_flag:, restart_delay: RESTART_DELAY, sinks_factory: nil)
+      # log_level: the owning workflow's resolved ::Logger::Severity int
+      # (Master, Story 1.7); nil means no per-tag gate (all severities pass).
+      def initialize(entity_id, entity_factory:, shutdown_flag:, restart_delay: RESTART_DELAY, sinks_factory: nil,
+                     log_level: nil)
         raise ArgumentError, "entity_id is required" if entity_id.nil?
         unless entity_factory.respond_to?(:call)
           raise ArgumentError, "entity_factory must respond to #call (entity #{entity_id.inspect})"
@@ -60,6 +63,7 @@ module AgentDaemon
         @shutdown_flag = shutdown_flag
         @restart_delay = restart_delay
         @sinks_factory = sinks_factory || method(:default_sinks_factory)
+        @log_level = log_level
 
         @generation = 0
         @state = nil
@@ -108,11 +112,16 @@ module AgentDaemon
         @generation = generation
         @entity = entity
         @bundle = bundle
+        # Ambient context binds THIS entity's own thread only (the master
+        # thread driving #tick never sets it) — the crash rescue below runs
+        # inside this same block/thread, so it inherits the tag for free and
+        # no longer needs its own manual prefix.
         @thread = Thread.new do
           Thread.current.name = key.to_s
+          Log.bind_context(tag: log_tag, generation: generation, level: @log_level)
           entity.run
         rescue => e
-          Log.error("[#{key}] Thread crashed: #{e.message}\n#{e.backtrace&.first(10)&.join("\n")}")
+          Log.error("Thread crashed: #{e.message}\n#{e.backtrace&.first(10)&.join("\n")}")
           Thread.current[:crashed] = true
           Thread.current[:crash_error] = e
         end
@@ -121,6 +130,7 @@ module AgentDaemon
       rescue => e
         Log.error("[#{thread_key}] Spawn failed: #{e.message}\n#{e.backtrace&.first(10)&.join("\n")}")
         @restart_at = monotonic_now + @restart_delay
+        Log.warn("#{log_prefix} entering :restarting (restart deadline in #{@restart_delay}s)")
         @state = :restarting
         false
       end
@@ -159,9 +169,11 @@ module AgentDaemon
         # cooperative stop is exactly a clean `run` return.
         return handle_thread_death if @thread[:crashed]
 
+        Log.info("#{log_prefix} exited cleanly")
         @bundle.publish_state(status: :exited)
         @pending_actors = drain_intents!
         @restart_at = monotonic_now + @restart_delay
+        Log.warn("#{log_prefix} entering :restarting (restart deadline in #{@restart_delay}s)")
         @state = :restarting
       end
 
@@ -171,10 +183,12 @@ module AgentDaemon
           @bundle.publish_state(status: :crashed)
           @pending_actors = drain_intents!
           @restart_at = monotonic_now + @restart_delay
+          Log.warn("#{log_prefix} entering :restarting (restart deadline in #{@restart_delay}s)")
           @state = :restarting
         else
           # AC2: a clean exit is never auto-restarted (manual restart only,
           # Epic 4). This boundary is the supervisor-published :exited status.
+          Log.info("#{log_prefix} exited cleanly, terminal")
           @bundle.publish_state(status: :exited)
           @state = :exited
         end
@@ -189,6 +203,7 @@ module AgentDaemon
         @pending_actors = (@pending_actors + drain_intents!).uniq
         return unless spawn!
 
+        Log.info("#{log_prefix} respawned as generation #{@generation}")
         actors = @pending_actors
         @pending_actors = []
         @bundle.publish_event(type: :restart, actor: actors, at: Time.now.utc.iso8601)
@@ -216,6 +231,27 @@ module AgentDaemon
       def thread_key
         @entity_id.respond_to?(:thread_key) ? @entity_id.thread_key : @entity_id
       end
+
+      # RunnerIdentity#log_tag for runners; the entity_id IS the log tag for
+      # messenger/reactor entities, same fallback as #thread_key.
+      def log_tag
+        @entity_id.respond_to?(:log_tag) ? @entity_id.log_tag : @entity_id.to_s
+      end
+
+      # Explicit tag+generation formatting for lines emitted on the MASTER
+      # thread (#tick and its callees) — that thread never carries the
+      # ambient context Log.bind_context sets on the entity's OWN thread, so
+      # supervisor-lifecycle lines must format the prefix themselves. Reuses
+      # the same formatter ambient tagging uses (Log.tag_prefix) so both
+      # paths are format-identical.
+      def log_prefix
+        Log.tag_prefix(log_tag, @generation)
+      end
+      # Public so the master thread's shutdown-path lines (Master#wait_for_threads
+      # /#finalize_supervisors/#sweep_orphaned_agents) can tag themselves with the
+      # same [tag genN] format — they run on the master thread with no ambient
+      # context, exactly like the #tick lifecycle lines.
+      public :log_prefix
 
       def default_sinks_factory(generation)
         Sinks::Bundle.new(

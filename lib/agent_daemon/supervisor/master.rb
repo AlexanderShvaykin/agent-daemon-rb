@@ -33,6 +33,7 @@ module AgentDaemon
         @shutdown_flag = AgentDaemon::ShutdownFlag.new
         @entity_factories = {}
         @entity_ids = {}
+        @log_levels = {}
         @supervisors = {}
       end
 
@@ -71,7 +72,8 @@ module AgentDaemon
           @supervisors[key] = RunnerSupervisor.new(
             @entity_ids.fetch(key),
             entity_factory: factory,
-            shutdown_flag: @shutdown_flag
+            shutdown_flag: @shutdown_flag,
+            log_level: @log_levels[key]
           )
         end
       end
@@ -98,12 +100,12 @@ module AgentDaemon
       # drain and the orphan sweep.
       def wait_for_threads
         Log.info("Waiting for threads to finish...")
-        @supervisors.each do |key, supervisor|
+        @supervisors.each do |_key, supervisor|
           thread = supervisor.thread
           next unless thread
 
           thread.join(@join_timeout)
-          Log.warn("[#{key}] thread did not finish within #{@join_timeout}s") if thread.alive?
+          Log.warn("#{supervisor.log_prefix} thread did not finish within #{@join_timeout}s") if thread.alive?
         end
       end
 
@@ -113,10 +115,10 @@ module AgentDaemon
       # set and never observes the death. Stragglers are still alive, so their
       # tick is a no-op.
       def finalize_supervisors
-        @supervisors.each do |key, supervisor|
+        @supervisors.each do |_key, supervisor|
           supervisor.tick
         rescue => e
-          Log.error("[#{key}] final tick failed: #{e.message}")
+          Log.error("#{supervisor.log_prefix} final tick failed: #{e.message}")
         end
       end
 
@@ -126,22 +128,22 @@ module AgentDaemon
       # process group directly — never Thread#kill (AD-2a); the thread itself
       # is abandoned to process exit.
       def sweep_orphaned_agents
-        @supervisors.each do |key, supervisor|
+        @supervisors.each do |_key, supervisor|
           thread = supervisor.thread
           next unless thread&.alive?
 
           entity = supervisor.entity
           unless entity.respond_to?(:kill_in_flight_agent)
-            Log.warn("[#{key}] straggler #{entity.class} owns no agent to sweep, abandoning it to process exit")
+            Log.warn("#{supervisor.log_prefix} straggler #{entity.class} owns no agent to sweep, abandoning it to process exit")
             next
           end
 
-          Log.warn("[#{key}] sweeping orphaned agent after join timeout")
+          Log.warn("#{supervisor.log_prefix} sweeping orphaned agent after join timeout")
           begin
             entity.kill_in_flight_agent
           rescue => e
             # One entity's failure must not strand the rest of the fleet.
-            Log.error("[#{key}] sweep failed: #{e.message}")
+            Log.error("#{supervisor.log_prefix} sweep failed: #{e.message}")
           end
         end
       end
@@ -156,10 +158,12 @@ module AgentDaemon
       end
 
       def build_runner_factories(workflow)
+        log_level = resolve_log_level(workflow[:config].logging["level"])
         workflow[:config].runners.zip(workflow[:identities]) do |runner_config, identity|
           key = identity.thread_key
           @entity_factories[key] = runner_factory_for(workflow[:config], runner_config)
           @entity_ids[key] = identity
+          @log_levels[key] = log_level
         end
       end
 
@@ -173,6 +177,24 @@ module AgentDaemon
         key = :"messenger:#{workflow[:name]}"
         @entity_factories[key] = ->(bundle) { Messenger.new(config, @shutdown_flag, sinks: bundle) }
         @entity_ids[key] = "messenger:#{workflow[:name]}"
+        @log_levels[key] = resolve_log_level(config.logging["level"])
+      end
+
+      # Maps a workflow's `logging.level` string (e.g. "info") to a
+      # ::Logger::Severity int via Log::SEVERITY — the same map the per-tag
+      # gate compares against (Story 1.7 AC2). Validated against the known
+      # level names so a null or typo'd level surfaces as a clear ConfigError
+      # at boot instead of a cryptic NoMethodError/NameError from the master
+      # thread (which would abort the whole fleet). Only the four gated
+      # severities are supported here — that is the per-tag vocabulary.
+      def resolve_log_level(level_string)
+        level = level_string.to_s.downcase.to_sym
+        unless Log::SEVERITY.key?(level)
+          raise AgentDaemon::ConfigError,
+                "invalid logging.level #{level_string.inspect} " \
+                "(expected one of: #{Log::SEVERITY.keys.join(', ')})"
+        end
+        Log::SEVERITY.fetch(level)
       end
 
       # Mirrors Daemon#runner_factory_for's type dispatch exactly, but as a
@@ -217,6 +239,12 @@ module AgentDaemon
           Mattermost::Reactor.new(listeners, @shutdown_flag, sinks: bundle)
         end
         @entity_ids[:mattermost_reactor] = "mattermost_reactor"
+        # The reactor is fleet-wide (AD-13) — one entity spanning every
+        # workflow's mattermost runners — so it has no single owning workflow
+        # to take a level from. Default to INFO; a listener's own lines
+        # therefore carry [mattermost_reactor gen<N>], not a per-workflow tag
+        # (accepted AD-13 consequence).
+        @log_levels[:mattermost_reactor] = ::Logger::INFO
       end
     end
   end

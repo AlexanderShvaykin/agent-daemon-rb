@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "stringio"
 
 # AD-5 lazy-require isolation: required explicitly here, never from the core
 # `require "agent_daemon"` graph.
@@ -97,20 +98,34 @@ class TestRunnerSupervisor < Minitest::Test
   ISO8601_RE = /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/
 
   def setup
+    @prior_logger = AgentDaemon::Log.instance_variable_get(:@logger)
     null_logger = ::Logger.new(File::NULL)
     null_logger.level = ::Logger::FATAL
     AgentDaemon::Log.instance_variable_set(:@logger, null_logger)
   end
 
   def teardown
-    AgentDaemon::Log.instance_variable_set(:@logger, nil)
+    AgentDaemon::Log.instance_variable_set(:@logger, @prior_logger)
+    AgentDaemon::Log.clear_context
+  end
+
+  # Swaps in a DEBUG-level StringIO-backed logger (undone by teardown's
+  # restore) so a test can assert on captured tagged output.
+  def capture_log
+    io = StringIO.new
+    logger = ::Logger.new(io)
+    logger.level = ::Logger::DEBUG
+    logger.formatter = proc { |_severity, _datetime, _progname, msg| "#{msg}\n" }
+    AgentDaemon::Log.use(logger)
+    io
   end
 
   # Builds a supervisor whose default sinks_factory is swapped for one
   # wrapping recording sinks (instead of Null) in the real GenerationStamp,
   # so generation stamping is observable without touching the class's
   # production default.
-  def build_supervisor(entity_id, entity_factory, shutdown_flag: AgentDaemon::ShutdownFlag.new, restart_delay: 0.05)
+  def build_supervisor(entity_id, entity_factory, shutdown_flag: AgentDaemon::ShutdownFlag.new, restart_delay: 0.05,
+                        log_level: nil)
     state_recorder = RunnerSupervisorRecordingSink.new
     event_recorder = RunnerSupervisorRecordingSink.new
     sinks_factory = lambda do |generation|
@@ -125,7 +140,8 @@ class TestRunnerSupervisor < Minitest::Test
       entity_factory: entity_factory,
       shutdown_flag: shutdown_flag,
       restart_delay: restart_delay,
-      sinks_factory: sinks_factory
+      sinks_factory: sinks_factory,
+      log_level: log_level
     )
     [supervisor, state_recorder, event_recorder]
   end
@@ -464,5 +480,121 @@ class TestRunnerSupervisor < Minitest::Test
         nil, entity_factory: ->(_bundle) {}, shutdown_flag: AgentDaemon::ShutdownFlag.new
       )
     end
+  end
+
+  # --- Story 1.7: centralized logging tagged per entity and generation ---
+
+  # Logs a fixed line on every #run, then crashes — lets a test observe the
+  # ambient tag+generation on the entity's OWN thread across a respawn.
+  class RunnerSupervisorLoggingCrashFake
+    def run
+      AgentDaemon::Log.info("hello from run")
+      raise "boom"
+    end
+  end
+
+  def test_ambient_tag_and_generation_bump_across_respawn
+    io = capture_log
+    supervisor, = build_supervisor("wf:r", ->(_bundle) { RunnerSupervisorLoggingCrashFake.new })
+
+    supervisor.spawn!
+    supervisor.thread.join(1)
+    supervisor.tick
+    sleep(0.06)
+    supervisor.tick
+    supervisor.thread.join(1)
+
+    lines = io.string.lines.select { |line| line.include?("hello from run") }
+    assert_equal ["[wf:r gen1] hello from run\n", "[wf:r gen2] hello from run\n"], lines
+  end
+
+  def test_ambient_level_gates_the_entitys_own_lines_but_not_the_crash_log
+    io = capture_log
+    supervisor, = build_supervisor(
+      "wf:r", ->(_bundle) { RunnerSupervisorLoggingCrashFake.new }, log_level: ::Logger::WARN
+    )
+
+    supervisor.spawn!
+    supervisor.thread.join(1)
+
+    refute_includes io.string, "hello from run"
+    assert_match(/\[wf:r gen1\] Thread crashed: boom/, io.string)
+  end
+
+  def test_crash_log_carries_a_single_tag_not_a_double_prefix
+    io = capture_log
+    supervisor, = build_supervisor("wf:r", ->(_bundle) { RunnerSupervisorCrashingFake.new })
+
+    supervisor.spawn!
+    supervisor.thread.join(1)
+
+    assert_match(/\A\[wf:r gen1\] Thread crashed: boom/, io.string)
+  end
+
+  def test_crash_path_logs_entering_restarting_and_successful_respawn_generation
+    io = capture_log
+    supervisor, = build_supervisor("wf:r", ->(_bundle) { RunnerSupervisorCrashingFake.new })
+
+    supervisor.spawn!
+    supervisor.thread.join(1)
+    supervisor.tick
+    sleep(0.06)
+    supervisor.tick
+
+    assert_match(/\[wf:r gen1\] entering :restarting \(restart deadline in 0\.05s\)/, io.string)
+    assert_match(/\[wf:r gen2\] respawned as generation 2/, io.string)
+  ensure
+    supervisor&.thread&.join(1)
+  end
+
+  def test_clean_exit_logs_terminal_line
+    io = capture_log
+    supervisor, = build_supervisor("wf:r", ->(_bundle) { RunnerSupervisorCleanExitFake.new })
+
+    supervisor.spawn!
+    supervisor.thread.join(1)
+    supervisor.tick
+
+    assert_match(/\[wf:r gen1\] exited cleanly, terminal/, io.string)
+  end
+
+  def test_stopping_clean_death_logs_exit_and_entering_restarting
+    io = capture_log
+    stop_flag = AgentDaemon::ShutdownFlag.new
+    supervisor, = build_supervisor("wf:r", ->(_bundle) { RunnerSupervisorStoppableFake.new(stop_flag) })
+    supervisor.spawn!
+    first_thread = supervisor.thread
+
+    supervisor.request_restart(:manual)
+    supervisor.tick
+
+    stop_flag.set!
+    first_thread.join(1)
+    supervisor.tick
+
+    assert_match(/\[wf:r gen1\] exited cleanly\n/, io.string)
+    assert_match(/\[wf:r gen1\] entering :restarting \(restart deadline in 0\.05s\)/, io.string)
+  ensure
+    stop_flag&.set!
+    supervisor&.thread&.join(1)
+  end
+
+  def test_failed_spawn_logs_spawn_failed_and_entering_restarting
+    io = capture_log
+    attempts = 0
+    factory = lambda do |_bundle|
+      attempts += 1
+      raise "cannot construct" if attempts == 1
+
+      RunnerSupervisorLoopingFake.new(AgentDaemon::ShutdownFlag.new)
+    end
+    supervisor, = build_supervisor("wf:r", factory)
+
+    refute supervisor.spawn!
+
+    assert_match(/\[wf:r\] Spawn failed: cannot construct/, io.string)
+    assert_match(/\[wf:r gen0\] entering :restarting \(restart deadline in 0\.05s\)/, io.string)
+  ensure
+    supervisor&.thread&.kill
   end
 end

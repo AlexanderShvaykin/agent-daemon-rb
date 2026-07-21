@@ -17,7 +17,13 @@ end
 config = AgentDaemon::Supervisor::Config.new(config_path)
 
 logger = ::Logger.new($stdout)
-logger.level = ::Logger::INFO
+# DEBUG here so the per-tag ambient level gate (Log.bind_context) is the
+# authoritative filter — a workflow configured for `logging.level: debug`
+# would otherwise still be dropped by this shared logger before its own
+# gate ever runs (AD-11/Story 1.7). Per-workflow `logging.file`/`output`
+# are deliberately ignored under the supervisor: one shared $stdout sink
+# for the whole fleet, only `logging.level` is consumed (per-tag).
+logger.level = ::Logger::DEBUG
 logger.formatter = proc { |severity, _datetime, _progname, msg| "#{severity}: #{msg}\n" }
 AgentDaemon::Log.use(logger)
 

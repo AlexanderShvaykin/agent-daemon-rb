@@ -11,13 +11,15 @@ require "agent_daemon/supervisor/master"
 
 class TestSupervisorMaster < Minitest::Test
   def setup
+    @prior_logger = AgentDaemon::Log.instance_variable_get(:@logger)
     null_logger = ::Logger.new(File::NULL)
     null_logger.level = ::Logger::FATAL
     AgentDaemon::Log.instance_variable_set(:@logger, null_logger)
   end
 
   def teardown
-    AgentDaemon::Log.instance_variable_set(:@logger, nil)
+    AgentDaemon::Log.instance_variable_set(:@logger, @prior_logger)
+    AgentDaemon::Log.clear_context
   end
 
   # Builds a real Supervisor::Config from workflow specs written to disk
@@ -39,6 +41,7 @@ class TestSupervisorMaster < Minitest::Test
           "runners" => spec[:runners]
         }
         data["messenger"] = spec[:messenger] if spec[:messenger]
+        data["logging"] = spec[:logging] if spec[:logging]
         File.write(File.join(wf_dir, "#{spec[:name]}.yml"), data.to_yaml)
       end
 
@@ -323,6 +326,97 @@ class TestSupervisorMaster < Minitest::Test
       assert_equal :running, a.state
       assert_equal 2, a.generation
       a.thread.join(1)
+    end
+  end
+
+  # --- Story 1.7: per-workflow logging.level injection (AC2) --------------
+
+  def test_log_level_is_resolved_per_workflow_and_injected_into_supervisors
+    with_config(
+      [
+        { name: "wfA", runners: [tracker_runner("a")], logging: { "level" => "warn" } },
+        { name: "wfB", runners: [tracker_runner("b")], logging: { "level" => "debug" } }
+      ]
+    ) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      master.send(:build_supervisors)
+      supervisors = master.instance_variable_get(:@supervisors)
+
+      assert_equal ::Logger::WARN, supervisors.fetch(:"runner:wfA:a").instance_variable_get(:@log_level)
+      assert_equal ::Logger::DEBUG, supervisors.fetch(:"runner:wfB:b").instance_variable_get(:@log_level)
+    end
+  end
+
+  def test_messenger_gets_its_owning_workflows_log_level
+    with_config(
+      [
+        {
+          name: "wf", runners: [tracker_runner("a")],
+          messenger: { "webhook_url" => "https://example.com/h" },
+          logging: { "level" => "error" }
+        }
+      ]
+    ) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      master.send(:build_supervisors)
+      supervisors = master.instance_variable_get(:@supervisors)
+
+      assert_equal ::Logger::ERROR, supervisors.fetch(:"messenger:wf").instance_variable_get(:@log_level)
+    end
+  end
+
+  # The reactor is fleet-wide (AD-13) and has no single owning workflow to
+  # take a level from, so it defaults to INFO regardless of any workflow's
+  # own `logging.level`.
+  def test_reactor_defaults_to_info_log_level_regardless_of_workflow_level
+    with_config(
+      [{ name: "wf", runners: [mattermost_runner("m")], logging: { "level" => "debug" } }]
+    ) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      master.send(:build_supervisors)
+      supervisors = master.instance_variable_get(:@supervisors)
+
+      assert_equal ::Logger::INFO, supervisors.fetch(:mattermost_reactor).instance_variable_get(:@log_level)
+    end
+  end
+
+  # --- Story 1.7 AC3: logging.file is ignored under the supervisor -------
+
+  def test_logging_file_is_ignored_under_the_supervisor
+    Dir.mktmpdir do |tmp|
+      log_file = File.join(tmp, "supervisor-story-1-7-should-not-exist.log")
+
+      with_config(
+        [{ name: "wf", runners: [file_runner("f")], logging: { "level" => "info", "output" => "file", "file" => log_file } }]
+      ) do |_dir, config|
+        master = AgentDaemon::Supervisor::Master.new(config)
+        master.send(:build_factories)
+        master.send(:build_supervisors)
+        master.send(:start_supervisors)
+
+        master.instance_variable_get(:@shutdown_flag).set!
+        master.send(:wait_for_threads)
+
+        refute File.exist?(log_file)
+      end
+    end
+  end
+
+  # A null or typo'd logging.level must fail fast with a clear ConfigError at
+  # boot, not a cryptic NoMethodError/NameError that aborts the whole fleet.
+  def test_resolve_log_level_rejects_null_or_unknown_level
+    with_config([{ name: "wf", runners: [file_runner("f")] }]) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+
+      assert_equal ::Logger::WARN, master.send(:resolve_log_level, "warn")
+
+      err = assert_raises(AgentDaemon::ConfigError) { master.send(:resolve_log_level, "verbose") }
+      assert_match(/invalid logging.level "verbose"/, err.message)
+
+      assert_raises(AgentDaemon::ConfigError) { master.send(:resolve_log_level, nil) }
     end
   end
 end
