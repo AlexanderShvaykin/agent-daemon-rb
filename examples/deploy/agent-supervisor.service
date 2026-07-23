@@ -1,0 +1,33 @@
+# agent-supervisor systemd unit (single master process; not @-templated —
+# one supervisor config enumerates every workflow it runs).
+#
+# Do not install directly — use your deployment tool (e.g. ctl setup).
+# Placeholders __USER__ and __DIR__ are replaced during installation.
+
+[Unit]
+Description=Agent Supervisor
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+Environment=PATH=/home/__USER__/.local/bin:/home/__USER__/.rbenv/shims:/usr/local/bin:/usr/bin:/bin
+ExecStart=__DIR__/bin/agent-supervisor __DIR__/supervisor.yml
+Restart=on-failure
+RestartSec=10
+# The master drains its supervised threads sequentially — each with a 30s join
+# timeout — before running its last-resort orphan sweep, so the drain's worst
+# case grows with fleet size (N simultaneously-wedged threads ≈ N×30s). 60s (the
+# standalone unit's value) can SIGKILL the master mid-drain and preempt the
+# sweep; 120s comfortably covers a realistic multi-workflow fleet. Raise it for a
+# large fleet where many threads may wedge at once (see the operator note in
+# lib/agent_daemon/supervisor/master.rb).
+TimeoutStopSec=120
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-supervisor
+
+[Install]
+WantedBy=multi-user.target

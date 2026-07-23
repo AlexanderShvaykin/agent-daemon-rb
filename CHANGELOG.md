@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.0] - 2026-07-23
+
+### Added
+- **`agent-supervisor` subsystem**: a new `bin/agent-supervisor <supervisor-config.yml>` entrypoint that runs N whole workflows, each an unchanged `AgentDaemon::Config`, as threads inside one MRI process, instead of one `agent-daemon` process per workflow.
+- `Supervisor::Config`: enumerates workflows by unique name, each referencing an ordinary per-workflow config file; fails fast, collecting every problem into one `ConfigError` (duplicate/blank names, an identity-delimiter `:` in a workflow or runner name, a referenced config that fails to load, and colliding `message_dir`/`output_dir`/trigger work-dirs across workflows).
+- `Supervisor::Master`: boots every workflow's runners and Messenger, plus exactly one fleet-wide `Mattermost::Reactor` shared across every workflow's mattermost runners. Centralized `SIGINT`/`SIGTERM` handling sets one shared `ShutdownFlag`, then drains every supervised thread (per-thread join timeout, sequential) followed by a last-resort **orphan sweep** that force-kills any straggler's in-flight agent process group (never `Thread#kill`).
+- Per-entity supervisor (`RunnerSupervisor`): crash auto-restart with a fixed delay, driven by a non-blocking ~1s tick loop (no blocking sleeps), and a monotonic **generation** counter bumped on every (re)spawn so every published record can be traced to the instance that emitted it.
+- Injected **publish seam** (`AgentDaemon::Sinks`): core components (runner, backend, messenger, reactor) report state/events only through a narrow sink protocol with no-op defaults, so the standalone daemon's behavior is completely unchanged (NFR5) while the supervisor can inject real per-generation sink adapters without the core ever naming a supervisor type.
+- Centralized logging tagged per `(workflow, runner)` and generation, gated by each workflow's own configured `logging.level`; one shared `$stdout` sink for the whole fleet.
+- **Load-time dependency isolation**: the standalone core `require "agent_daemon"` graph (and therefore `bin/agent-daemon`) loads no supervisor file and no supervisor-only dependency (`sqlite3`, the HTTP server gem, the OAuth client gem), guarded by a new test (`test/test_require_isolation.rb`) that shells out to a clean subprocess. `agent_daemon.gemspec` now declares `agent-supervisor` as a second `executables` entry alongside `agent-daemon`.
+- `examples/deploy/agent-supervisor.service`: a plain (non-templated) systemd unit for the single master process, with `TimeoutStopSec=120` to comfortably exceed the sequential per-thread drain's worst case.
+
+### Notes
+- Isolation is **load-time, not install-time**: once `sqlite3`/`puma`/`rack`/`oauth2` are added as gemspec dependencies in a later release, they are still *installed* on every host that installs this gem, even one that only ever runs the standalone `agent-daemon` CLI.
+
 ## [0.5.0] - 2026-06-24
 
 ### Added

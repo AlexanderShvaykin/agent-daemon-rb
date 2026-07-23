@@ -285,6 +285,134 @@ Config loading fails immediately with descriptive errors when:
   requires `base_url`, `token`, `team`, and a non-empty `channels` list).
 - A prompt template file does not exist on disk.
 
+## Supervisor
+
+`bin/agent-supervisor <supervisor-config.yml>` runs **N whole workflows** (each
+an ordinary, unchanged `AgentDaemon::Config`) as threads inside **one** MRI
+process, instead of one `agent-daemon` process per workflow. It is a separate
+subsystem layered *on top of* the core described above — the core itself does
+not know it exists (see "Dependency isolation" below). The full invariant set
+this subsystem is built against (AD-1…AD-16) is captured in the project's
+internal architecture spine — a planning artifact kept outside this repository,
+not a shipped document; this section describes the shape actually implemented in Epic 1
+— the console, SQLite history, and metrics exporter referenced by later AD
+numbers ship in Epics 2/5/6 and are not part of this codebase yet.
+
+### Layout
+
+One file per concern under `lib/agent_daemon/supervisor/`:
+
+| File                    | Responsibility                                              |
+|--------------------------|-------------------------------------------------------------|
+| `config.rb`              | Loads a supervisor config that enumerates per-workflow configs |
+| `master.rb`              | Boots and drives every workflow's threads in one process     |
+| `runner_supervisor.rb`   | Per-entity crash/restart state machine (generation tracking) |
+| `runner_identity.rb`     | Composite `(workflow, runner)` identity value object          |
+
+### Supervisor config
+
+`Supervisor::Config` enumerates workflows, each `{name:, config: <path>}`,
+where `config` resolves relative to the supervisor config file's own directory
+(the same rule core uses for `prompt_template`) and is loaded as an ordinary
+`AgentDaemon::Config` — no new config dialect. Loading fails fast, collecting
+every problem into one `ConfigError` (mirroring core): missing/duplicate
+workflow names, a workflow or runner name containing the `:` identity
+delimiter, a referenced config that fails to load, and two workflows whose
+`message_dir`/`output_dir`/trigger work-dirs collide (a shared `project_path`
+alone is not a collision). See `examples/supervisor.yml`.
+
+### Master: one process, many workflows
+
+`Supervisor::Master` builds one entity factory per runner across every
+workflow, plus one per-workflow Messenger (skipped if unconfigured) and
+exactly **one** fleet-wide `Mattermost::Reactor` shared by every workflow's
+mattermost runners — EventMachine's reactor is a process singleton, so this
+mirrors the standalone daemon's one-reactor rule at fleet scale instead of
+per-config. Runners are keyed by the composite `(workflow, runner)`
+`RunnerIdentity` (`workflow:runner` thread key and log tag) rather than by
+runner name alone, since a runner name is only unique *within* its workflow.
+
+Each entity is wrapped in a `RunnerSupervisor` (below); `Master#start` drives
+all of them through a single non-blocking ~1s tick loop
+(`supervise_until_shutdown`) instead of a blocking idle sleep, so one entity's
+restart delay never stalls another's supervision.
+
+**Shutdown** is centralized: `SIGINT`/`SIGTERM` set one shared `ShutdownFlag`
+(same primitive as the standalone daemon), which stops the tick loop and joins
+every supervised thread with a per-thread timeout (`JOIN_TIMEOUT`, 30s
+default) — sequentially, so the worst case for N wedged entities is
+`N * JOIN_TIMEOUT`. After the join, one final tick lets any entity that died
+during the drain publish its terminal state (the tick loop otherwise never
+observes a death after the flag flips). Finally, an **orphan sweep** force-kills
+the in-flight agent process group of any thread still alive after its join
+timeout (never `Thread#kill` — the thread itself is abandoned to process exit;
+only its owned OS process group is killed).
+
+### Per-entity supervisor: crash auto-restart and generation
+
+`RunnerSupervisor` is a small state machine (`:running → :stopping →
+:restarting → :running…` or terminal `:exited`) supervising a single entity's
+full lifecycle — this covers all three entity kinds (runner, messenger,
+reactor), not just runners. `#tick` is its only driver, called ~1/s by the
+master; it never sleeps, so a pending restart is a recorded monotonic
+deadline, not a blocking wait.
+
+A crash (an uncaught exception on the entity's own thread) schedules an
+automatic respawn after `RESTART_DELAY` (60s); a clean exit does not
+auto-restart (manual restart is Epic 4's concern) and becomes terminal.
+Every (re)spawn increments a monotonic **generation** counter starting at 1,
+and builds a fresh sink bundle for that generation — a superseded (old-gen)
+entity's late publish still carries its own, now-stale generation, so a
+downstream consumer (Epic 2's read model) can always tell which instance a
+record came from.
+
+### Publish seam (why the core needs no supervisor require)
+
+Core components (runner, backend, messenger, reactor) report state/events only
+through the narrow `AgentDaemon::Sinks` protocol defined in `sinks.rb` — a
+`Bundle` of `NullState`/`NullEvent`/`NullOutput` sinks by default, so the
+standalone CLI path silently discards everything it publishes (zero behavior
+change, NFR5). The supervisor injects a real `Bundle` per generation
+(`RunnerSupervisor#default_sinks_factory`, gen-stamped via `GenerationStamp`)
+at entity-construction time; the core class being supervised is identical to
+the one the standalone daemon instantiates and never names a supervisor type.
+Today, with no console/history/metrics consumer yet, the injected sinks are
+still the no-op defaults — this seam is what made stories 1.1–1.7 additive
+rather than a core rewrite, and is what Epic 2 hooks a real `StateRegistry`
+into without touching runner/backend/messenger code.
+
+### Centralized, tagged logging
+
+The master installs one shared logger (`bin/agent-supervisor`, `Logger::DEBUG`)
+for the whole fleet; each supervised entity's own thread binds ambient log
+context (`Log.bind_context`) tagging every line with its `(workflow, runner)`
+tag and current generation, gated by that *workflow's* configured
+`logging.level` (per-tag, not global). A per-workflow `logging.file` is
+ignored under the supervisor — there is one shared `$stdout` sink for the
+fleet. The standalone daemon's own single-workflow logger is unchanged.
+
+### Dependency isolation (AD-5) — the contract this story's test guards
+
+All supervisor code lives under `AgentDaemon::Supervisor::` in files required
+**only** from `bin/agent-supervisor` (directly, or transitively through
+`master.rb` → `config.rb`/`runner_supervisor.rb` → `runner_identity.rb`). The
+core load path — `require "agent_daemon"` and therefore `bin/agent-daemon` —
+requires no supervisor file and defines no `AgentDaemon::Supervisor` constant.
+`test/test_require_isolation.rb` asserts this in a clean child Ruby process
+(the shared Minitest process is unsuitable: sibling test files already load
+supervisor code into it before this test runs), and asserts by *feature path*
+that none of `sqlite3`/`puma`/`rack`/`oauth2` (the Epic 2/5/6 console/OAuth/
+SQLite stack) are loaded either — those gems are not yet gemspec dependencies,
+so today the check is forward-guarding a boundary that does not yet have
+anything to violate it. `agent_daemon.gemspec` declares `agent-supervisor` as
+a second `executables` entry alongside `agent-daemon`, so both binstubs
+install with the gem.
+
+**Accepted residual:** isolation is *load-time*, not *install-time* — once
+`sqlite3`/`puma`/`rack`/`oauth2` are added as gemspec dependencies in later
+epics, they are still *installed* on every host that installs this gem, even
+one that only ever runs the standalone `agent-daemon` CLI.
+
 ## Deployment
 
 The gem includes a systemd template unit at `examples/deploy/agent-daemon@.service`.

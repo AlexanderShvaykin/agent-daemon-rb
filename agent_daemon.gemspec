@@ -25,7 +25,7 @@ Gem::Specification.new do |spec|
 
   spec.files = Dir["lib/**/*.rb", "bin/*", "LICENSE", "README.md", "CHANGELOG.md"]
   spec.bindir = "bin"
-  spec.executables = ["agent-daemon"]
+  spec.executables = ["agent-daemon", "agent-supervisor"]
   spec.require_paths = ["lib"]
 
   spec.add_dependency "eventmachine"
