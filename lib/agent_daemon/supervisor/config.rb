@@ -6,6 +6,7 @@ require "json"
 
 require_relative "../config"
 require_relative "runner_identity"
+require_relative "event_bus"
 
 module AgentDaemon
   module Supervisor
@@ -24,10 +25,15 @@ module AgentDaemon
     # depends solely on core Config + Ruby stdlib.
     class Config
       DEFAULTS = {
-        "workflows" => []
+        "workflows" => [],
+        # Records retained by the master's single EventBus. Operator-tunable
+        # because events_dropped_total (AD-4) is a scrapeable Epic 6 metric —
+        # an operator watching it climb needs a remedy other than editing a
+        # constant and redeploying the fleet.
+        "event_bus_capacity" => EventBus::DEFAULT_CAPACITY
       }.freeze
 
-      attr_reader :config_path, :config_dir, :workflows
+      attr_reader :config_path, :config_dir, :workflows, :event_bus_capacity
 
       def initialize(path)
         @config_path = File.expand_path(path)
@@ -35,6 +41,7 @@ module AgentDaemon
         raw = YAML.safe_load(render(File.read(path))) || {}
         @data = deep_merge(DEFAULTS, raw)
         @workflows = build_workflows(@data["workflows"])
+        @event_bus_capacity = @data["event_bus_capacity"]
         validate!
       end
 
@@ -145,6 +152,10 @@ module AgentDaemon
           errors.concat(load_errors)
           errors.concat(validate_duplicate_names)
           errors.concat(validate_dir_collisions)
+        end
+
+        unless @event_bus_capacity.is_a?(Integer) && @event_bus_capacity.positive?
+          errors << "event_bus_capacity must be a positive integer (got #{@event_bus_capacity.inspect}) in #{@config_path}"
         end
 
         raise AgentDaemon::ConfigError, errors.join("\n") unless errors.empty?

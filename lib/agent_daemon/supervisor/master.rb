@@ -3,6 +3,8 @@
 require_relative "../../agent_daemon"
 require_relative "config"
 require_relative "runner_supervisor"
+require_relative "state_registry"
+require_relative "event_bus"
 
 module AgentDaemon
   module Supervisor
@@ -27,6 +29,8 @@ module AgentDaemon
       # RESTART_DELAY / restart_delay:.
       JOIN_TIMEOUT = 30
 
+      attr_reader :state_registry, :event_bus
+
       def initialize(supervisor_config, join_timeout: JOIN_TIMEOUT)
         @config = supervisor_config
         @join_timeout = join_timeout
@@ -35,6 +39,8 @@ module AgentDaemon
         @entity_ids = {}
         @log_levels = {}
         @supervisors = {}
+        @state_registry = StateRegistry.new
+        @event_bus = EventBus.new(capacity: supervisor_config.event_bus_capacity)
       end
 
       def start
@@ -73,7 +79,24 @@ module AgentDaemon
             @entity_ids.fetch(key),
             entity_factory: factory,
             shutdown_flag: @shutdown_flag,
-            log_level: @log_levels[key]
+            log_level: @log_levels[key],
+            sinks_factory: read_model_sinks_factory(key)
+          )
+        end
+      end
+
+      # Mirrors RunnerSupervisor#default_sinks_factory exactly, except the
+      # state/event sinks are the Master's own StateRegistry/EventBus instead
+      # of Null — the read model (AD-4) that every Epic 2 observer reads.
+      # Output stays the Bundle default (NullOutput); the output pipeline is
+      # Epic 3.
+      def read_model_sinks_factory(key)
+        entity_id = @entity_ids.fetch(key)
+        lambda do |generation|
+          Sinks::Bundle.new(
+            entity_id: entity_id,
+            state: GenerationStamp.new(generation, @state_registry),
+            event: GenerationStamp.new(generation, @event_bus)
           )
         end
       end

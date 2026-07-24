@@ -427,4 +427,41 @@ class TestSupervisorConfig < Minitest::Test
       assert_equal 2, config.workflows.size
     end
   end
+
+  # --- event_bus_capacity (AD-10 convention: DEFAULTS + validate!) ---------
+
+  # Rewrite the supervisor.yml the helper produced, keeping its (valid)
+  # workflows list, so a capacity case is exercised against a config that is
+  # otherwise clean.
+  def with_capacity(value)
+    specs = [{ name: "a", file: "a", data: sandboxed_workflow_data }]
+    with_supervisor(specs) do |_dir, path|
+      data = YAML.safe_load(File.read(path))
+      data["event_bus_capacity"] = value unless value == :omitted
+      File.write(path, data.to_yaml)
+      yield path
+    end
+  end
+
+  def test_event_bus_capacity_defaults_to_the_bus_constant
+    with_capacity(:omitted) do |path|
+      config = AgentDaemon::Supervisor::Config.new(path)
+      assert_equal AgentDaemon::Supervisor::EventBus::DEFAULT_CAPACITY, config.event_bus_capacity
+    end
+  end
+
+  def test_event_bus_capacity_accepts_a_positive_integer_override
+    with_capacity(50) do |path|
+      assert_equal 50, AgentDaemon::Supervisor::Config.new(path).event_bus_capacity
+    end
+  end
+
+  def test_event_bus_capacity_rejects_zero_negative_and_non_integer
+    [0, -1, "2000", 12.5].each do |bad|
+      with_capacity(bad) do |path|
+        err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Supervisor::Config.new(path) }
+        assert_match(/event_bus_capacity must be a positive integer/, err.message)
+      end
+    end
+  end
 end
