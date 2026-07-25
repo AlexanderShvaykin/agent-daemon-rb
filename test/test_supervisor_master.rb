@@ -468,7 +468,7 @@ class TestSupervisorMaster < Minitest::Test
   end
 
   def spy_factory(spies, **kwargs)
-    ->(console_config) { spies << ConsoleSpy.new(console_config, **kwargs); spies.last }
+    ->(console_config, _fleet) { spies << ConsoleSpy.new(console_config, **kwargs); spies.last }
   end
 
   # Swaps the null logger this file installs for a StringIO one just for the
@@ -593,7 +593,7 @@ class TestSupervisorMaster < Minitest::Test
   # A factory that blows up before returning an object is the misconfiguration
   # case (bad base_url, unusable auth block) — same rule applies.
   def test_a_console_factory_that_raises_does_not_stop_the_fleet
-    exploding = ->(_console_config) { raise "factory boom" }
+    exploding = ->(_console_config, _fleet) { raise "factory boom" }
     with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config, console_factory: exploding)
       master.send(:build_factories)
@@ -652,5 +652,71 @@ class TestSupervisorMaster < Minitest::Test
   ensure
     Signal.trap("TERM", original_term)
     Signal.trap("INT", original_int)
+  end
+
+  # --- Story 2.3: the roster the console factory receives -----------------
+
+  def test_console_factory_receives_a_fleet_whose_roster_covers_runners_messenger_and_reactor_in_order
+    received_fleet = nil
+    factory = lambda do |console_config, fleet|
+      received_fleet = fleet
+      ConsoleSpy.new(console_config)
+    end
+
+    with_config(
+      [{
+        name: "wf",
+        runners: [tracker_runner("a"), mattermost_runner("m")],
+        messenger: { "webhook_url" => "https://example.com/h" }
+      }],
+      console: CONSOLE_BLOCK
+    ) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: factory)
+      master.send(:build_factories)
+      master.send(:start_console)
+
+      entries = received_fleet.entries
+      assert_equal %i[runner runner messenger reactor], entries.map(&:kind)
+      assert_equal %w[a m messenger mattermost_reactor], entries.map(&:name)
+    end
+  end
+
+  # Fleet's header claims the roster "can never drift" from @entity_ids
+  # because both are written at the same three sites. That is an invariant,
+  # not a comment: an entity wired into @entity_factories without a matching
+  # roster line vanishes from the console silently, and a monitoring surface
+  # that shows fewer entities than exist fails in the worst direction.
+  def test_the_roster_covers_exactly_the_supervised_entity_ids
+    with_config(
+      [{
+        name: "wf",
+        runners: [tracker_runner("a"), mattermost_runner("m")],
+        messenger: { "webhook_url" => "https://example.com/h" }
+      }],
+      console: CONSOLE_BLOCK
+    ) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: spy_factory([]))
+      master.send(:build_factories)
+
+      roster_ids = master.instance_variable_get(:@roster).map(&:entity_id)
+      entity_ids = master.instance_variable_get(:@entity_ids).values
+
+      assert_equal entity_ids.size, roster_ids.size
+      assert_empty entity_ids - roster_ids, "supervised entities missing from the console roster"
+      assert_empty roster_ids - entity_ids, "roster rows with no supervised entity behind them"
+    end
+  end
+
+  # Master#fleet advertises that it tolerates being called before
+  # build_factories. It only does if Fleet copies the roster instead of
+  # freezing Master's own array.
+  def test_starting_the_console_before_build_factories_does_not_wedge_the_roster
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: spy_factory([]))
+      master.send(:start_console)
+      master.send(:build_factories)
+
+      assert_equal %w[a], master.instance_variable_get(:@roster).map(&:name)
+    end
   end
 end

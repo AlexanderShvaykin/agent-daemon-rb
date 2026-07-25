@@ -7,6 +7,8 @@ require "uri"
 # AD-5 lazy-require isolation: console files are loaded explicitly here. This
 # also pulls puma in (Puma::LogWriter is unloadable on its own).
 require "agent_daemon/supervisor/console/server"
+require "agent_daemon/supervisor/fleet"
+require "agent_daemon/supervisor/state_registry"
 
 # Story 2.2 AC7 — the console really runs. AI-1: this boots a REAL Puma with
 # the REAL middleware stack on an ephemeral port and speaks HTTP to it; the
@@ -46,8 +48,12 @@ class TestConsoleServer < Minitest::Test
     restore_logger!
   end
 
+  def empty_fleet
+    AgentDaemon::Supervisor::Fleet.new(roster: [], state_registry: AgentDaemon::Supervisor::StateRegistry.new)
+  end
+
   def start_server(config = CONSOLE_CONFIG)
-    server = Server.new(config, log_writer: Puma::LogWriter.strings)
+    server = Server.new(config, fleet: empty_fleet, log_writer: Puma::LogWriter.strings)
     @servers << server
     server.start
     server
@@ -126,7 +132,7 @@ class TestConsoleServer < Minitest::Test
   end
 
   def test_stop_before_start_is_a_no_op
-    server = Server.new(CONSOLE_CONFIG, log_writer: Puma::LogWriter.strings)
+    server = Server.new(CONSOLE_CONFIG, fleet: empty_fleet, log_writer: Puma::LogWriter.strings)
     @servers << server
 
     server.stop
@@ -170,7 +176,7 @@ class TestConsoleServer < Minitest::Test
       end
     end
 
-    server = failing.new(CONSOLE_CONFIG.merge("port" => port), log_writer: Puma::LogWriter.strings)
+    server = failing.new(CONSOLE_CONFIG.merge("port" => port), fleet: empty_fleet, log_writer: Puma::LogWriter.strings)
     assert_raises(RuntimeError) { server.start }
 
     # If the socket leaked, this bind fails with EADDRINUSE.

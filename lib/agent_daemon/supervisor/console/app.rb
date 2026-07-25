@@ -8,9 +8,11 @@ module AgentDaemon
   module Supervisor
     module Console
       # The console's authenticated surface — plain Rack, no router gem, no
-      # Sinatra. In Story 2.2 it is deliberately almost empty: the fleet list is
-      # 2.3, runner detail 2.4, the activity log 2.5, SSE 2.6. It reads neither
-      # StateRegistry nor EventBus yet.
+      # Sinatra. `/` is the fleet list (Story 2.3): every supervised entity,
+      # grouped by workflow, with liveness derived from the read model
+      # (Fleet, itself backed by StateRegistry, AD-4). Runner detail is 2.4,
+      # the activity log 2.5, SSE 2.6 — this app reads neither EventBus nor
+      # per-runner fields yet.
       #
       # There is NO auth code here, by design. Auth wraps this app and
       # authenticates by default, so a route added below is protected the moment
@@ -27,6 +29,10 @@ module AgentDaemon
           "cache-control" => "no-store"
         }.freeze
         TEXT_HEADERS = { "content-type" => "text/plain; charset=utf-8" }.freeze
+
+        def initialize(fleet:)
+          @fleet = fleet
+        end
 
         def call(env)
           request = Rack::Request.new(env)
@@ -68,7 +74,10 @@ module AgentDaemon
         end
 
         # AD-7: every interpolated value is escaped. The username comes from
-        # GitLab and is not ours to trust.
+        # GitLab, entity/workflow names from operator-authored config — not
+        # agent-influenced today, but 2.4/2.5 put genuinely agent-influenced
+        # values (work-item keys) into this same table, so this page escapes
+        # by habit rather than by threat model.
         def page(username, csrf_token)
           <<~HTML
             <!DOCTYPE html>
@@ -76,14 +85,85 @@ module AgentDaemon
             <head><meta charset="utf-8"><title>agent-daemon console</title></head>
             <body>
             <h1>agent-daemon console</h1>
-            <p>Signed in as <strong>#{Rack::Utils.escape_html(username)}</strong></p>
+            <p>Signed in as <strong>#{esc(username)}</strong></p>
             <form method="post" action="/auth/logout">
-            <input type="hidden" name="_csrf" value="#{Rack::Utils.escape_html(csrf_token)}">
+            <input type="hidden" name="_csrf" value="#{esc(csrf_token)}">
             <button type="submit">Log out</button>
             </form>
+            #{fleet_html}
             </body>
             </html>
           HTML
+        end
+
+        # One #entries call, two projections of it: every row on the page then
+        # comes from a single registry read, which is also one mutex
+        # acquisition instead of two per request.
+        def fleet_html
+          entries = @fleet.entries
+          workflows = @fleet.workflows(entries)
+          fleet_wide = @fleet.fleet_wide(entries)
+
+          return "<p>No supervised entities.</p>" if workflows.empty? && fleet_wide.empty?
+
+          html = +""
+          workflows.each do |name, entries|
+            html << "<h2>#{esc(name)}</h2>\n"
+            html << entity_table(entries)
+          end
+          unless fleet_wide.empty?
+            html << "<h2>Fleet-wide</h2>\n"
+            html << entity_table(fleet_wide)
+          end
+          html
+        end
+
+        def entity_table(entries)
+          rows = entries.map { |entry| entity_row(entry) }.join
+          <<~HTML
+            <table>
+            <tr><th>Entity</th><th>Kind</th><th>Liveness</th><th>Note</th><th></th></tr>
+            #{rows}</table>
+          HTML
+        end
+
+        def entity_row(entry)
+          <<~HTML
+            <tr><td>#{esc(entry.name)}</td><td>#{esc(entry.kind)}</td><td>#{liveness_cell(entry.liveness)}</td><td>#{esc(note_for(entry.status))}</td><td>#{restart_placeholder}</td></tr>
+          HTML
+        end
+
+        def liveness_cell(liveness)
+          %(<span class="liveness liveness-#{esc(liveness)}">#{esc(liveness)}</span>)
+        end
+
+        # AC3's FR3 boundary: a runner that exited without the crash flag is
+        # not auto-restarted, and that must be visible here, not inferred
+        # from the liveness word alone.
+        # :stopped is the whole fleet's state for the length of the drain —
+        # stop_console runs in Master#start's ensure, AFTER wait_for_threads,
+        # so the console keeps serving for up to JOIN_TIMEOUT per supervisor.
+        # Without this branch every row reads `dead` with no explanation,
+        # indistinguishable from a fleet that has fallen over.
+        def note_for(status)
+          case status
+          when :exited then "exited cleanly — not auto-restarted"
+          when :stopped then "stopped — fleet is shutting down"
+          when nil then "no state published — never started, or failed to start"
+          else ""
+          end
+        end
+
+        # AC2/AD-13: every supervised entity gets a restart action, disabled
+        # until Epic 4 adds the endpoint. No <form>, no action, no POST
+        # target — a form pointing at a route that does not exist yet is a
+        # 404 waiting to be mistaken for a bug.
+        def restart_placeholder
+          '<button type="button" disabled>Restart</button>'
+        end
+
+        def esc(value)
+          Rack::Utils.escape_html(value.to_s)
         end
       end
     end

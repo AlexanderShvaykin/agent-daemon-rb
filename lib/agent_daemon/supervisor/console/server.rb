@@ -32,7 +32,7 @@ module AgentDaemon
 
         attr_reader :port
 
-        def initialize(console_config, log_writer: Puma::LogWriter.stdio)
+        def initialize(console_config, fleet:, log_writer: Puma::LogWriter.stdio)
           @bind = console_config.fetch("bind")
           @port = console_config.fetch("port")
           @max_threads = console_config.fetch("max_threads")
@@ -40,6 +40,7 @@ module AgentDaemon
           @secure_cookies = console_config.fetch("secure_cookies")
           @base_url = console_config.fetch("base_url")
           @auth_config = console_config.fetch("auth")
+          @fleet = fleet
           @log_writer = log_writer
         end
 
@@ -116,7 +117,7 @@ module AgentDaemon
         def app
           sessions = SessionStore.new(ttl: @session_ttl)
           Auth.new(
-            App.new,
+            App.new(fleet: @fleet),
             sessions: sessions,
             gitlab: gitlab,
             allowed_groups: @auth_config.fetch("allowed_groups"),

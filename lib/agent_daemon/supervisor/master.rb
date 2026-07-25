@@ -5,6 +5,7 @@ require_relative "config"
 require_relative "runner_supervisor"
 require_relative "state_registry"
 require_relative "event_bus"
+require_relative "fleet"
 require_relative "console/server"
 
 module AgentDaemon
@@ -33,7 +34,7 @@ module AgentDaemon
       # Builds the console server from the config's `console` block. Injectable
       # for the same reason join_timeout is: a test must be able to make the
       # console fail on purpose and watch the fleet carry on regardless.
-      CONSOLE_FACTORY = ->(console_config) { Console::Server.new(console_config) }
+      CONSOLE_FACTORY = ->(console_config, fleet) { Console::Server.new(console_config, fleet: fleet) }
 
       attr_reader :state_registry, :event_bus
 
@@ -46,6 +47,7 @@ module AgentDaemon
         @entity_ids = {}
         @log_levels = {}
         @supervisors = {}
+        @roster = []
         @console = nil
         @console_dead = false
         @state_registry = StateRegistry.new
@@ -118,13 +120,21 @@ module AgentDaemon
         @supervisors.each_value(&:spawn!)
       end
 
+      # Must tolerate being called before build_factories (@roster is [] from
+      # initialize), so it yields an empty fleet rather than a
+      # NoMethodError — several existing tests call start_console with no
+      # build_factories first.
+      def fleet
+        @fleet ||= Fleet.new(roster: @roster, state_registry: @state_registry)
+      end
+
       # AC7 / AD-3 / NFR4: the console is an observer, so a console fault is
       # never a fleet fault. A bind collision or an OAuth misconfiguration is
       # logged and the supervision loop runs on without a console.
       def start_console
         return if @config.console.nil?
 
-        console = @console_factory.call(@config.console)
+        console = @console_factory.call(@config.console, fleet)
         console.start
         @console = console
         Log.info("[Console] listening on #{@config.console['bind']}:#{console.port}")
@@ -242,6 +252,7 @@ module AgentDaemon
           @entity_factories[key] = runner_factory_for(workflow[:config], runner_config)
           @entity_ids[key] = identity
           @log_levels[key] = log_level
+          @roster << Fleet::Rostered.new(kind: :runner, workflow: workflow[:name], name: runner_config["name"], entity_id: identity)
         end
       end
 
@@ -253,9 +264,11 @@ module AgentDaemon
 
         config = workflow[:config]
         key = :"messenger:#{workflow[:name]}"
+        entity_id = "messenger:#{workflow[:name]}"
         @entity_factories[key] = ->(bundle) { Messenger.new(config, @shutdown_flag, sinks: bundle) }
-        @entity_ids[key] = "messenger:#{workflow[:name]}"
+        @entity_ids[key] = entity_id
         @log_levels[key] = resolve_log_level(config.logging["level"])
+        @roster << Fleet::Rostered.new(kind: :messenger, workflow: workflow[:name], name: "messenger", entity_id: entity_id)
       end
 
       # Maps a workflow's `logging.level` string (e.g. "info") to a
@@ -317,6 +330,7 @@ module AgentDaemon
           Mattermost::Reactor.new(listeners, @shutdown_flag, sinks: bundle)
         end
         @entity_ids[:mattermost_reactor] = "mattermost_reactor"
+        @roster << Fleet::Rostered.new(kind: :reactor, workflow: nil, name: "mattermost_reactor", entity_id: @entity_ids[:mattermost_reactor])
         # The reactor is fleet-wide (AD-13) — one entity spanning every
         # workflow's mattermost runners — so it has no single owning workflow
         # to take a level from. Default to INFO; a listener's own lines
