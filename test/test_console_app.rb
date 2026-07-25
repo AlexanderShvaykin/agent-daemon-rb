@@ -196,10 +196,10 @@ class TestConsoleApp < Minitest::Test
     wf_a = section(body, "wfA")
     wf_b = section(body, "wfB")
 
-    assert_includes wf_a, "<td>alpha</td>"
+    assert_includes wf_a, %(<td><a href="/entity?id=runner%3AwfA%3Aalpha">alpha</a></td>)
     assert_includes wf_a, %(<span class="liveness liveness-alive">alive</span>)
     refute_includes wf_a, "beta"
-    assert_includes wf_b, "<td>beta</td>"
+    assert_includes wf_b, %(<td><a href="/entity?id=runner%3AwfB%3Abeta">beta</a></td>)
     refute_includes wf_b, "alpha"
     assert_operator body.index("<h2>wfA</h2>"), :<, body.index("<h2>wfB</h2>"), "workflows must render in config order"
   end
@@ -217,7 +217,7 @@ class TestConsoleApp < Minitest::Test
 
     assert_includes body, "<tr><th>Entity</th><th>Kind</th><th>Liveness</th><th>Note</th><th></th></tr>"
     assert_includes body,
-                    "<tr><td>alpha</td><td>runner</td>" \
+                    "<tr><td><a href=\"/entity?id=runner%3Awf%3Aalpha\">alpha</a></td><td>runner</td>" \
                     "<td><span class=\"liveness liveness-alive\">alive</span></td>" \
                     "<td></td><td><button type=\"button\" disabled>Restart</button></td></tr>"
   end
@@ -238,10 +238,10 @@ class TestConsoleApp < Minitest::Test
     wf_section = section(body, "wf")
     fleet_wide_section = section(body, "Fleet-wide")
 
-    assert_includes wf_section, "<td>messenger</td>"
+    assert_includes wf_section, %(<td><a href="/entity?id=messenger%3Awf">messenger</a></td>)
     refute_includes wf_section, "mattermost_reactor"
-    assert_includes fleet_wide_section, "<td>mattermost_reactor</td>"
-    refute_includes fleet_wide_section, "<td>messenger</td>"
+    assert_includes fleet_wide_section, %(<td><a href="/entity?id=mattermost_reactor">mattermost_reactor</a></td>)
+    refute_includes fleet_wide_section, ">messenger<"
 
     [wf_section, fleet_wide_section].each do |sect|
       assert_includes sect, %(<span class="liveness liveness-alive">alive</span>)
@@ -334,5 +334,290 @@ class TestConsoleApp < Minitest::Test
     # spelled differently, and the button sits outside that tag anyway.
     assert_equal ['<form method="post" action="/auth/logout">'], body.scan(/<form[^>]*>/),
                  "the logout form must be the only <form> on the page until Epic 4 adds the restart endpoint"
+  end
+
+  # --- Story 2.4: per-runner detail page -----------------------------------
+
+  def test_a_waiting_runner_shows_liveness_and_activity_but_no_work_item_row
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :waiting, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry))
+
+    body = get_on(app, "/entity?id=runner%3Awf%3Aalpha").body
+
+    assert_includes body, %(<span class="liveness liveness-alive">alive</span>)
+    assert_includes body, "<tr><th>Activity</th><td>waiting</td></tr>"
+    refute_includes body, "<th>Work item</th>"
+    refute_includes body, "<th>Attempt</th>"
+  end
+
+  # AC7
+  def test_an_in_progress_runner_shows_the_work_item_and_attempt_count
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :in_progress, work_item: "T-1", attempt: 2, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry))
+
+    body = get_on(app, "/entity?id=runner%3Awf%3Aalpha").body
+
+    assert_includes body, "<tr><th>Work item</th><td>T-1</td></tr>"
+    assert_includes body, "<tr><th>Attempt</th><td>2</td></tr>"
+  end
+
+  # AC4-carried-forward: work_item is the first genuinely agent-influenced
+  # value to reach this renderer.
+  def test_a_hostile_work_item_is_rendered_escaped
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :in_progress, work_item: "<script>alert(1)</script>", attempt: 1, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry))
+
+    body = get_on(app, "/entity?id=runner%3Awf%3Aalpha").body
+
+    refute_includes body, "<script>alert(1)</script>"
+    assert_includes body, "&lt;script&gt;alert(1)&lt;/script&gt;"
+  end
+
+  # AC6, rendered: the same-generation :crashed publish is a full overwrite,
+  # so a crashed runner never renders a stale "working on X" row — this is
+  # impossible by construction, so the render is checked against the AC6
+  # sequence rather than guarded defensively.
+  def test_a_crashed_runner_renders_restarting_its_generation_and_no_work_item_row
+    id = RunnerIdentity.new(workflow: "wf", runner: "flaky")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :in_progress, work_item: "T-1", attempt: 2, generation: 1 })
+    registry.publish(id, { status: :crashed, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "flaky", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry, restart_delay: 60))
+
+    body = get_on(app, "/entity?id=runner%3Awf%3Aflaky").body
+
+    assert_includes body, %(<span class="liveness liveness-restarting">restarting</span>)
+    assert_includes body, "<tr><th>Generation</th><td>1 (0 restart(s))</td></tr>"
+    assert_match(%r{<tr><th>Restarting for</th><td>\d+s</td></tr>}, body)
+    refute_includes body, "<th>Work item</th>"
+    refute_includes body, "T-1"
+  end
+
+  # AC4: a healthy restart vs. a stuck crash-loop, driven by the injected
+  # clock (no sleep).
+  def test_a_crash_looping_entity_renders_the_stuck_flag_a_fresh_one_does_not
+    id = RunnerIdentity.new(workflow: "wf", runner: "flaky")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :crashed, generation: 1 })
+    published_at = registry.snapshot(id).fetch(:observed_monotonic)
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "flaky", entity_id: id)]
+
+    stuck_app = build_app(Fleet.new(roster: roster, state_registry: registry, restart_delay: 60,
+                                     clock: -> { published_at + 66 }))
+    fresh_app = build_app(Fleet.new(roster: roster, state_registry: registry, restart_delay: 60,
+                                     clock: -> { published_at + 1 }))
+
+    stuck_body = get_on(stuck_app, "/entity?id=runner%3Awf%3Aflaky").body
+    fresh_body = get_on(fresh_app, "/entity?id=runner%3Awf%3Aflaky").body
+
+    assert_includes stuck_body,
+                    "<tr><th>Restarting for</th><td>66s — <strong>stuck: respawn is failing</strong></td></tr>"
+    assert_includes fresh_body, "<tr><th>Restarting for</th><td>1s</td></tr>"
+    refute_includes fresh_body, "stuck: respawn is failing"
+  end
+
+  # AC9: a messenger/reactor entity has no work-item/attempt semantics at all.
+  def test_a_messenger_entity_shows_liveness_only
+    registry = StateRegistry.new
+    registry.publish("messenger:wf", { status: :running, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :messenger, workflow: "wf", name: "messenger", entity_id: "messenger:wf")]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry))
+
+    body = get_on(app, "/entity?id=messenger%3Awf").body
+
+    assert_includes body, %(<span class="liveness liveness-alive">alive</span>)
+    refute_includes body, "<th>Work item</th>"
+    refute_includes body, "<th>Attempt</th>"
+  end
+
+  def test_a_reactor_entity_shows_liveness_only
+    registry = StateRegistry.new
+    registry.publish("mattermost_reactor", { status: :running, generation: 1 })
+    roster = [
+      Fleet::Rostered.new(kind: :reactor, workflow: nil, name: "mattermost_reactor", entity_id: "mattermost_reactor")
+    ]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry))
+
+    body = get_on(app, "/entity?id=mattermost_reactor").body
+
+    assert_includes body, %(<span class="liveness liveness-alive">alive</span>)
+    # The reactor is fleet-wide, so its Workflow cell is the pinned em dash
+    # rather than a blank cell.
+    assert_includes body, "<tr><th>Workflow</th><td>—</td></tr>"
+    refute_includes body, "<th>Work item</th>"
+    refute_includes body, "<th>Attempt</th>"
+  end
+
+  # AC5
+  def test_the_staleness_note_is_present
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :waiting, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry))
+
+    body = get_on(app, "/entity?id=runner%3Awf%3Aalpha").body
+
+    # The literal, not App::STALENESS_NOTE: asserting the constant against
+    # itself passes for any wording, and the Dev Notes pin this string.
+    assert_includes body,
+                    "<p class=\"staleness\">Liveness is observed on the supervisor's ~1 s supervision " \
+                    "tick, so a crash can take up to ~1 s to appear here. This latency counts inside " \
+                    "the ≤ 2 s freshness budget, not on top of it.</p>"
+  end
+
+  # Every not-found test below runs against this, never against an empty
+  # roster: with roster: [] the lookup returns nil for any input, so the whole
+  # batch would pass against an app with no id handling at all.
+  def one_runner_app
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :waiting, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    build_app(Fleet.new(roster: roster, state_registry: registry))
+  end
+
+  # The positive control every not-found test needs: this app does render a
+  # detail page, so a 404 below is the id being rejected, not the fleet being
+  # empty.
+  def assert_renders_alpha(app)
+    response = get_on(app, "/entity?id=runner%3Awf%3Aalpha")
+
+    assert_equal 200, response.status
+    assert_includes response.body, "<h2>alpha</h2>"
+  end
+
+  # The Detail page contract's empty markers: "— is the empty marker … never a
+  # blank cell, never nil.to_s: an empty cell reads as a rendering bug". An
+  # entity that never published exercises every one of them at once, plus the
+  # back-link and the three rows no other test asserts.
+  def test_a_never_published_entity_renders_every_pinned_empty_marker
+    id = RunnerIdentity.new(workflow: "wf", runner: "ghost")
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "ghost", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new))
+
+    body = get_on(app, "/entity?id=runner%3Awf%3Aghost").body
+
+    assert_includes body, %(<p><a href="/">&larr; Fleet</a></p>)
+    assert_includes body, "<h2>ghost</h2>"
+    assert_includes body, "<tr><th>Workflow</th><td>wf</td></tr>"
+    assert_includes body, "<tr><th>Kind</th><td>runner</td></tr>"
+    assert_includes body, %(<span class="liveness liveness-unknown">unknown</span>)
+    assert_includes body, "<tr><th>Activity</th><td>—</td></tr>"
+    assert_includes body, "<tr><th>Generation</th><td>—</td></tr>"
+    assert_includes body, "<tr><th>State published</th><td>never</td></tr>"
+    assert_includes body, "<p>no state published — never started, or failed to start</p>"
+  end
+
+  # AC11: an unknown id is a plain 404 that echoes nothing.
+  def test_get_entity_with_unknown_id_is_not_found_and_echoes_nothing
+    app = one_runner_app
+    assert_renders_alpha(app)
+
+    response = get_on(app, "/entity?id=nope")
+
+    assert_equal 404, response.status
+    assert_equal "not found", response.body
+  end
+
+  def test_get_entity_with_a_hostile_id_is_not_found_and_echoes_nothing
+    app = one_runner_app
+    assert_renders_alpha(app)
+
+    ["../../etc/passwd", "<script>alert(1)</script>"].each do |hostile|
+      response = get_on(app, "/entity?id=#{Rack::Utils.escape(hostile)}")
+
+      assert_equal 404, response.status
+      assert_equal "not found", response.body
+    end
+  end
+
+  # AC11's "malformed" half. Rack raises out of query parsing for a key that
+  # mixes scalar and array forms or nests past its depth limit; PARAM_ERRORS
+  # turns each into the same 404. Untested, that rescue is dead code to CI —
+  # which is exactly how ParameterTypeError escaped the original list.
+  def test_get_entity_with_a_malformed_query_string_is_not_found
+    app = one_runner_app
+    assert_renders_alpha(app)
+
+    ["id=1&id[]=2", "id[]=1&id=2", "id#{"[a]" * 40}=1"].each do |query|
+      response = get_on(app, "/entity?#{query}")
+
+      assert_equal 404, response.status, "malformed query #{query.inspect} must be a 404, not a 500"
+      assert_equal "not found", response.body
+    end
+  end
+
+  # The Routing contract is one path and one *query* parameter. #params would
+  # also merge a form-encoded body, so the id in the visible URL would not be
+  # the id that renders.
+  def test_a_form_encoded_body_cannot_override_the_query_string_id
+    app = one_runner_app
+    assert_renders_alpha(app)
+
+    response = app.get("/entity?id=nope",
+                       { Auth::SESSION_ENV_KEY => session_for("alice"),
+                         :input => "id=runner%3Awf%3Aalpha",
+                         "CONTENT_TYPE" => "application/x-www-form-urlencoded" })
+
+    assert_equal 404, response.status
+    assert_equal "not found", response.body
+  end
+
+  def test_post_entity_is_not_found
+    assert_equal 404, @app.post("/entity").status
+  end
+
+  def test_get_entity_with_no_id_param_is_not_found
+    app = one_runner_app
+    assert_renders_alpha(app)
+
+    assert_equal 404, get_on(app, "/entity").status
+    assert_equal 404, get_on(app, "/entity?id=").status
+  end
+
+  # AC12: the detail page carries the same no-store header and CSRF logout
+  # form as the list page.
+  def test_the_detail_page_carries_no_store_and_the_csrf_logout_form
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :waiting, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry))
+    session = session_for("alice")
+
+    response = app.get("/entity?id=runner%3Awf%3Aalpha", { Auth::SESSION_ENV_KEY => session })
+
+    assert_equal "no-store", response.headers["cache-control"]
+    assert_includes response.body, %(action="/auth/logout")
+    assert_includes response.body, session.csrf_token
+  end
+
+  # AC10: following the list's link actually renders that entity's page, not
+  # just the presence of an <a>.
+  def test_the_lists_entity_link_round_trips_to_that_entitys_detail_page
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :waiting, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry))
+
+    list_body = get_on(app, "/").body
+    href = list_body[%r{href="(/entity\?id=[^"]+)"}, 1]
+    refute_nil href, "no entity link found on the list page"
+
+    detail_body = get_on(app, href).body
+
+    assert_includes detail_body, "<h2>alpha</h2>"
   end
 end

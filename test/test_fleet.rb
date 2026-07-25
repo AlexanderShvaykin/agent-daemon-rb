@@ -197,6 +197,101 @@ class TestFleet < Minitest::Test
     assert_empty fleet.fleet_wide
   end
 
+  # --- Story 2.4: #find and the detail fields -------------------------------
+
+  def test_find_locates_each_of_the_three_id_shapes_and_nil_for_unknown
+    runner_id = runner_identity("wf", "alpha")
+    roster = [
+      Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: runner_id),
+      Rostered.new(kind: :messenger, workflow: "wf", name: "messenger", entity_id: "messenger:wf"),
+      Rostered.new(kind: :reactor, workflow: nil, name: "mattermost_reactor", entity_id: "mattermost_reactor")
+    ]
+    fleet = Fleet.new(roster: roster, state_registry: @registry)
+
+    assert_equal "alpha", fleet.find("runner:wf:alpha").name
+    assert_equal "messenger", fleet.find("messenger:wf").name
+    assert_equal "mattermost_reactor", fleet.find("mattermost_reactor").name
+    assert_nil fleet.find("unknown")
+  end
+
+  def test_an_in_progress_snapshot_surfaces_work_item_attempt_and_generation
+    id = runner_identity("wf", "alpha")
+    @registry.publish(id, { status: :in_progress, work_item: "T-1", attempt: 2, generation: 3 })
+    roster = [Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    fleet = Fleet.new(roster: roster, state_registry: @registry)
+
+    entry = fleet.entries.first
+
+    assert_equal "T-1", entry.work_item
+    assert_equal 2, entry.attempt
+    assert_equal 3, entry.generation
+  end
+
+  # AC6, driven for real (not stubbed): the supervisor's same-generation
+  # :crashed publish is a full overwrite (state_registry.rb:50-57), so it
+  # must erase the dying instance's own last :in_progress work_item/attempt
+  # rather than leave them stale.
+  def test_a_same_generation_crash_erases_the_last_in_progress_work_item
+    id = runner_identity("wf", "flaky")
+    @registry.publish(id, { status: :in_progress, work_item: "T-1", attempt: 2, generation: 1 })
+    @registry.publish(id, { status: :crashed, generation: 1 })
+    roster = [Rostered.new(kind: :runner, workflow: "wf", name: "flaky", entity_id: id)]
+    fleet = Fleet.new(roster: roster, state_registry: @registry)
+
+    entry = fleet.entries.first
+
+    assert_nil entry.work_item
+    assert_nil entry.attempt
+    assert_equal :restarting, entry.liveness
+  end
+
+  # --- Story 2.4: stuck_restarting (clock injected, no sleep) ---------------
+
+  def test_stuck_restarting_is_false_for_a_freshly_crashed_entity
+    id = runner_identity("wf", "flaky")
+    @registry.publish(id, { status: :crashed, generation: 1 })
+    published_at = @registry.snapshot(id).fetch(:observed_monotonic)
+    roster = [Rostered.new(kind: :runner, workflow: "wf", name: "flaky", entity_id: id)]
+    fleet = Fleet.new(roster: roster, state_registry: @registry, restart_delay: 60, clock: -> { published_at + 1 })
+
+    refute fleet.entries.first.stuck_restarting
+  end
+
+  def test_stuck_restarting_is_true_once_elapsed_exceeds_restart_delay_plus_margin
+    id = runner_identity("wf", "flaky")
+    @registry.publish(id, { status: :crashed, generation: 1 })
+    published_at = @registry.snapshot(id).fetch(:observed_monotonic)
+    roster = [Rostered.new(kind: :runner, workflow: "wf", name: "flaky", entity_id: id)]
+    fleet = Fleet.new(roster: roster, state_registry: @registry, restart_delay: 60, clock: -> { published_at + 66 })
+
+    entry = fleet.entries.first
+
+    assert entry.stuck_restarting
+    assert_equal 66, entry.seconds_since_published
+  end
+
+  def test_stuck_restarting_is_false_for_an_in_progress_entity_of_any_age
+    id = runner_identity("wf", "busy")
+    @registry.publish(id, { status: :in_progress, work_item: "T-1", attempt: 1, generation: 1 })
+    published_at = @registry.snapshot(id).fetch(:observed_monotonic)
+    roster = [Rostered.new(kind: :runner, workflow: "wf", name: "busy", entity_id: id)]
+    fleet = Fleet.new(roster: roster, state_registry: @registry, restart_delay: 60,
+                       clock: -> { published_at + 1_000_000 })
+
+    refute fleet.entries.first.stuck_restarting
+  end
+
+  def test_stuck_restarting_is_false_when_restart_delay_is_nil
+    id = runner_identity("wf", "flaky")
+    @registry.publish(id, { status: :crashed, generation: 1 })
+    published_at = @registry.snapshot(id).fetch(:observed_monotonic)
+    roster = [Rostered.new(kind: :runner, workflow: "wf", name: "flaky", entity_id: id)]
+    fleet = Fleet.new(roster: roster, state_registry: @registry, restart_delay: nil,
+                       clock: -> { published_at + 1_000_000 })
+
+    refute fleet.entries.first.stuck_restarting
+  end
+
   # --- Empty roster ---------------------------------------------------------
 
   def test_an_empty_roster_yields_empty_results

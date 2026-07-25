@@ -30,7 +30,14 @@ module AgentDaemon
       Rostered = Struct.new(:kind, :workflow, :name, :entity_id, keyword_init: true)
 
       # A rostered entity joined with its current registry state (or none).
-      Entry = Struct.new(:kind, :workflow, :name, :status, :liveness, keyword_init: true)
+      # The first five members and :id, :generation, :work_item, :attempt,
+      # :observed_at are the join itself; :seconds_since_published and
+      # :stuck_restarting are derived at read time from the single clock
+      # reading #entries takes, so every row describes one instant.
+      Entry = Struct.new(:kind, :workflow, :name, :status, :liveness,
+                          :id, :generation, :work_item, :attempt,
+                          :observed_at, :seconds_since_published, :stuck_restarting,
+                          keyword_init: true)
 
       # Maps a snapshot's raw published :status to a three-way liveness. A
       # status absent from this map (including a nil status, meaning no
@@ -53,13 +60,31 @@ module AgentDaemon
         stopped: :dead # graceful fleet shutdown
       }.freeze
 
+      # A healthy restart republishes within restart_delay + ~1s (the master
+      # tick, master.rb's sleep(1)). Five seconds is that 1s plus four of
+      # slack for tick jitter and GC; anything still :crashed past it has had
+      # a respawn attempt fail silently (RunnerSupervisor#spawn!'s rescue,
+      # which re-arms the deadline and publishes nothing) — see Story 2.4 Dev
+      # Notes for the full derivation.
+      RESTART_STUCK_MARGIN = 5
+
+      DEFAULT_CLOCK = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+
       # The roster is dup'd before freezing: Master hands us the very array it
       # keeps appending to in build_factories, and freezing that object in
       # place would turn a later @roster << into a FrozenError — a boot abort,
       # since nothing on that path rescues.
-      def initialize(roster:, state_registry:)
+      #
+      # restart_delay: the supervisor's real restart delay, injected rather
+      # than imported (see Dev Notes) so this read model never depends on
+      # RunnerSupervisor. nil means the stuck-restart flag is unavailable,
+      # never "flag everything". clock: injectable so tests advance time
+      # instead of sleeping, matching SessionStore's own clock: kwarg.
+      def initialize(roster:, state_registry:, restart_delay: nil, clock: DEFAULT_CLOCK)
         @roster = roster.dup.freeze
         @state_registry = state_registry
+        @restart_delay = restart_delay
+        @clock = clock
       end
 
       # Roster order, state joined. One registry read per call (#all, not N
@@ -68,17 +93,14 @@ module AgentDaemon
       # #fleet_wide — otherwise the page's rows come from two different reads.
       def entries
         snapshots = @state_registry.all
-        @roster.map do |rostered|
-          snapshot = snapshots[rostered.entity_id]
-          status = snapshot && snapshot[:status]
-          Entry.new(
-            kind: rostered.kind,
-            workflow: rostered.workflow,
-            name: rostered.name,
-            status: status,
-            liveness: LIVENESS.fetch(status, :unknown)
-          )
-        end
+        now = @clock.call
+        @roster.map { |rostered| build_entry(rostered, snapshots[rostered.entity_id], now) }
+      end
+
+      # Linear scan: NFR7 caps the fleet at ~20 entities, and the alternative
+      # is a second index to keep in sync with the roster.
+      def find(id)
+        entries.find { |entry| entry.id == id }
       end
 
       # Config order; each workflow's runners then its messenger. The
@@ -102,6 +124,49 @@ module AgentDaemon
       # mattermost runner configured anywhere in the fleet).
       def fleet_wide(entries = self.entries)
         entries.select { |entry| entry.kind == :reactor }
+      end
+
+      private
+
+      def build_entry(rostered, snapshot, now)
+        status = snapshot && snapshot[:status]
+        liveness = LIVENESS.fetch(status, :unknown)
+        since_published = seconds_since_published(snapshot, now)
+
+        Entry.new(
+          kind: rostered.kind,
+          workflow: rostered.workflow,
+          name: rostered.name,
+          status: status,
+          liveness: liveness,
+          id: entity_id(rostered.entity_id),
+          generation: snapshot && snapshot[:generation],
+          work_item: snapshot && snapshot[:work_item],
+          attempt: snapshot && snapshot[:attempt],
+          observed_at: snapshot && snapshot[:observed_at],
+          seconds_since_published: since_published,
+          stuck_restarting: stuck_restarting?(liveness, since_published)
+        )
+      end
+
+      # Mirrors RunnerSupervisor#thread_key's fallback: a RunnerIdentity
+      # yields its workflow-qualified key, a messenger/reactor entity_id is
+      # already the opaque id string.
+      def entity_id(entity_id)
+        entity_id.respond_to?(:thread_key) ? entity_id.thread_key.to_s : entity_id.to_s
+      end
+
+      def seconds_since_published(snapshot, now)
+        return nil unless snapshot && snapshot[:observed_monotonic]
+
+        (now - snapshot[:observed_monotonic]).round
+      end
+
+      def stuck_restarting?(liveness, seconds_since_published)
+        return false unless liveness == :restarting
+        return false unless @restart_delay && seconds_since_published
+
+        seconds_since_published > @restart_delay + RESTART_STUCK_MARGIN
       end
     end
   end

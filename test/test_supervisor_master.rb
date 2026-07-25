@@ -707,6 +707,20 @@ class TestSupervisorMaster < Minitest::Test
     end
   end
 
+  # Story 2.4: restart_delay is injected into Fleet, not imported, so nothing
+  # keeps the two in sync but this test. A Master that forgot to pass it
+  # would silently disable the stuck-restart flag (Fleet defaults to nil).
+  def test_fleet_carries_the_supervisors_real_restart_delay
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: spy_factory([]))
+
+      fleet = master.send(:fleet)
+
+      assert_equal AgentDaemon::Supervisor::RunnerSupervisor::RESTART_DELAY,
+                   fleet.instance_variable_get(:@restart_delay)
+    end
+  end
+
   # Master#fleet advertises that it tolerates being called before
   # build_factories. It only does if Fleet copies the roster instead of
   # freezing Master's own array.

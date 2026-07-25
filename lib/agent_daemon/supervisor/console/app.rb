@@ -10,9 +10,10 @@ module AgentDaemon
       # The console's authenticated surface — plain Rack, no router gem, no
       # Sinatra. `/` is the fleet list (Story 2.3): every supervised entity,
       # grouped by workflow, with liveness derived from the read model
-      # (Fleet, itself backed by StateRegistry, AD-4). Runner detail is 2.4,
-      # the activity log 2.5, SSE 2.6 — this app reads neither EventBus nor
-      # per-runner fields yet.
+      # (Fleet, itself backed by StateRegistry, AD-4). `/entity?id=…` is the
+      # per-runner detail page (Story 2.4), which reads the snapshot's
+      # per-runner fields — work item, attempt, generation, observed_at. The
+      # activity log is 2.5 and SSE is 2.6 — this app reads no EventBus yet.
       #
       # There is NO auth code here, by design. Auth wraps this app and
       # authenticates by default, so a route added below is protected the moment
@@ -30,6 +31,25 @@ module AgentDaemon
         }.freeze
         TEXT_HEADERS = { "content-type" => "text/plain; charset=utf-8" }.freeze
 
+        EM_DASH = "—"
+
+        # Pinned wording (Story 2.4 Dev Notes → Detail page contract). The
+        # <strong> markup is intentional HTML, not agent-influenced text, so
+        # it is never passed through #esc.
+        STUCK_FLAG = " — <strong>stuck: respawn is failing</strong>"
+
+        STALENESS_NOTE = "<p class=\"staleness\">Liveness is observed on the supervisor's ~1 s supervision " \
+                          "tick, so a crash can take up to ~1 s to appear here. This latency counts inside " \
+                          "the ≤ 2 s freshness budget, not on top of it.</p>"
+
+        # Rack raises out of query parsing for a string that exceeds its
+        # depth/count limits, carries a bad encoding, or mixes a scalar and an
+        # array under one key (?id=1&id[]=2) — the id arrives on a path a
+        # client controls entirely (AC11), so every one of those is a 404, not
+        # a 500. Rack::BadRequest is the shared ancestor of the whole family;
+        # enumerating the leaf classes is what let ParameterTypeError through.
+        PARAM_ERRORS = [Rack::BadRequest].freeze
+
         def initialize(fleet:)
           @fleet = fleet
         end
@@ -42,6 +62,7 @@ module AgentDaemon
           # on this path for the same reason.
           when "/healthz" then probe(request)
           when "/"        then request.get? ? home(env[Auth::SESSION_ENV_KEY]) : not_found
+          when "/entity"  then request.get? ? entity_detail(request, env[Auth::SESSION_ENV_KEY]) : not_found
           else                 not_found
           end
         end
@@ -66,19 +87,50 @@ module AgentDaemon
         # access decision here would be exactly the auth code this app must not
         # contain.
         def home(session)
-          [200, HTML_HEADERS.dup, [page(session&.username.to_s, session&.csrf_token.to_s)]]
+          [200, HTML_HEADERS.dup, [layout(session, fleet_html)]]
+        end
+
+        # GET /entity?id=<entity id>. A query parameter, not a path segment —
+        # Rack::Request#GET decodes reliably where PATH_INFO decoding is
+        # server-dependent (Routing contract). Unknown/blank/missing id, or a
+        # malformed query string, all fall through to the same #not_found:
+        # fixed body, no echo of the attacker-controlled id (AC11).
+        def entity_detail(request, session)
+          id = entity_id_param(request)
+          return not_found unless id
+
+          entry = @fleet.find(id)
+          return not_found unless entry
+
+          [200, HTML_HEADERS.dup, [layout(session, entity_page(entry))]]
+        end
+
+        # #GET, not #params: the Routing contract is one exact path and one
+        # decoded query parameter, and #params would also merge a form-encoded
+        # request body — so a GET whose visible URL says one id could render
+        # another.
+        def entity_id_param(request)
+          id = request.GET["id"]
+          id.nil? || id.empty? ? nil : id
+        rescue *PARAM_ERRORS
+          nil
         end
 
         def not_found
           [404, TEXT_HEADERS.dup, ["not found"]]
         end
 
-        # AD-7: every interpolated value is escaped. The username comes from
-        # GitLab, entity/workflow names from operator-authored config — not
-        # agent-influenced today, but 2.4/2.5 put genuinely agent-influenced
-        # values (work-item keys) into this same table, so this page escapes
-        # by habit rather than by threat model.
-        def page(username, csrf_token)
+        # Shared chrome for every authenticated page (doctype, h1, signed-in-as
+        # line, CSRF logout form) — extracted so /entity carries the same chrome
+        # as / without a second copy of it. AD-7: every interpolated value is
+        # escaped. The username comes from GitLab, entity/workflow names from
+        # operator-authored config — not agent-influenced today, but 2.4/2.5 put
+        # genuinely agent-influenced values (work-item keys) into this same
+        # page, so it escapes by habit rather than by threat model.
+        def layout(session, content)
+          username = session&.username.to_s
+          csrf_token = session&.csrf_token.to_s
+
           <<~HTML
             <!DOCTYPE html>
             <html lang="en">
@@ -90,7 +142,7 @@ module AgentDaemon
             <input type="hidden" name="_csrf" value="#{esc(csrf_token)}">
             <button type="submit">Log out</button>
             </form>
-            #{fleet_html}
+            #{content}
             </body>
             </html>
           HTML
@@ -129,8 +181,18 @@ module AgentDaemon
 
         def entity_row(entry)
           <<~HTML
-            <tr><td>#{esc(entry.name)}</td><td>#{esc(entry.kind)}</td><td>#{liveness_cell(entry.liveness)}</td><td>#{esc(note_for(entry.status))}</td><td>#{restart_placeholder}</td></tr>
+            <tr><td>#{entity_link(entry)}</td><td>#{esc(entry.kind)}</td><td>#{liveness_cell(entry.liveness)}</td><td>#{esc(note_for(entry.status))}</td><td>#{restart_placeholder}</td></tr>
           HTML
+        end
+
+        # Href construction, both steps, in this order (Routing contract):
+        # Rack::Utils.escape is form encoding, the correct pair for
+        # Rack::Request#params; #esc then makes the result a safe attribute
+        # value. Skipping the first step breaks any id containing & or #;
+        # skipping the second is an XSS hole.
+        def entity_link(entry)
+          href = esc("/entity?id=#{Rack::Utils.escape(entry.id)}")
+          %(<a href="#{href}">#{esc(entry.name)}</a>)
         end
 
         def liveness_cell(liveness)
@@ -160,6 +222,64 @@ module AgentDaemon
         # 404 waiting to be mistaken for a bug.
         def restart_placeholder
           '<button type="button" disabled>Restart</button>'
+        end
+
+        # Detail page contract (Story 2.4 Dev Notes). Conditional rows are
+        # omitted entirely, never rendered empty — Restarting-for only when
+        # liveness is :restarting (AC4), Work item/Attempt only when a
+        # snapshot actually carries one (AC6/AC9: a crashed/exited/stopped
+        # snapshot has no work_item field at all, and neither does a
+        # messenger/reactor snapshot — the same absence check satisfies both).
+        def entity_page(entry)
+          <<~HTML
+            <p><a href="/">&larr; Fleet</a></p>
+            <h2>#{esc(entry.name)}</h2>
+            <table>
+            <tr><th>Workflow</th><td>#{esc(entry.workflow || EM_DASH)}</td></tr>
+            <tr><th>Kind</th><td>#{esc(entry.kind)}</td></tr>
+            <tr><th>Liveness</th><td>#{liveness_cell(entry.liveness)}</td></tr>
+            <tr><th>Activity</th><td>#{esc(entry.status || EM_DASH)}</td></tr>
+            <tr><th>Generation</th><td>#{esc(generation_cell(entry.generation))}</td></tr>
+            #{restarting_row(entry)}#{work_item_rows(entry)}<tr><th>State published</th><td>#{esc(entry.observed_at || "never")}</td></tr>
+            </table>
+            #{note_paragraph(entry.status)}<p>#{restart_placeholder}</p>
+            #{STALENESS_NOTE}
+          HTML
+        end
+
+        def generation_cell(generation)
+          return EM_DASH if generation.nil?
+
+          "#{generation} (#{generation - 1} restart(s))"
+        end
+
+        # AC4: the current generation and time-in-restarting, so the operator
+        # can distinguish a healthy respawn from a crash-loop where a respawn
+        # attempt has failed silently. Not escaped: seconds is our own integer
+        # and STUCK_FLAG is a static string carrying intentional <strong>
+        # markup, neither is agent-influenced.
+        def restarting_row(entry)
+          return "" unless entry.liveness == :restarting
+
+          text = "#{entry.seconds_since_published}s"
+          text += STUCK_FLAG if entry.stuck_restarting
+          "<tr><th>Restarting for</th><td>#{text}</td></tr>\n"
+        end
+
+        def work_item_rows(entry)
+          return "" unless entry.kind == :runner && entry.work_item
+
+          <<~HTML
+            <tr><th>Work item</th><td>#{esc(entry.work_item)}</td></tr>
+            <tr><th>Attempt</th><td>#{esc(entry.attempt)}</td></tr>
+          HTML
+        end
+
+        def note_paragraph(status)
+          note = note_for(status)
+          return "" if note.empty?
+
+          "<p>#{esc(note)}</p>\n"
         end
 
         def esc(value)

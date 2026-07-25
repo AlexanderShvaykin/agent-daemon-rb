@@ -125,7 +125,7 @@ module AgentDaemon
       # NoMethodError — several existing tests call start_console with no
       # build_factories first.
       def fleet
-        @fleet ||= Fleet.new(roster: @roster, state_registry: @state_registry)
+        @fleet ||= Fleet.new(roster: @roster, state_registry: @state_registry, restart_delay: RunnerSupervisor::RESTART_DELAY)
       end
 
       # AC7 / AD-3 / NFR4: the console is an observer, so a console fault is
