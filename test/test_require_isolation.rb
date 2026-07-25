@@ -29,10 +29,15 @@ class TestRequireIsolation < Minitest::Test
       require "agent_daemon"
       bad = []
       bad.concat($LOADED_FEATURES.grep(%r{/agent_daemon/supervisor/}))
-      # sqlite3/puma/rack/oauth2 are not gemspec deps yet (they land in Epics
-      # 2/5/6), so this check trivially holds today. Matching by feature PATH
-      # (not a rescue-able `require`) means it starts guarding the core->dep
-      # boundary the moment those gems are added later, with no test edit.
+      # rack/puma/oauth2 became gemspec runtime deps in Story 2.2 (the console),
+      # so this check now has real teeth: the gems ARE installed and ARE
+      # loadable, and only the require graph keeps them out of the core. That
+      # story also answered the question 1.8 deferred — "rack in the core graph:
+      # allow or deny?" — as DENY, for all three: they are supervisor-console
+      # deps, reachable solely from lib/agent_daemon/supervisor/console/.
+      # sqlite3 (Epic 5) is still ahead of us and holds trivially for now.
+      # Matching by feature PATH (not a rescue-able `require`) is what makes
+      # this a boundary check rather than an availability check.
       bad.concat($LOADED_FEATURES.grep(%r{/(sqlite3|puma|rack|oauth2)(/|\\.rb|\\.so|\\.bundle)}))
       bad << "AgentDaemon::Supervisor defined" if defined?(AgentDaemon::Supervisor)
       unless bad.empty?

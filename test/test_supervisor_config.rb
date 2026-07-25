@@ -464,4 +464,287 @@ class TestSupervisorConfig < Minitest::Test
       end
     end
   end
+
+  # --- console block (Story 2.2, AC6/AC8) ---------------------------------
+
+  # A minimal VALID console block. Callers mutate the returned hash (or drop
+  # keys from it) so every failure case starts from something that would
+  # otherwise load cleanly — a case that fails for two reasons proves nothing.
+  def valid_console
+    {
+      "base_url" => "https://console.example.com",
+      "auth" => {
+        "gitlab_host" => "https://gitlab.example.com",
+        "app_id" => "id",
+        "app_secret" => "secret",
+        "allowed_groups" => ["backoffice", "platform/sre"]
+      }
+    }
+  end
+
+  # Same shape as with_capacity: keep the helper's valid workflows list and
+  # splice a console block into the supervisor.yml. :omitted writes no key.
+  def with_console(value)
+    specs = [{ name: "a", file: "a", data: sandboxed_workflow_data }]
+    with_supervisor(specs) do |_dir, path|
+      data = YAML.safe_load(File.read(path))
+      data["console"] = value unless value == :omitted
+      File.write(path, data.to_yaml)
+      yield path
+    end
+  end
+
+  def console_error(value)
+    with_console(value) do |path|
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Supervisor::Config.new(path) }
+      return err.message
+    end
+  end
+
+  # AC8 — the whole point of the nil default: a pre-console supervisor config
+  # loads with zero new requirements.
+  def test_console_absent_loads_and_disables_the_console
+    with_console(:omitted) do |path|
+      assert_nil AgentDaemon::Supervisor::Config.new(path).console
+    end
+  end
+
+  def test_console_explicit_nil_disables_the_console
+    with_console(nil) do |path|
+      assert_nil AgentDaemon::Supervisor::Config.new(path).console
+    end
+  end
+
+  def test_console_applies_defaults_under_a_present_block
+    with_console(valid_console) do |path|
+      console = AgentDaemon::Supervisor::Config.new(path).console
+      assert_equal "127.0.0.1", console["bind"]
+      assert_equal 9292, console["port"]
+      assert_equal 16, console["max_threads"]
+      assert_equal 28_800, console["session_ttl"]
+      assert_equal true, console["secure_cookies"]
+      assert_equal "https://console.example.com", console["base_url"]
+      assert_equal %w[backoffice platform/sre], console.dig("auth", "allowed_groups")
+    end
+  end
+
+  def test_console_overrides_defaults
+    console = valid_console.merge("bind" => "0.0.0.0", "port" => 8080, "max_threads" => 4,
+                                  "session_ttl" => 60, "secure_cookies" => false)
+    with_console(console) do |path|
+      loaded = AgentDaemon::Supervisor::Config.new(path).console
+      assert_equal "0.0.0.0", loaded["bind"]
+      assert_equal 8080, loaded["port"]
+      assert_equal 4, loaded["max_threads"]
+      assert_equal 60, loaded["session_ttl"]
+      assert_equal false, loaded["secure_cookies"]
+    end
+  end
+
+  def test_console_must_be_a_mapping
+    assert_match(/console must be a mapping/, console_error("yes"))
+  end
+
+  def test_console_base_url_is_required
+    assert_match(/console\.base_url is required/, console_error(valid_console.tap { |c| c.delete("base_url") }))
+    assert_match(/console\.base_url is required/, console_error(valid_console.merge("base_url" => "")))
+    assert_match(/console\.base_url is required/, console_error(valid_console.merge("base_url" => 42)))
+  end
+
+  def test_console_auth_is_required
+    assert_match(/console\.auth is required/, console_error(valid_console.tap { |c| c.delete("auth") }))
+    assert_match(/console\.auth is required/, console_error(valid_console.merge("auth" => "nope")))
+  end
+
+  def test_console_auth_credentials_are_required
+    %w[gitlab_host app_id app_secret].each do |key|
+      console = valid_console
+      console["auth"].delete(key)
+      assert_match(/console\.auth\.#{key} is required \(String\)/, console_error(console))
+    end
+  end
+
+  # The secret must never be echoed back, not even as the "got" half of its own
+  # error message.
+  def test_console_app_secret_value_never_appears_in_the_error
+    console = valid_console
+    console["auth"]["app_secret"] = ""
+    console["auth"]["app_id"] = { "leaky" => "s3kr3t-value" }
+    message = console_error(console)
+    assert_match(/console\.auth\.app_secret is required \(String\)/, message)
+    refute_match(/s3kr3t-value/, message)
+  end
+
+  def test_console_gitlab_host_must_be_an_http_url
+    ["ftp://gitlab.example.com", "gitlab.example.com", "://"].each do |bad|
+      console = valid_console
+      console["auth"]["gitlab_host"] = bad
+      assert_match(/console\.auth\.gitlab_host must be an http\(s\) URL/, console_error(console))
+    end
+  end
+
+  def test_console_gitlab_host_accepts_plain_http
+    console = valid_console
+    console["auth"]["gitlab_host"] = "http://gitlab.internal"
+    with_console(console) do |path|
+      assert_equal "http://gitlab.internal", AgentDaemon::Supervisor::Config.new(path).console.dig("auth", "gitlab_host")
+    end
+  end
+
+  def test_console_allowed_groups_must_be_a_non_empty_list_of_strings
+    console = valid_console
+    console["auth"]["allowed_groups"] = "backoffice"
+    assert_match(/console\.auth\.allowed_groups must be a list/, console_error(console))
+
+    console = valid_console
+    console["auth"]["allowed_groups"] = []
+    assert_match(/console\.auth\.allowed_groups is empty/, console_error(console))
+
+    console = valid_console
+    console["auth"]["allowed_groups"] = ["ok", "", 7]
+    assert_match(/console\.auth\.allowed_groups entries must be non-empty strings/, console_error(console))
+  end
+
+  def test_console_numeric_keys_must_be_positive_integers
+    %w[max_threads session_ttl].each do |key|
+      [0, -1, "9292", 1.5, true].each do |bad|
+        message = console_error(valid_console.merge(key => bad))
+        assert_match(/console\.#{key} must be a positive integer/, message)
+      end
+    end
+  end
+
+  # A "positive integer" port still fails at bind time, which Master demotes to
+  # a logged warning and a console-less supervisor — so the range is what makes
+  # a typo an eager ConfigError.
+  def test_console_port_must_be_inside_the_tcp_port_range
+    [0, -1, 65_536, 70_000, "9292", 1.5, true].each do |bad|
+      assert_match(/console\.port must be a port number in 1\.\.65535/,
+                   console_error(valid_console.merge("port" => bad)))
+    end
+
+    with_console(valid_console.merge("port" => 65_535)) do |path|
+      assert_equal 65_535, AgentDaemon::Supervisor::Config.new(path).console["port"]
+    end
+  end
+
+  def test_console_secure_cookies_must_be_boolean
+    assert_match(/console\.secure_cookies must be true or false/,
+                 console_error(valid_console.merge("secure_cookies" => "true")))
+  end
+
+  # base_url feeds URI.join in Server, which raises on a relative value — and
+  # Master demotes that raise to a logged warning and a console-less
+  # supervisor. Validating it here keeps the eager-ConfigError contract.
+  def test_console_base_url_must_be_an_absolute_http_url
+    ["console.example.com", "/console", "ftp://c.example.com", "https://", "https:"].each do |bad|
+      assert_match(/console\.base_url must be an absolute http\(s\) URL/,
+                   console_error(valid_console.merge("base_url" => bad)),
+                   "#{bad.inspect} must be rejected")
+    end
+  end
+
+  # A scheme-only check passes "https://", whose host is empty — the client
+  # then fails at runtime with a generic wrapped error instead of at load.
+  def test_console_gitlab_host_must_carry_a_host_not_just_a_scheme
+    console = valid_console
+    console["auth"]["gitlab_host"] = "https://"
+
+    assert_match(/console\.auth\.gitlab_host must be an http\(s\) URL/, console_error(console))
+  end
+
+  # The two keys are coupled: over plain HTTP the browser silently discards a
+  # Secure cookie, so every request arrives cookieless and login loops forever
+  # with nothing in the log to explain it.
+  def test_console_secure_cookies_conflicts_with_a_plain_http_base_url
+    console = valid_console.merge("base_url" => "http://console.internal")
+
+    assert_match(/console\.secure_cookies is true but console\.base_url is plain http/,
+                 console_error(console))
+  end
+
+  def test_console_plain_http_base_url_is_fine_when_secure_cookies_is_off
+    console = valid_console.merge("base_url" => "http://console.internal", "secure_cookies" => false)
+
+    with_console(console) do |path|
+      assert_equal false, AgentDaemon::Supervisor::Config.new(path).console["secure_cookies"]
+    end
+  end
+
+  def test_console_roles_are_optional
+    with_console(valid_console) do |path|
+      assert_nil AgentDaemon::Supervisor::Config.new(path).console.dig("auth", "roles")
+    end
+  end
+
+  def test_console_roles_are_parsed_when_valid
+    console = valid_console
+    console["auth"]["roles"] = { "viewer" => ["backoffice"], "operator" => ["platform/sre"] }
+    with_console(console) do |path|
+      roles = AgentDaemon::Supervisor::Config.new(path).console.dig("auth", "roles")
+      assert_equal({ "viewer" => ["backoffice"], "operator" => ["platform/sre"] }, roles)
+    end
+  end
+
+  def test_console_roles_must_be_a_mapping
+    console = valid_console
+    console["auth"]["roles"] = %w[viewer]
+    assert_match(/console\.auth\.roles must be a mapping/, console_error(console))
+  end
+
+  def test_console_unknown_role_name_is_rejected
+    console = valid_console
+    console["auth"]["roles"] = { "admin" => ["backoffice"] }
+    message = console_error(console)
+    assert_match(/unknown role "admin"/, message)
+    assert_match(/expected one of: viewer, operator/, message)
+  end
+
+  def test_console_malformed_role_value_is_rejected
+    [["backoffice", ""], "backoffice", []].each do |bad|
+      console = valid_console
+      console["auth"]["roles"] = { "viewer" => bad }
+      assert_match(/console\.auth\.roles\.viewer must be a list of non-empty strings/, console_error(console))
+    end
+  end
+
+  # A role naming a group nobody can hold is a dead rule, and a dead rule is a
+  # config bug this repo fails fast on.
+  def test_console_role_referencing_a_group_outside_allowed_groups_is_rejected
+    console = valid_console
+    console["auth"]["roles"] = { "viewer" => ["backoffice", "ghost/group"] }
+    message = console_error(console)
+    assert_match(/console\.auth\.roles\.viewer references group "ghost\/group"/, message)
+    assert_match(/not in allowed_groups/, message)
+    refute_match(/"backoffice"/, message)
+  end
+
+  # Collect-all, same contract as every sibling validator.
+  def test_console_collects_every_problem_into_one_error
+    console = valid_console.merge("base_url" => "", "port" => 0)
+    console["auth"]["allowed_groups"] = []
+    console["auth"]["roles"] = { "admin" => ["x"] }
+    message = console_error(console)
+
+    assert_match(/console\.base_url is required/, message)
+    assert_match(/console\.port must be a port number/, message)
+    assert_match(/console\.auth\.allowed_groups is empty/, message)
+    assert_match(/unknown role "admin"/, message)
+  end
+
+  # A console problem must not mask a workflow problem (or vice versa): both
+  # validators contribute to the same collected error.
+  def test_console_problems_collect_alongside_workflow_problems
+    specs = [{ name: "a", file: "a", data: sandboxed_workflow_data }]
+    with_supervisor(specs) do |_dir, path|
+      data = YAML.safe_load(File.read(path))
+      data["console"] = valid_console.merge("port" => 0)
+      data["event_bus_capacity"] = -5
+      File.write(path, data.to_yaml)
+
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Supervisor::Config.new(path) }
+      assert_match(/event_bus_capacity must be a positive integer/, err.message)
+      assert_match(/console\.port must be a port number/, err.message)
+    end
+  end
 end

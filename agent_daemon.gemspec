@@ -31,5 +31,15 @@ Gem::Specification.new do |spec|
   spec.add_dependency "eventmachine"
   spec.add_dependency "faye-websocket"
 
+  # Supervisor console only (AD-5/AD-6): reachable exclusively from
+  # lib/agent_daemon/supervisor/console/, never from `require "agent_daemon"`.
+  # test/test_require_isolation.rb enforces that boundary.
+  spec.add_dependency "oauth2", "~> 2.0"
+  # Upper-bounded because the console embeds Puma through its internal API
+  # (Puma::Server.new's positional args, add_tcp_listener, #run, puma/log_writer),
+  # not through a documented embedding contract. A new major may move any of it.
+  spec.add_dependency "puma", ">= 6", "< 9"
+  spec.add_dependency "rack", "~> 3"
+
   spec.add_development_dependency "minitest"
 end

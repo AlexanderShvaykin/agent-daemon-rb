@@ -5,8 +5,7 @@
 # referenced config and keys every runner by a composite (workflow, runner)
 # identity.
 #
-# NOTE: there is no runnable supervisor entrypoint yet — `bin/agent-supervisor`
-# arrives in a later story. This file documents the config shape only.
+# Run it with: bin/agent-supervisor supervisor.yml
 #
 # Like a per-workflow config, this file is rendered as an ERB template before
 # YAML parsing, so `<%%= secret('KEY') %>` / `<%%= ENV['KEY'] %>` work here too.
@@ -22,3 +21,55 @@ workflows:
     config: workflows/task-analyst.yml     # path to a per-workflow config, relative to this file
   - name: reviewer
     config: workflows/reviewer.yml
+
+# Optional web console. OMIT THIS WHOLE BLOCK and no server is started and
+# nothing below is validated — a supervisor config without it behaves exactly
+# as it did before the console existed.
+#
+# Uncomment and fill in to enable it. Every key under `auth` is required; there
+# are deliberately no defaults for credentials. The block is validated eagerly
+# at load, and every problem is reported at once.
+#
+# console:
+#   bind: 127.0.0.1        # default 127.0.0.1 — loopback. Put a TLS terminator
+#                          # in front rather than binding this to 0.0.0.0.
+#   port: 9292             # default 9292
+#   max_threads: 16        # default 16 — must stay ABOVE the peak number of
+#                          # concurrent live views; each one parks a thread.
+#   session_ttl: 28800     # default 28800 (8 hours), in seconds
+#   secure_cookies: true   # default true; set false ONLY for plain-HTTP local dev
+#   base_url: https://console.example.com   # REQUIRED — the public origin of this
+#                          # console. The GitLab redirect_uri is built from it
+#                          # (<base_url>/auth/callback) and must match the one
+#                          # registered in the GitLab application exactly.
+#   auth:
+#     gitlab_host: https://gitlab.example.com   # REQUIRED — gitlab.com or self-hosted
+#     app_id: <%%= secret('GITLAB_APP_ID') %>     # REQUIRED — GitLab application id
+#     app_secret: <%%= secret('GITLAB_APP_SECRET') %>   # REQUIRED — application secret
+#
+#     # REQUIRED, non-empty. A user may sign in iff one of these EXACTLY equals
+#     # one of their GitLab group full_paths (case-sensitive). GitLab already
+#     # expands inherited membership, so listing a parent group admits its
+#     # members; a user who only belongs to `backoffice/interns` is NOT admitted
+#     # by `backoffice` — list the subgroup explicitly if you want it.
+#     allowed_groups:
+#       - backoffice
+#       - platform/sre
+#
+#     # OPTIONAL. Parsed and validated (known role names only, and every group
+#     # must appear in allowed_groups), but NOT enforced in v1: every allowed
+#     # user may view everything. Known roles: viewer, operator.
+#     roles:
+#       viewer:
+#         - backoffice
+#       operator:
+#         - platform/sre
+#
+# The GitLab application needs the `read_api` scope (read_user cannot see group
+# membership) and its redirect URI set to <base_url>/auth/callback.
+#
+# /healthz is the only unauthenticated route that serves content — a bare
+# liveness probe for systemd, answering GET and HEAD. The login legs
+# (/auth/login, /auth/callback) are necessarily reachable without a session
+# too, but they are answered by the auth middleware and never reach the app.
+# Everything else requires a GitLab login.

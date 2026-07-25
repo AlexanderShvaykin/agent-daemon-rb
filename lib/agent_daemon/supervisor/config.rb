@@ -3,6 +3,7 @@
 require "yaml"
 require "erb"
 require "json"
+require "uri"
 
 require_relative "../config"
 require_relative "runner_identity"
@@ -30,10 +31,40 @@ module AgentDaemon
         # because events_dropped_total (AD-4) is a scrapeable Epic 6 metric —
         # an operator watching it climb needs a remedy other than editing a
         # constant and redeploying the fleet.
-        "event_bus_capacity" => EventBus::DEFAULT_CAPACITY
+        "event_bus_capacity" => EventBus::DEFAULT_CAPACITY,
+        # Optional web console (AD-6). nil ⇒ disabled and never validated, so a
+        # supervisor config written before the console existed keeps loading
+        # unchanged (Story 2.2 AC8).
+        "console" => nil
       }.freeze
 
-      attr_reader :config_path, :config_dir, :workflows, :event_bus_capacity
+      # Server-side console defaults, merged UNDER a present `console:` block.
+      # The auth sub-keys have no defaults on purpose — every one of them is
+      # required, and a defaulted credential would be a fail-open path.
+      CONSOLE_DEFAULTS = {
+        # Loopback by default: the console is expected to sit behind a TLS
+        # terminator, and a config that forgets `bind` must not become
+        # world-reachable.
+        "bind" => "127.0.0.1",
+        "port" => 9292,
+        # Must exceed the peak number of concurrent SSE streams (AD-6): each
+        # live stream parks one Puma thread for its whole lifetime.
+        "max_threads" => 16,
+        "session_ttl" => 28_800, # 8 hours (FR16)
+        "secure_cookies" => true
+      }.freeze
+
+      # The whole role vocabulary (FR15). Roles are parsed and validated here
+      # but are NOT action-gating in v1 — every allowed authenticated user may
+      # view and (from Epic 4) restart.
+      KNOWN_ROLES = %w[viewer operator].freeze
+
+      # A "positive integer" port still fails at bind time; the range is what
+      # actually makes a typo a load-time error rather than a silently
+      # console-less supervisor.
+      PORT_RANGE = (1..65_535).freeze
+
+      attr_reader :config_path, :config_dir, :workflows, :event_bus_capacity, :console
 
       def initialize(path)
         @config_path = File.expand_path(path)
@@ -42,6 +73,7 @@ module AgentDaemon
         @data = deep_merge(DEFAULTS, raw)
         @workflows = build_workflows(@data["workflows"])
         @event_bus_capacity = @data["event_bus_capacity"]
+        @console = build_console(@data["console"])
         validate!
       end
 
@@ -138,6 +170,16 @@ module AgentDaemon
         }
       end
 
+      # A present `console:` block gets CONSOLE_DEFAULTS merged underneath it;
+      # an absent one stays nil (console disabled). A present-but-not-a-mapping
+      # value is passed through untouched so validate_console can report it.
+      def build_console(raw)
+        return nil if raw.nil?
+        return raw unless raw.is_a?(Hash)
+
+        deep_merge(CONSOLE_DEFAULTS, raw)
+      end
+
       def validate!
         errors = []
 
@@ -157,6 +199,8 @@ module AgentDaemon
         unless @event_bus_capacity.is_a?(Integer) && @event_bus_capacity.positive?
           errors << "event_bus_capacity must be a positive integer (got #{@event_bus_capacity.inspect}) in #{@config_path}"
         end
+
+        errors.concat(validate_console)
 
         raise AgentDaemon::ConfigError, errors.join("\n") unless errors.empty?
       end
@@ -243,6 +287,160 @@ module AgentDaemon
         end
 
         dirs
+      end
+
+      # AC6 — the console block. Collects every problem like its siblings and
+      # never raises early. Returns [] when the console is disabled: an absent
+      # block must impose zero new requirements on an existing config (AC8).
+      def validate_console
+        return [] if @console.nil?
+        return ["console must be a mapping in #{@config_path}"] unless @console.is_a?(Hash)
+
+        validate_console_server + validate_console_auth(@console["auth"])
+      end
+
+      def validate_console_server
+        base_url = @console["base_url"]
+        errors = validate_base_url(base_url)
+
+        errors << "console.bind is required (String) in #{@config_path}" unless non_empty_string?(@console["bind"])
+
+        %w[max_threads session_ttl].each do |key|
+          value = @console[key]
+          next if positive_integer?(value)
+
+          errors << "console.#{key} must be a positive integer (got #{value.inspect}) in #{@config_path}"
+        end
+
+        port = @console["port"]
+        unless positive_integer?(port) && PORT_RANGE.cover?(port)
+          errors << "console.port must be a port number in #{PORT_RANGE} (got #{port.inspect}) in #{@config_path}"
+        end
+
+        errors.concat(validate_secure_cookies(base_url))
+      end
+
+      # base_url is not merely a string: Server builds the OAuth redirect_uri
+      # with URI.join, which raises on a relative value. Validating it here
+      # turns a missing "https://" from a console that silently never starts
+      # (Master#start_console logs and carries on, by AC7 design) into the
+      # eager ConfigError this file promises everywhere else.
+      def validate_base_url(base_url)
+        return ["console.base_url is required (String) in #{@config_path}"] unless non_empty_string?(base_url)
+        return [] if http_url?(base_url)
+
+        ["console.base_url must be an absolute http(s) URL (got #{base_url.inspect}) in #{@config_path}"]
+      end
+
+      # The two keys are coupled, and the failure mode of getting them wrong is
+      # invisible: over plain HTTP a browser silently discards a Secure cookie,
+      # so every request arrives cookieless — indistinguishable server-side from
+      # a first visit — and login loops forever with nothing in the log.
+      def validate_secure_cookies(base_url)
+        secure = @console["secure_cookies"]
+        unless [true, false].include?(secure)
+          return ["console.secure_cookies must be true or false (got #{secure.inspect}) in #{@config_path}"]
+        end
+
+        return [] unless secure && url_scheme(base_url) == "http"
+
+        ["console.secure_cookies is true but console.base_url is plain http, so no session cookie can " \
+         "ever be stored and login cannot complete — use https, or set secure_cookies: false " \
+         "in #{@config_path}"]
+      end
+
+      # Credentials are reported by NAME only — an error message quoting a bad
+      # app_secret would leak it into logs and operator terminals, which the
+      # secrets rule forbids just as strictly as a log line would.
+      def validate_console_auth(auth)
+        return ["console.auth is required (mapping) in #{@config_path}"] unless auth.is_a?(Hash)
+
+        errors = []
+
+        %w[gitlab_host app_id app_secret].each do |key|
+          errors << "console.auth.#{key} is required (String) in #{@config_path}" unless non_empty_string?(auth[key])
+        end
+
+        host = auth["gitlab_host"]
+        if non_empty_string?(host) && !http_url?(host)
+          errors << "console.auth.gitlab_host must be an http(s) URL (got #{host.inspect}) in #{@config_path}"
+        end
+
+        groups = auth["allowed_groups"]
+        errors.concat(validate_allowed_groups(groups))
+        errors.concat(validate_roles(auth["roles"], groups))
+
+        errors
+      end
+
+      def validate_allowed_groups(groups)
+        return ["console.auth.allowed_groups must be a list in #{@config_path}"] unless groups.is_a?(Array)
+        return ["console.auth.allowed_groups is empty in #{@config_path}"] if groups.empty?
+
+        bad = groups.reject { |g| non_empty_string?(g) }
+        return [] if bad.empty?
+
+        ["console.auth.allowed_groups entries must be non-empty strings (got #{bad.map(&:inspect).join(', ')}) in #{@config_path}"]
+      end
+
+      # `roles` is optional (FR15). When present it must name only known roles
+      # and only groups the config actually allows: a role listing a group that
+      # is not in allowed_groups can never match anyone, and a silently dead
+      # role is precisely the kind of config bug this repo fails fast on.
+      def validate_roles(roles, groups)
+        return [] if roles.nil?
+        return ["console.auth.roles must be a mapping in #{@config_path}"] unless roles.is_a?(Hash)
+
+        # Only cross-check against a well-formed allowed_groups; otherwise the
+        # dead-group errors below would just restate the allowed_groups error.
+        known_groups = groups.is_a?(Array) && groups.all? { |g| non_empty_string?(g) } ? groups : nil
+
+        roles.flat_map do |name, value|
+          validate_role(name, value, known_groups)
+        end
+      end
+
+      def validate_role(name, value, known_groups)
+        unless KNOWN_ROLES.include?(name)
+          return ["unknown role #{name.inspect} (expected one of: #{KNOWN_ROLES.join(', ')}) in #{@config_path}"]
+        end
+
+        unless value.is_a?(Array) && !value.empty? && value.all? { |g| non_empty_string?(g) }
+          return ["console.auth.roles.#{name} must be a list of non-empty strings (got #{value.inspect}) in #{@config_path}"]
+        end
+
+        return [] if known_groups.nil?
+
+        (value - known_groups).map do |dead|
+          "console.auth.roles.#{name} references group #{dead.inspect} which is not in allowed_groups in #{@config_path}"
+        end
+      end
+
+      def non_empty_string?(value)
+        value.is_a?(String) && !value.empty?
+      end
+
+      # Rejects `true`, which is an Integer only to Ruby's duck-typing eye.
+      def positive_integer?(value)
+        value.is_a?(Integer) && value.positive?
+      end
+
+      # A host is as required as the scheme: URI.parse("https://") reports
+      # scheme "https" with an empty host, which passes a scheme-only check and
+      # then produces an unusable client at runtime.
+      def http_url?(value)
+        uri = URI.parse(value)
+        %w[http https].include?(uri.scheme) && !uri.host.to_s.empty?
+      rescue URI::InvalidURIError
+        false
+      end
+
+      def url_scheme(value)
+        return nil unless non_empty_string?(value)
+
+        URI.parse(value).scheme
+      rescue URI::InvalidURIError
+        nil
       end
 
       def deep_merge(base, override)

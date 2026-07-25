@@ -5,6 +5,7 @@ require_relative "config"
 require_relative "runner_supervisor"
 require_relative "state_registry"
 require_relative "event_bus"
+require_relative "console/server"
 
 module AgentDaemon
   module Supervisor
@@ -29,16 +30,24 @@ module AgentDaemon
       # RESTART_DELAY / restart_delay:.
       JOIN_TIMEOUT = 30
 
+      # Builds the console server from the config's `console` block. Injectable
+      # for the same reason join_timeout is: a test must be able to make the
+      # console fail on purpose and watch the fleet carry on regardless.
+      CONSOLE_FACTORY = ->(console_config) { Console::Server.new(console_config) }
+
       attr_reader :state_registry, :event_bus
 
-      def initialize(supervisor_config, join_timeout: JOIN_TIMEOUT)
+      def initialize(supervisor_config, join_timeout: JOIN_TIMEOUT, console_factory: CONSOLE_FACTORY)
         @config = supervisor_config
         @join_timeout = join_timeout
+        @console_factory = console_factory
         @shutdown_flag = AgentDaemon::ShutdownFlag.new
         @entity_factories = {}
         @entity_ids = {}
         @log_levels = {}
         @supervisors = {}
+        @console = nil
+        @console_dead = false
         @state_registry = StateRegistry.new
         @event_bus = EventBus.new(capacity: supervisor_config.event_bus_capacity)
       end
@@ -49,10 +58,14 @@ module AgentDaemon
         build_factories
         build_supervisors
         start_supervisors
+        start_console
         begin
           supervise_until_shutdown
           wait_for_threads
         ensure
+          # Take the inbound surface down FIRST: the console reads master-owned
+          # state, so no request thread should observe a half-finalized fleet.
+          stop_console
           # The sweep is the last-resort orphan guard, so it must also run when
           # supervision or the drain raised — that is exactly when an agent is
           # most likely to be left behind.
@@ -105,6 +118,47 @@ module AgentDaemon
         @supervisors.each_value(&:spawn!)
       end
 
+      # AC7 / AD-3 / NFR4: the console is an observer, so a console fault is
+      # never a fleet fault. A bind collision or an OAuth misconfiguration is
+      # logged and the supervision loop runs on without a console.
+      def start_console
+        return if @config.console.nil?
+
+        console = @console_factory.call(@config.console)
+        console.start
+        @console = console
+        Log.info("[Console] listening on #{@config.console['bind']}:#{console.port}")
+      rescue => e
+        # @console stays nil, so stop_console has nothing to take down. The
+        # class is part of the message because every start-time failure mode
+        # (EADDRINUSE, a bad base_url, an OAuth misconfiguration) arrives here
+        # as one log line and nothing else.
+        Log.error("[Console] failed to start, continuing without it: #{e.class}: #{e.message}")
+      end
+
+      # The console is not a supervised entity (AD-13 enumerates exactly three
+      # kinds and this is none of them), so nothing restarts it. That is not a
+      # reason to let it die unnoticed: without this, a dead Puma thread is
+      # invisible until an operator's browser hangs.
+      def check_console
+        return unless @console && !@console_dead
+        return if @console.running?
+
+        @console_dead = true
+        Log.error("[Console] server thread is no longer running; the console is down until the supervisor restarts")
+      end
+
+      # Rescued for the same reason the sweep sits in an ensure (Story 1.6): a
+      # console that will not stop must not cost the fleet its orphan sweep.
+      def stop_console
+        return unless @console
+
+        @console.stop
+        Log.info("[Console] stopped")
+      rescue => e
+        Log.error("[Console] failed to stop: #{e.class}: #{e.message}")
+      end
+
       # The only driver of every entity's state machine: non-blocking, ~1/s.
       # Replaces the old sleep(1) until flag idle wait — a crashed entity's
       # restart delay is now a recorded deadline inside its own supervisor,
@@ -112,6 +166,7 @@ module AgentDaemon
       def supervise_until_shutdown
         until @shutdown_flag.value
           @supervisors.each_value(&:tick)
+          check_console
           sleep(1)
         end
       end

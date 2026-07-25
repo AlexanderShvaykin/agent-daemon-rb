@@ -27,7 +27,9 @@ class TestSupervisorMaster < Minitest::Test
   # of { name:, runners: [...], messenger: {...} | nil } — each becomes its
   # own referenced per-workflow config with a distinct project_path/message_dir
   # so 1.1's collision validation never rejects the fixture itself.
-  def with_config(specs)
+  # `console:` splices a Story 2.2 console block into the supervisor config;
+  # omitting it (every pre-2.2 caller) leaves the config exactly as before.
+  def with_config(specs, console: nil)
     Dir.mktmpdir do |dir|
       wf_dir = File.join(dir, "workflows")
       FileUtils.mkdir_p(File.join(wf_dir, "prompts"))
@@ -47,7 +49,9 @@ class TestSupervisorMaster < Minitest::Test
 
       entries = specs.map { |s| { "name" => s[:name], "config" => "workflows/#{s[:name]}.yml" } }
       path = File.join(dir, "supervisor.yml")
-      File.write(path, { "workflows" => entries }.to_yaml)
+      supervisor_data = { "workflows" => entries }
+      supervisor_data["console"] = console if console
+      File.write(path, supervisor_data.to_yaml)
 
       yield dir, AgentDaemon::Supervisor::Config.new(path)
     end
@@ -418,5 +422,235 @@ class TestSupervisorMaster < Minitest::Test
 
       assert_raises(AgentDaemon::ConfigError) { master.send(:resolve_log_level, nil) }
     end
+  end
+
+  # --- Console wiring (Story 2.2, AC7/AC8) ---------------------------------
+
+  CONSOLE_BLOCK = {
+    "base_url" => "https://console.example.com",
+    "auth" => {
+      "gitlab_host" => "https://gitlab.example.com",
+      "app_id" => "app-id",
+      "app_secret" => "app-secret",
+      "allowed_groups" => ["backoffice"]
+    }
+  }.freeze
+
+  # Records the lifecycle instead of binding a socket — Puma itself is covered
+  # end to end in test_console_server.rb.
+  class ConsoleSpy
+    attr_reader :config, :events
+    attr_accessor :alive
+
+    def initialize(config, port: 9292, fail_on: nil)
+      @config = config
+      @port = port
+      @fail_on = fail_on
+      @alive = true
+      @events = []
+    end
+
+    def port = @port
+
+    def running? = @alive
+
+    def start
+      @events << :start
+      raise "console boom" if @fail_on == :start
+
+      self
+    end
+
+    def stop
+      @events << :stop
+      raise "stop boom" if @fail_on == :stop
+    end
+  end
+
+  def spy_factory(spies, **kwargs)
+    ->(console_config) { spies << ConsoleSpy.new(console_config, **kwargs); spies.last }
+  end
+
+  # Swaps the null logger this file installs for a StringIO one just for the
+  # block, and returns the ERROR lines emitted inside it. Restores the null
+  # logger afterwards so nothing leaks into the rest of the file.
+  def capture_log_errors
+    io = StringIO.new
+    logger = ::Logger.new(io)
+    logger.level = ::Logger::ERROR
+    prior = AgentDaemon::Log.instance_variable_get(:@logger)
+    AgentDaemon::Log.use(logger)
+    yield
+    io.string.lines.map(&:chomp).reject(&:empty?)
+  ensure
+    AgentDaemon::Log.instance_variable_set(:@logger, prior)
+  end
+
+  def test_console_is_started_with_the_configured_block
+    spies = []
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: spy_factory(spies))
+      master.send(:start_console)
+
+      assert_equal 1, spies.size
+      assert_equal [:start], spies.first.events
+      # The factory receives the DEFAULTS-merged block, not the raw YAML.
+      assert_equal "127.0.0.1", spies.first.config["bind"]
+      assert_equal 28_800, spies.first.config["session_ttl"]
+      assert_equal "https://console.example.com", spies.first.config["base_url"]
+    end
+  end
+
+  # The console is not a supervised entity (AD-13), so nothing restarts it —
+  # but a dead Puma thread must not be invisible either. The tick observes it
+  # and says so exactly once, rather than once per second forever.
+  def test_a_dead_console_is_reported_once_by_the_supervision_tick
+    spies = []
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: spy_factory(spies))
+      master.send(:start_console)
+
+      assert_empty capture_log_errors { master.send(:check_console) },
+                   "a healthy console must say nothing"
+
+      spies.first.alive = false
+      errors = capture_log_errors do
+        master.send(:check_console)
+        master.send(:check_console)
+      end
+
+      assert_equal 1, errors.size, "the death must be reported once, not once per tick"
+      assert_match(/no longer running/, errors.first)
+    end
+  end
+
+  def test_console_never_checked_when_no_console_is_configured
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:start_console)
+
+      errors = capture_log_errors { master.send(:check_console) }
+
+      assert_empty errors
+    end
+  end
+
+  def test_console_is_stopped_on_shutdown
+    spies = []
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: spy_factory(spies))
+      master.send(:start_console)
+      master.send(:stop_console)
+
+      assert_equal %i[start stop], spies.first.events
+    end
+  end
+
+  # AC8 — a config with no console block must construct nothing at all.
+  def test_no_console_block_never_constructs_a_server
+    spies = []
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
+      assert_nil config.console
+
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: spy_factory(spies))
+      master.send(:start_console)
+      master.send(:stop_console)
+
+      assert_empty spies, "no console block must mean no console object"
+      assert_nil master.instance_variable_get(:@console)
+    end
+  end
+
+  # AC7 / AD-3 / NFR4 — the console is an observer: its failure degrades the
+  # console, never the fleet.
+  def test_a_console_that_fails_to_start_does_not_stop_the_fleet
+    spies = []
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: spy_factory(spies, fail_on: :start))
+      master.send(:build_factories)
+      master.send(:build_supervisors)
+      master.send(:start_console)
+      master.send(:start_supervisors)
+
+      supervisors = master.instance_variable_get(:@supervisors)
+      refute_empty supervisors
+      supervisors.each_value { |supervisor| refute_nil supervisor.thread }
+
+      # Nothing was retained, so shutdown has nothing to take down either.
+      assert_nil master.instance_variable_get(:@console)
+      master.send(:stop_console)
+      assert_equal [:start], spies.first.events
+    ensure
+      # `master` is nil if with_config or Master.new raised; without the guard
+      # this ensure would mask the real failure with a NoMethodError.
+      if master
+        master.instance_variable_get(:@shutdown_flag).set!
+        master.send(:wait_for_threads)
+      end
+    end
+  end
+
+  # A factory that blows up before returning an object is the misconfiguration
+  # case (bad base_url, unusable auth block) — same rule applies.
+  def test_a_console_factory_that_raises_does_not_stop_the_fleet
+    exploding = ->(_console_config) { raise "factory boom" }
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: exploding)
+      master.send(:build_factories)
+      master.send(:build_supervisors)
+      master.send(:start_console)
+      master.send(:start_supervisors)
+
+      assert_nil master.instance_variable_get(:@console)
+      refute_empty master.instance_variable_get(:@supervisors)
+    ensure
+      # `master` is nil if with_config or Master.new raised; without the guard
+      # this ensure would mask the real failure with a NoMethodError.
+      if master
+        master.instance_variable_get(:@shutdown_flag).set!
+        master.send(:wait_for_threads)
+      end
+    end
+  end
+
+  # Story 1.6's reasoning applied to the console: a console that will not stop
+  # must not cost the fleet its final tick and orphan sweep.
+  def test_a_console_that_fails_to_stop_does_not_raise
+    spies = []
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: spy_factory(spies, fail_on: :stop))
+      master.send(:start_console)
+
+      master.send(:stop_console) # must not raise
+
+      assert_equal %i[start stop], spies.first.events
+    end
+  end
+
+  # The console must come down BEFORE the final tick and the orphan sweep, so
+  # no request thread can observe a half-finalized fleet.
+  def test_start_stops_the_console_before_finalizing_supervisors
+    # Master#start installs its own INT/TERM handlers; save and restore the
+    # real ones (test_supervisor_shutdown.rb's precedent).
+    original_term = Signal.trap("TERM", "DEFAULT")
+    original_int = Signal.trap("INT", "DEFAULT")
+
+    order = []
+    spies = []
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, console_factory: spy_factory(spies))
+      master.define_singleton_method(:stop_console) { order << :stop_console; super() }
+      master.define_singleton_method(:finalize_supervisors) { order << :finalize; super() }
+      master.define_singleton_method(:sweep_orphaned_agents) { order << :sweep; super() }
+      master.instance_variable_get(:@shutdown_flag).set!
+
+      master.start
+
+      assert_equal %i[stop_console finalize sweep], order
+      assert_equal %i[start stop], spies.first.events
+    end
+  ensure
+    Signal.trap("TERM", original_term)
+    Signal.trap("INT", original_int)
   end
 end
