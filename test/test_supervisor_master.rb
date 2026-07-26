@@ -468,7 +468,7 @@ class TestSupervisorMaster < Minitest::Test
   end
 
   def spy_factory(spies, **kwargs)
-    ->(console_config, _fleet) { spies << ConsoleSpy.new(console_config, **kwargs); spies.last }
+    ->(console_config, _fleet, _activity_log) { spies << ConsoleSpy.new(console_config, **kwargs); spies.last }
   end
 
   # Swaps the null logger this file installs for a StringIO one just for the
@@ -593,7 +593,7 @@ class TestSupervisorMaster < Minitest::Test
   # A factory that blows up before returning an object is the misconfiguration
   # case (bad base_url, unusable auth block) — same rule applies.
   def test_a_console_factory_that_raises_does_not_stop_the_fleet
-    exploding = ->(_console_config, _fleet) { raise "factory boom" }
+    exploding = ->(_console_config, _fleet, _activity_log) { raise "factory boom" }
     with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config, console_factory: exploding)
       master.send(:build_factories)
@@ -658,7 +658,7 @@ class TestSupervisorMaster < Minitest::Test
 
   def test_console_factory_receives_a_fleet_whose_roster_covers_runners_messenger_and_reactor_in_order
     received_fleet = nil
-    factory = lambda do |console_config, fleet|
+    factory = lambda do |console_config, fleet, _activity_log|
       received_fleet = fleet
       ConsoleSpy.new(console_config)
     end
@@ -678,6 +678,30 @@ class TestSupervisorMaster < Minitest::Test
       entries = received_fleet.entries
       assert_equal %i[runner runner messenger reactor], entries.map(&:kind)
       assert_equal %w[a m messenger mattermost_reactor], entries.map(&:name)
+    end
+  end
+
+  # Story 2.5: a Master that wires the wrong bus (or none) into the console
+  # factory would ship a permanently empty activity timeline with a green
+  # suite — the same failure mode 2.4 wrote its restart_delay: wiring test to
+  # catch. Prove it by publishing onto the Master's own event_bus and reading
+  # it back through the activity_log the factory received.
+  def test_console_factory_receives_an_activity_log_reading_the_masters_own_event_bus
+    received_activity_log = nil
+    factory = lambda do |console_config, _fleet, activity_log|
+      received_activity_log = activity_log
+      ConsoleSpy.new(console_config)
+    end
+
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: factory)
+      master.send(:build_factories)
+      master.send(:start_console)
+
+      identity = master.instance_variable_get(:@entity_ids).fetch(:"runner:wf:a")
+      master.event_bus.publish(identity, { type: :picked_up, work_item: "T-1", generation: 1 })
+
+      assert_equal 1, received_activity_log.recent("runner:wf:a").size
     end
   end
 

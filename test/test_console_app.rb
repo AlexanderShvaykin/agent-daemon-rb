@@ -10,6 +10,9 @@ require "agent_daemon/supervisor/console/session_store"
 require "agent_daemon/supervisor/fleet"
 require "agent_daemon/supervisor/state_registry"
 require "agent_daemon/supervisor/runner_identity"
+require "agent_daemon/supervisor/activity_log"
+require "agent_daemon/supervisor/event_bus"
+require "agent_daemon/supervisor/runner_supervisor"
 
 # Story 2.2 AC1/AC2 — the minimal authenticated surface. Story 2.3 adds the
 # fleet list itself.
@@ -23,6 +26,9 @@ class TestConsoleApp < Minitest::Test
   Fleet = AgentDaemon::Supervisor::Fleet
   StateRegistry = AgentDaemon::Supervisor::StateRegistry
   RunnerIdentity = AgentDaemon::Supervisor::RunnerIdentity
+  ActivityLog = AgentDaemon::Supervisor::ActivityLog
+  EventBus = AgentDaemon::Supervisor::EventBus
+  GenerationStamp = AgentDaemon::Supervisor::GenerationStamp
 
   def setup
     @registry = StateRegistry.new
@@ -31,8 +37,8 @@ class TestConsoleApp < Minitest::Test
     @sessions = SessionStore.new(ttl: 3_600)
   end
 
-  def build_app(fleet)
-    Rack::MockRequest.new(Rack::Lint.new(App.new(fleet: fleet)))
+  def build_app(fleet, activity_log: ActivityLog.new(event_bus: EventBus.new))
+    Rack::MockRequest.new(Rack::Lint.new(App.new(fleet: fleet, activity_log: activity_log)))
   end
 
   # A real, freshly promoted session — the same object the middleware puts in
@@ -619,5 +625,291 @@ class TestConsoleApp < Minitest::Test
     detail_body = get_on(app, href).body
 
     assert_includes detail_body, "<h2>alpha</h2>"
+  end
+
+  # --- Story 2.5: the activity log section ----------------------------------
+
+  # Scoped to the activity section, not the whole body: body[/…/m] is nil on
+  # no-match, so a layout regression surfaces as a readable failure here
+  # rather than as a NoMethodError further down.
+  def activity_section(body)
+    found = body[%r{<h3>Recent activity \(up to \d+ events\)</h3>.*?<p class="activity-note">[^<]*</p>}m]
+    refute_nil found, "no activity section found in the page"
+    found
+  end
+
+  def build_activity_app(roster:, state_registry: StateRegistry.new, event_bus: EventBus.new)
+    fleet = Fleet.new(roster: roster, state_registry: state_registry)
+    build_app(fleet, activity_log: ActivityLog.new(event_bus: event_bus))
+  end
+
+  # The section's two remaining pinned strings, asserted literally rather than
+  # against the constants that render them: the note is only ever located by
+  # activity_section's `[^<]*` regex, which passes for any wording, and the
+  # header row is only ever asserted in the negative by the empty-state test.
+  # Column set and order are part of the contract.
+  def test_the_pinned_note_and_table_header_render_verbatim
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    bus = EventBus.new
+    bus.publish(id, { type: :picked_up, work_item: "TASK-1", generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section,
+                    "<tr><th>When</th><th>Gen</th><th>Event</th><th>Work item</th>" \
+                    "<th>Attempt</th><th>Detail</th></tr>"
+    assert_includes section,
+                    "<p class=\"activity-note\">Recent activity only — the event buffer is bounded " \
+                    "and does not survive a supervisor restart.</p>"
+  end
+
+  # The heading advertises the limit the injected log actually applies, not
+  # ActivityLog::DEFAULT_LIMIT — otherwise a non-default limit renders a
+  # truncated timeline under a promise of 50, the false negative the
+  # bounded-buffer note exists to prevent.
+  def test_the_heading_reports_the_injected_logs_own_limit
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    bus = EventBus.new
+    3.times { |i| bus.publish(id, { type: :picked_up, work_item: "item-#{i}", generation: 1 }) }
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    fleet = Fleet.new(roster: roster, state_registry: StateRegistry.new)
+    app = build_app(fleet, activity_log: ActivityLog.new(event_bus: bus, limit: 2))
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, "<h3>Recent activity (up to 2 events)</h3>"
+    refute_includes section, "up to #{ActivityLog::DEFAULT_LIMIT} events"
+    assert_equal 2, section.scan("<tr><td>").size
+  end
+
+  def test_a_full_work_item_cycle_renders_three_activity_rows
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    bus = EventBus.new
+    gen1 = GenerationStamp.new(1, bus)
+    gen1.publish(id, { type: :picked_up, work_item: "T-1" })
+    gen1.publish(id, { type: :started, work_item: "T-1", attempt: 1 })
+    gen1.publish(id, { type: :finished, work_item: "T-1", attempt: 1, reason: :ok })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, "<h3>Recent activity (up to 50 events)</h3>"
+    assert_equal 3, section.scan("<tr><td>").size
+    assert_match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/, section)
+    assert_includes section, "<td>1</td><td>picked_up</td><td>T-1</td><td>—</td><td>—</td>"
+    assert_includes section, "<td>1</td><td>started</td><td>T-1</td><td>1</td><td>—</td>"
+    assert_includes section, "<td>1</td><td>finished</td><td>T-1</td><td>1</td><td>ok</td>"
+  end
+
+  def test_each_finished_reason_renders_verbatim_in_the_detail_cell
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    bus = EventBus.new
+    %i[ok failed timeout killed].each_with_index do |reason, i|
+      bus.publish(id, { type: :finished, work_item: "T-#{i}", attempt: 1, reason: reason, generation: 1 })
+    end
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    %w[ok failed timeout killed].each do |reason|
+      assert_includes section, "<td>#{reason}</td></tr>", "reason #{reason.inspect} did not render verbatim"
+    end
+  end
+
+  def test_a_restart_event_renders_its_actor_set_and_timestamp
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    bus = EventBus.new
+    bus.publish(id, { type: :restart, actor: [:crash_auto], generation: 2 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/, section)
+    assert_includes section, "<td>restart</td><td>—</td><td>—</td><td>actor: crash_auto</td>"
+  end
+
+  def test_a_multi_actor_restart_set_renders_joined
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    bus = EventBus.new
+    bus.publish(id, { type: :restart, actor: %i[crash_auto console_alice], generation: 2 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, "actor: crash_auto, console_alice"
+  end
+
+  def test_a_restart_with_an_empty_actor_array_renders_the_em_dash
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    bus = EventBus.new
+    bus.publish(id, { type: :restart, actor: [], generation: 2 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, "<td>restart</td><td>—</td><td>—</td><td>—</td>"
+  end
+
+  # AC4: two generations of the same restarted runner interleave, and each row
+  # carries its own generation rather than the current one.
+  def test_interleaved_generations_render_their_own_generation_per_row
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    bus = EventBus.new
+    GenerationStamp.new(1, bus).publish(id, { type: :picked_up, work_item: "T-1" })
+    GenerationStamp.new(2, bus).publish(id, { type: :picked_up, work_item: "T-2" })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, "<td>2</td><td>picked_up</td><td>T-2</td>"
+    assert_includes section, "<td>1</td><td>picked_up</td><td>T-1</td>"
+  end
+
+  # AC4/Detail cell: a record shape this app does not know is rendered with
+  # its type and timestamp and an em-dash Detail, never dropped and never
+  # raised on.
+  def test_an_unrecognised_event_type_renders_with_an_em_dash_detail
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    bus = EventBus.new
+    bus.publish(id, { type: :some_future_event, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, "<td>some_future_event</td><td>—</td><td>—</td><td>—</td>"
+  end
+
+  def test_a_hostile_work_item_is_rendered_inert
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    malicious = "<script>alert(1)</script>"
+    bus = EventBus.new
+    bus.publish(id, { type: :picked_up, work_item: malicious, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, "&lt;script&gt;alert(1)&lt;/script&gt;"
+    refute_includes section, malicious
+  end
+
+  def test_a_hostile_actor_is_rendered_inert
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    malicious = "<script>alert(1)</script>"
+    bus = EventBus.new
+    bus.publish(id, { type: :restart, actor: [malicious], generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, "&lt;script&gt;alert(1)&lt;/script&gt;"
+    refute_includes section, malicious
+  end
+
+  # AC8: an entity with no events renders the pinned empty-state message and
+  # no table inside the activity section — not the absence of the whole
+  # section, and not merely the absence of the word "table".
+  def test_an_entity_with_no_events_renders_the_pinned_empty_state
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :waiting, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, state_registry: registry)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, "<p>No activity recorded.</p>"
+    refute_includes section, "<tr><th>When</th><th>Gen</th><th>Event</th><th>Work item</th><th>Attempt</th><th>Detail</th></tr>"
+  end
+
+  # AC8: a messenger's timeline is restart-only, never absent — and 2.4's
+  # AC9 guard (no Work item/Attempt rows for a non-runner) must still hold.
+  def test_a_messenger_with_a_restart_event_renders_that_row_and_no_work_item_rows
+    entity_id = "messenger:wf"
+    bus = EventBus.new
+    bus.publish(entity_id, { type: :restart, actor: [:crash_auto], generation: 1 })
+    registry = StateRegistry.new
+    registry.publish(entity_id, { status: :running, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :messenger, workflow: "wf", name: "messenger", entity_id: entity_id)]
+    app = build_activity_app(roster: roster, state_registry: registry, event_bus: bus)
+
+    body = get_on(app, "/entity?id=messenger%3Awf").body
+    section = activity_section(body)
+
+    assert_includes section, "actor: crash_auto"
+    refute_includes body, "<tr><th>Work item</th><td>"
+    refute_includes body, "<tr><th>Attempt</th><td>"
+  end
+
+  # More events than the limit -> exactly ActivityLog::DEFAULT_LIMIT rows, the
+  # newest present and the oldest absent.
+  def test_more_events_than_the_limit_renders_only_the_newest_default_limit_rows
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    bus = EventBus.new
+    (ActivityLog::DEFAULT_LIMIT + 10).times { |i| bus.publish(id, { type: :picked_up, work_item: "item-#{i}", generation: 1 }) }
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_equal ActivityLog::DEFAULT_LIMIT, section.scan("<tr><td>").size
+    assert_includes section, "item-#{ActivityLog::DEFAULT_LIMIT + 9}"
+    refute_includes section, "item-0<"
+  end
+
+  # AC7: a render fault costs the operator the whole page (a loud 500), never
+  # a silently missing row — and never echoes the fault or the request path.
+  def test_an_activity_log_that_raises_on_read_yields_a_500_with_no_echo_and_one_logged_error
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    fleet = Fleet.new(roster: roster, state_registry: StateRegistry.new)
+    exploding_activity_log = Object.new.tap do |o|
+      def o.recent(*) = raise "activity log boom, path /entity?id=runner:wf:alpha"
+    end
+    app = build_app(fleet, activity_log: exploding_activity_log)
+
+    errors = capture_log_errors do
+      @response = get_on(app, "/entity?id=runner%3Awf%3Aalpha")
+    end
+
+    assert_equal 500, @response.status
+    assert_equal "internal error", @response.body
+    refute_includes @response.body, "boom"
+    refute_includes @response.body, "/entity"
+    assert_equal 1, errors.size
+    assert_match(/RuntimeError/, errors.first)
+    # The other half of the contract: what the body must not carry, the log
+    # must. Without this the rescue could log nothing useful and still pass.
+    assert_includes errors.first, "activity log boom"
+    assert_includes errors.first, "/entity"
+  end
+
+  # Same helper test_supervisor_master.rb uses (capture_log_errors): swap the
+  # null logger this file's other tests never installed for a StringIO one,
+  # for the duration of the block only. LogStubbing is deliberately not used
+  # here — it installs a File::NULL logger, which cannot capture, and this
+  # test asserts on what was logged. The restore mirrors LogStubbing's,
+  # clear_context included.
+  def capture_log_errors
+    io = StringIO.new
+    logger = ::Logger.new(io)
+    logger.level = ::Logger::ERROR
+    prior = AgentDaemon::Log.instance_variable_get(:@logger)
+    AgentDaemon::Log.use(logger)
+    yield
+    io.string.lines.map(&:chomp).reject(&:empty?)
+  ensure
+    AgentDaemon::Log.instance_variable_set(:@logger, prior)
+    AgentDaemon::Log.clear_context
   end
 end

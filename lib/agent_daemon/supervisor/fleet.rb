@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "runner_identity"
+
 module AgentDaemon
   module Supervisor
     # The read-side join that answers "what does the fleet look like right
@@ -153,7 +155,7 @@ module AgentDaemon
       # yields its workflow-qualified key, a messenger/reactor entity_id is
       # already the opaque id string.
       def entity_id(entity_id)
-        entity_id.respond_to?(:thread_key) ? entity_id.thread_key.to_s : entity_id.to_s
+        RunnerIdentity.key_for(entity_id)
       end
 
       def seconds_since_published(snapshot, now)

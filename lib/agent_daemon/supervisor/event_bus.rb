@@ -82,6 +82,21 @@ module AgentDaemon
         @mutex.synchronize { @subscribers.fetch(cursor)[:dropped] }
       end
 
+      # Non-consuming, non-registering snapshot of the retained ring, in seq
+      # order (Story 2.5). Deliberately NOT #read: a page render must not
+      # register a subscriber - #subscribe's cursors are only ever removed by
+      # an explicit #unsubscribe, so one leaked per request would accumulate
+      # forever AND slow every publish, since evict_if_needed walks every
+      # registered subscriber on the producer's thread. Cursor lifecycle is
+      # Story 2.6's; this reader has none.
+      #
+      # Copy-on-read, same contract as #read: the ring keeps its records for
+      # every subscriber, so a consumer that transforms what it reads must not
+      # be handed the retained hash itself.
+      def records
+        @mutex.synchronize { @records.map(&:dup) }
+      end
+
       def events_dropped_total
         @mutex.synchronize { @events_dropped_total }
       end

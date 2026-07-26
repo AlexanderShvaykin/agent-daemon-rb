@@ -110,4 +110,80 @@ class TestEventBus < Minitest::Test
     assert_equal 3, bus.events_dropped_total
     assert_raises(KeyError) { bus.dropped(cursor) }
   end
+
+  # --- Story 2.5: #records is a non-consuming, non-registering snapshot ----
+
+  def test_records_returns_the_whole_ring_in_seq_order
+    @bus.publish("ent-1", { type: :picked_up, generation: 1 })
+    @bus.publish("ent-2", { type: :picked_up, generation: 1 })
+
+    records = @bus.records
+
+    assert_equal %w[ent-1 ent-2], records.map { |r| r[:entity_id] }
+    assert_equal [1, 2], records.map { |r| r[:seq] }
+  end
+
+  def test_records_does_not_register_a_subscriber_and_does_not_consume
+    @bus.publish("ent-1", { type: :picked_up, generation: 1 })
+
+    first_call = @bus.records
+    second_call = @bus.records
+
+    assert_equal first_call, second_call
+    assert_equal 0, @bus.instance_variable_get(:@subscribers).size, "#records must never register a cursor"
+  end
+
+  def test_records_leaves_a_pre_existing_subscribers_read_unaffected
+    cursor = @bus.subscribe
+    @bus.publish("ent-1", { type: :picked_up, generation: 1 })
+
+    @bus.records
+    @bus.records
+
+    assert_equal 1, @bus.read(cursor).size, "repeated #records calls must not advance any subscriber's cursor"
+  end
+
+  def test_records_leaves_drop_accounting_untouched
+    bus = AgentDaemon::Supervisor::EventBus.new(capacity: 1)
+    cursor = bus.subscribe
+    bus.publish("ent-1", { type: :e1, generation: 1 })
+    bus.publish("ent-1", { type: :e2, generation: 1 })
+
+    before_total = bus.events_dropped_total
+    before_dropped = bus.dropped(cursor)
+    bus.records
+    bus.records
+
+    assert_equal before_total, bus.events_dropped_total
+    assert_equal before_dropped, bus.dropped(cursor)
+  end
+
+  # Copy-on-read, same property #read already pins: mutating what #records
+  # returns must not corrupt the retained ring.
+  def test_records_copies_each_record_hash_so_top_level_keys_cannot_be_corrupted
+    @bus.publish("ent-1", { type: :started, work_item: "TASK-1.yml", generation: 1 })
+
+    drained = @bus.records.first
+    drained[:work_item] = "TAMPERED"
+    drained[:injected] = true
+
+    fresh = @bus.records.first
+    assert_equal "TASK-1.yml", fresh[:work_item]
+    refute fresh.key?(:injected)
+  end
+
+  # The copy is one level deep, exactly as #read's is - this pins where the
+  # boundary actually falls so no consumer mistakes it for a deep copy. `actor`
+  # is the only nested collection in the vocabulary (AD-9), and the rule that
+  # keeps this safe is "do not mutate what the bus hands you": ActivityLog
+  # copies it into an Entry Struct and the console only joins it for display.
+  def test_records_copies_one_level_deep_so_a_nested_actor_array_is_still_shared
+    @bus.publish("ent-1", { type: :restart, actor: [:crash_auto], generation: 2 })
+
+    @bus.records.first[:actor] << :INJECTED
+
+    assert_equal %i[crash_auto INJECTED], @bus.records.first[:actor],
+                 "nested values are shared by design; if this ever becomes a deep copy, " \
+                 "update EventBus#records' contract comment and ActivityLog's dup caveat"
+  end
 end

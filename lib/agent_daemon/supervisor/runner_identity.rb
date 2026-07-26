@@ -41,6 +41,17 @@ module AgentDaemon
       def to_s
         log_tag
       end
+
+      # The one derivation from an opaque entity_id to the String key the console,
+      # the API and the activity log address an entity by. A RunnerIdentity yields
+      # its workflow-qualified thread key; a messenger/reactor entity_id is already
+      # an opaque String (Master#build_messenger_factory and Master#build_reactor_factory
+      # each assign one). Fleet and ActivityLog both call this
+      # so a bus record and a roster row can never disagree about who an event
+      # belongs to.
+      def self.key_for(entity_id)
+        entity_id.respond_to?(:thread_key) ? entity_id.thread_key.to_s : entity_id.to_s
+      end
     end
   end
 end

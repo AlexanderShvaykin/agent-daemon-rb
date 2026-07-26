@@ -2,6 +2,7 @@
 
 require "rack"
 
+require_relative "../../log"
 require_relative "auth"
 
 module AgentDaemon
@@ -13,7 +14,8 @@ module AgentDaemon
       # (Fleet, itself backed by StateRegistry, AD-4). `/entity?id=…` is the
       # per-runner detail page (Story 2.4), which reads the snapshot's
       # per-runner fields — work item, attempt, generation, observed_at. The
-      # activity log is 2.5 and SSE is 2.6 — this app reads no EventBus yet.
+      # per-runner activity log is 2.5, read through an injected ActivityLog;
+      # SSE is 2.6, so every read here is pull-based, on page render only.
       #
       # There is NO auth code here, by design. Auth wraps this app and
       # authenticates by default, so a route added below is protected the moment
@@ -42,6 +44,12 @@ module AgentDaemon
                           "tick, so a crash can take up to ~1 s to appear here. This latency counts inside " \
                           "the ≤ 2 s freshness budget, not on top of it.</p>"
 
+        # Story 2.5 AC1: a truncated timeline otherwise reads as "the runner
+        # did nothing", which is the same class of false negative the
+        # note_for :stopped/:exited branches guard against.
+        ACTIVITY_NOTE = '<p class="activity-note">Recent activity only — the event buffer is bounded and ' \
+                         "does not survive a supervisor restart.</p>"
+
         # Rack raises out of query parsing for a string that exceeds its
         # depth/count limits, carries a bad encoding, or mixes a scalar and an
         # array under one key (?id=1&id[]=2) — the id arrives on a path a
@@ -50,8 +58,9 @@ module AgentDaemon
         # enumerating the leaf classes is what let ParameterTypeError through.
         PARAM_ERRORS = [Rack::BadRequest].freeze
 
-        def initialize(fleet:)
+        def initialize(fleet:, activity_log:)
           @fleet = fleet
+          @activity_log = activity_log
         end
 
         def call(env)
@@ -65,6 +74,9 @@ module AgentDaemon
           when "/entity"  then request.get? ? entity_detail(request, env[Auth::SESSION_ENV_KEY]) : not_found
           else                 not_found
           end
+        rescue StandardError => e
+          Log.error("[Console] render failed for #{request&.path_info.inspect}: #{e.class}: #{e.message}")
+          [500, TEXT_HEADERS.dup, ["internal error"]]
         end
 
         private
@@ -244,6 +256,7 @@ module AgentDaemon
             </table>
             #{note_paragraph(entry.status)}<p>#{restart_placeholder}</p>
             #{STALENESS_NOTE}
+            #{activity_section(entry)}
           HTML
         end
 
@@ -280,6 +293,46 @@ module AgentDaemon
           return "" if note.empty?
 
           "<p>#{esc(note)}</p>\n"
+        end
+
+        # AC1/AC8: every entity kind gets this section — a messenger or the
+        # reactor renders restart-only rows, and a runner with no events yet
+        # renders the empty state, never a missing heading (AC8).
+        def activity_section(entry)
+          events = @activity_log.recent(entry.id)
+          heading = "<h3>Recent activity (up to #{@activity_log.limit} events)</h3>"
+          body = events.empty? ? "<p>No activity recorded.</p>" : activity_table(events)
+
+          "#{heading}\n#{body}#{ACTIVITY_NOTE}\n"
+        end
+
+        def activity_table(events)
+          rows = events.map { |event| activity_row(event) }.join
+          <<~HTML
+            <table>
+            <tr><th>When</th><th>Gen</th><th>Event</th><th>Work item</th><th>Attempt</th><th>Detail</th></tr>
+            #{rows}</table>
+          HTML
+        end
+
+        def activity_row(event)
+          <<~HTML
+            <tr><td>#{esc(event.at || EM_DASH)}</td><td>#{esc(event.generation || EM_DASH)}</td><td>#{esc(event.type || EM_DASH)}</td><td>#{esc(event.work_item || EM_DASH)}</td><td>#{esc(event.attempt || EM_DASH)}</td><td>#{esc(activity_detail(event))}</td></tr>
+          HTML
+        end
+
+        # Detail cell contract (Story 2.5 Dev Notes): a finished row's reason
+        # verbatim, a restart row's actor set joined, and an em dash for
+        # anything else — including a record shape this app does not know,
+        # never dropped and never raised on.
+        def activity_detail(event)
+          case event.type
+          when :finished then event.reason || EM_DASH
+          when :restart
+            actors = Array(event.actor)
+            actors.empty? ? EM_DASH : "actor: #{actors.join(', ')}"
+          else EM_DASH
+          end
         end
 
         def esc(value)

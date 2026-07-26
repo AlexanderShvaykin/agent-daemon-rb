@@ -9,6 +9,8 @@ require "uri"
 require "agent_daemon/supervisor/console/server"
 require "agent_daemon/supervisor/fleet"
 require "agent_daemon/supervisor/state_registry"
+require "agent_daemon/supervisor/activity_log"
+require "agent_daemon/supervisor/event_bus"
 
 # Story 2.2 AC7 — the console really runs. AI-1: this boots a REAL Puma with
 # the REAL middleware stack on an ephemeral port and speaks HTTP to it; the
@@ -52,8 +54,12 @@ class TestConsoleServer < Minitest::Test
     AgentDaemon::Supervisor::Fleet.new(roster: [], state_registry: AgentDaemon::Supervisor::StateRegistry.new)
   end
 
+  def empty_activity_log
+    AgentDaemon::Supervisor::ActivityLog.new(event_bus: AgentDaemon::Supervisor::EventBus.new)
+  end
+
   def start_server(config = CONSOLE_CONFIG)
-    server = Server.new(config, fleet: empty_fleet, log_writer: Puma::LogWriter.strings)
+    server = Server.new(config, fleet: empty_fleet, activity_log: empty_activity_log, log_writer: Puma::LogWriter.strings)
     @servers << server
     server.start
     server
@@ -132,7 +138,7 @@ class TestConsoleServer < Minitest::Test
   end
 
   def test_stop_before_start_is_a_no_op
-    server = Server.new(CONSOLE_CONFIG, fleet: empty_fleet, log_writer: Puma::LogWriter.strings)
+    server = Server.new(CONSOLE_CONFIG, fleet: empty_fleet, activity_log: empty_activity_log, log_writer: Puma::LogWriter.strings)
     @servers << server
 
     server.stop
@@ -176,7 +182,8 @@ class TestConsoleServer < Minitest::Test
       end
     end
 
-    server = failing.new(CONSOLE_CONFIG.merge("port" => port), fleet: empty_fleet, log_writer: Puma::LogWriter.strings)
+    server = failing.new(CONSOLE_CONFIG.merge("port" => port), fleet: empty_fleet, activity_log: empty_activity_log,
+                          log_writer: Puma::LogWriter.strings)
     assert_raises(RuntimeError) { server.start }
 
     # If the socket leaked, this bind fails with EADDRINUSE.

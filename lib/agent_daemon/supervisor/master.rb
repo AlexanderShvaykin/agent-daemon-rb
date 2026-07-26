@@ -6,6 +6,7 @@ require_relative "runner_supervisor"
 require_relative "state_registry"
 require_relative "event_bus"
 require_relative "fleet"
+require_relative "activity_log"
 require_relative "console/server"
 
 module AgentDaemon
@@ -34,7 +35,7 @@ module AgentDaemon
       # Builds the console server from the config's `console` block. Injectable
       # for the same reason join_timeout is: a test must be able to make the
       # console fail on purpose and watch the fleet carry on regardless.
-      CONSOLE_FACTORY = ->(console_config, fleet) { Console::Server.new(console_config, fleet: fleet) }
+      CONSOLE_FACTORY = ->(console_config, fleet, activity_log) { Console::Server.new(console_config, fleet: fleet, activity_log: activity_log) }
 
       attr_reader :state_registry, :event_bus
 
@@ -128,13 +129,17 @@ module AgentDaemon
         @fleet ||= Fleet.new(roster: @roster, state_registry: @state_registry, restart_delay: RunnerSupervisor::RESTART_DELAY)
       end
 
+      def activity_log
+        @activity_log ||= ActivityLog.new(event_bus: @event_bus)
+      end
+
       # AC7 / AD-3 / NFR4: the console is an observer, so a console fault is
       # never a fleet fault. A bind collision or an OAuth misconfiguration is
       # logged and the supervision loop runs on without a console.
       def start_console
         return if @config.console.nil?
 
-        console = @console_factory.call(@config.console, fleet)
+        console = @console_factory.call(@config.console, fleet, activity_log)
         console.start
         @console = console
         Log.info("[Console] listening on #{@config.console['bind']}:#{console.port}")
