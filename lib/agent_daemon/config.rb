@@ -292,6 +292,13 @@ module AgentDaemon
                channels.all? { |c| c.is_a?(String) && !c.empty? }
           errors << "runner #{runner_label.inspect}: trigger.channels must be a non-empty Array of non-empty Strings"
         end
+        if trigger.key?("direct_users")
+          direct_users = trigger["direct_users"]
+          unless direct_users.is_a?(Array) && !direct_users.empty? &&
+                 direct_users.all? { |user| user.is_a?(String) && !user.empty? }
+            errors << "runner #{runner_label.inspect}: trigger.direct_users must be a non-empty Array of non-empty Strings"
+          end
+        end
         unless trigger["interval"].is_a?(Integer) && trigger["interval"] > 0
           errors << "runner #{runner_label.inspect}: trigger.interval must be a positive Integer"
         end

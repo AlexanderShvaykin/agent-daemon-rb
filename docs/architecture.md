@@ -80,9 +80,10 @@ Polls `input_dir` for `*.yml` files. On success the file moves to
 
 ### Runner::Mattermost
 
-A `mattermost` runner turns Mattermost @-mentions into agent runs and posts the
-answer back as a threaded reply. It is the only **push**-driven trigger, so it
-is split across two cooperating pieces plus the shared reactor:
+A `mattermost` runner turns Mattermost @-mentions — and, when configured,
+direct messages from allowlisted users — into agent runs and posts the answer
+back as a threaded reply. It is the only **push**-driven trigger, so it is split
+across two cooperating pieces plus the shared reactor:
 
 - **`Mattermost::Listener`** — a per-runner WebSocket handler. It does *not* own
   a thread: the reactor creates its faye-websocket client and drives the
@@ -90,12 +91,15 @@ is split across two cooperating pieces plus the shared reactor:
   with a blocking `GET /api/v4/users/me` and the team id with
   `GET /api/v4/teams/name/{team}` (so the reactor thread never blocks on IO
   inside the loop). It then connects, sends an `authentication_challenge`,
-  and for each incoming `posted` event applies four filters — not the bot
-  itself, the event's `team_id` matching the configured team (so a like-named
-  channel in another team cannot trigger), channel in the runner's `channels`
-  allowlist, and the bot id present in the event's `mentions` — before
-  de-duplicating by post id (checked across
-  the inbox, done, and failed dirs). A qualifying mention is written as a
+  and for each incoming `posted` event rejects posts from the bot, then selects
+  one route. A direct-message (`channel_type: "D"`) is accepted only when its
+  `sender_name` is in the optional `direct_users` allowlist; it needs neither a
+  mention nor a configured team or channel. Every other channel type retains
+  the existing filters: the event's `team_id` matches the configured team (so a
+  like-named channel in another team cannot trigger), its name is in the
+  runner's `channels` allowlist, and its `mentions` include the bot id. The
+  listener then de-duplicates by post id (checked across
+  the inbox, done, and failed dirs). A qualifying post is written as a
   `<post_id>.yml` work-item into the inbox, carrying `message`, `channel_id`,
   `root_id` (the post's thread root, falling back to its own id for a top-level
   post), `sender`, `channel_name`, `post_id`, and `created_at`. On socket close
@@ -257,6 +261,11 @@ Per-item failures use a separate attempt counter. After `max_attempts` (default
 
 YAML-based, loaded by `AgentDaemon::Config`. See `examples/config.yml` for a
 fully commented example.
+
+For a Mattermost runner, `trigger.direct_users` is optional. When present it
+must be a non-empty list of non-empty Mattermost usernames and enables incoming
+one-to-one direct messages from exactly those users. Omitting it preserves the
+mention-only behavior; `channels` remains required for non-DM posts.
 
 ### Path Resolution
 

@@ -60,7 +60,7 @@ class TestMattermostListener < Minitest::Test
 
   # Builds a `posted` event frame matching the Mattermost wire format: data.post
   # and data.mentions are themselves JSON-encoded strings.
-  def posted_frame(post: {}, mentions: [BOT_ID], channel_name: "town-square", sender_name: "@alice", team_id: "team1", include_mentions: true)
+  def posted_frame(post: {}, mentions: [BOT_ID], channel_name: "town-square", channel_type: "O", sender_name: "@alice", team_id: "team1", include_mentions: true)
     post_obj = {
       "id" => "POSTID",
       "user_id" => "UID",
@@ -73,7 +73,7 @@ class TestMattermostListener < Minitest::Test
     data = {
       "channel_name" => channel_name,
       "channel_display_name" => "Town Square",
-      "channel_type" => "O",
+      "channel_type" => channel_type,
       "sender_name" => sender_name,
       "team_id" => team_id,
       "post" => JSON.generate(post_obj)
@@ -155,6 +155,46 @@ class TestMattermostListener < Minitest::Test
     listener.on_message(posted_frame(post: { "id" => "p650" }, include_mentions: false))
 
     refute ::File.exist?(item_path("p650")), "absent mentions key means no mention"
+  end
+
+  def test_allowlisted_direct_message_without_mention_writes_work_item
+    listener = prepared_listener("direct_users" => ["alexander.shvaykin"])
+
+    listener.on_message(posted_frame(
+      post: { "id" => "dm100" },
+      channel_type: "D",
+      channel_name: "unrelated",
+      sender_name: "alexander.shvaykin",
+      team_id: "other-team",
+      include_mentions: false
+    ))
+
+    assert ::File.exist?(item_path("dm100")), "allowlisted direct message must not require a mention"
+  end
+
+  def test_direct_message_from_non_allowlisted_user_is_ignored
+    listener = prepared_listener("direct_users" => ["alexander.shvaykin"])
+
+    listener.on_message(posted_frame(
+      post: { "id" => "dm200" },
+      channel_type: "D",
+      sender_name: "mallory",
+      include_mentions: false
+    ))
+
+    refute ::File.exist?(item_path("dm200")), "non-allowlisted direct message must be ignored"
+  end
+
+  def test_direct_users_do_not_bypass_non_direct_message_mention_filter
+    listener = prepared_listener("direct_users" => ["alexander.shvaykin"])
+
+    listener.on_message(posted_frame(
+      post: { "id" => "p675" },
+      sender_name: "alexander.shvaykin",
+      include_mentions: false
+    ))
+
+    refute ::File.exist?(item_path("p675")), "non-direct messages must still mention the bot"
   end
 
   def test_dedup_against_inbox

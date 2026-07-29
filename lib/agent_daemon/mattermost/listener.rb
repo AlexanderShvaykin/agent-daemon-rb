@@ -15,7 +15,7 @@ module AgentDaemon
     # It does NOT own a thread; the Reactor creates the faye client and drives the
     # callbacks. Responsibilities: resolve the bot id once (blocking, in #prepare,
     # before the reactor loop), connect + authenticate, filter `posted` events
-    # (not-self + allowlisted channel + bot mentioned), de-dup by post id, and
+    # (not-self + allowlisted DM sender or channel mention), de-dup by post id, and
     # write a `<post_id>.yml` work-item into the inbox for the consumer runner.
     #
     # The pure seams — #prepare, #on_message, #handle_event — are directly
@@ -31,6 +31,7 @@ module AgentDaemon
         @token = trigger_config.fetch("token")
         @team = trigger_config.fetch("team")
         @channels = Array(trigger_config.fetch("channels"))
+        @direct_users = Array(trigger_config["direct_users"])
         @input_dir = trigger_config.fetch("input_dir")
         @archive_dir = trigger_config.fetch("archive_dir")
         @failed_dir = trigger_config.fetch("failed_dir")
@@ -74,7 +75,7 @@ module AgentDaemon
         nil
       end
 
-      # Applies the 3-filter + de-dup and writes the work-item for a qualifying
+      # Applies the route filter + de-dup and writes the work-item for a qualifying
       # `posted` event. Directly callable in tests.
       def handle_event(event)
         # `hello` confirms a successful authentication — connection bookkeeping
@@ -97,9 +98,13 @@ module AgentDaemon
         return unless post_id.is_a?(String) && !post_id.empty?
 
         return if post["user_id"] == @bot_id
-        return unless data["team_id"] == @team_id
-        return unless @channels.include?(data["channel_name"])
-        return unless mentions(data).include?(@bot_id)
+        if data["channel_type"] == "D"
+          return unless @direct_users.include?(data["sender_name"])
+        else
+          return unless data["team_id"] == @team_id
+          return unless @channels.include?(data["channel_name"])
+          return unless mentions(data).include?(@bot_id)
+        end
         return if already_seen?(post_id)
 
         write_work_item(post, data)

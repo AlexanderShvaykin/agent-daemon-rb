@@ -83,7 +83,7 @@ runners:
   #     interval: 300
   #   prompt_template: prompts/default.txt
 
-  # --- Example 4: Mattermost mention trigger (WebSocket, push) ---
+  # --- Example 4: Mattermost mention/direct-message trigger (WebSocket, push) ---
   # Listens over a WebSocket for @-mentions of the bot in the listed channels,
   # writes each one as a work item, and runs the agent on it. The agent replies
   # back into the originating thread by writing a message YAML (see
@@ -101,6 +101,11 @@ runners:
   #     channels:                              # only @-mentions in these channels trigger
   #       - support
   #       - general
+  #     # Optional: incoming one-to-one direct messages from these usernames
+  #     # trigger without an @-mention. Every non-DM post still requires the
+  #     # configured team, channel, and bot mention.
+  #     # direct_users:
+  #     #   - alexander.shvaykin
   #     # interval: 2          # inbox poll interval, seconds (default 2)
   #     # jitter: 0            # random 0..jitter s added per cycle (default 0)
   #     # Work dirs default to mentions/<name>/{inbox,done,failed} under

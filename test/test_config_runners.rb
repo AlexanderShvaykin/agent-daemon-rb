@@ -307,4 +307,29 @@ class TestConfigRunners < Minitest::Test
       assert_includes err.message, "trigger.channels"
     end
   end
+
+  def test_accepts_mattermost_direct_users
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runner = mattermost_runner
+      runner["trigger"]["direct_users"] = ["alexander.shvaykin"]
+      path = write_config(dir, base_config(project_path, [runner]))
+
+      assert_equal ["alexander.shvaykin"], AgentDaemon::Config.new(path).runners.first.dig("trigger", "direct_users")
+    end
+  end
+
+  def test_rejects_invalid_mattermost_direct_users
+    [nil, [], [""], "alexander.shvaykin"].each do |direct_users|
+      Dir.mktmpdir do |dir|
+        project_path = with_project(dir)
+        runner = mattermost_runner
+        runner["trigger"]["direct_users"] = direct_users
+        path = write_config(dir, base_config(project_path, [runner]))
+
+        err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+        assert_includes err.message, "trigger.direct_users"
+      end
+    end
+  end
 end
