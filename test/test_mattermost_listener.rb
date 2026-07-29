@@ -164,7 +164,7 @@ class TestMattermostListener < Minitest::Test
       post: { "id" => "dm100" },
       channel_type: "D",
       channel_name: "unrelated",
-      sender_name: "alexander.shvaykin",
+      sender_name: "@alexander.shvaykin",
       team_id: "other-team",
       include_mentions: false
     ))

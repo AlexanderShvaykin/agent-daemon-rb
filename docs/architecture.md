@@ -264,7 +264,9 @@ fully commented example.
 
 For a Mattermost runner, `trigger.direct_users` is optional. When present it
 must be a non-empty list of non-empty Mattermost usernames and enables incoming
-one-to-one direct messages from exactly those users. `channels` may be empty
+one-to-one direct messages from exactly those users. The listener accepts the
+Mattermost event's optional leading `@` in `sender_name`; configure usernames
+without it. `channels` may be empty
 only with a valid `direct_users` allowlist, which configures a direct-message-
 only runner. Otherwise, `channels` remains required for non-DM posts.
 

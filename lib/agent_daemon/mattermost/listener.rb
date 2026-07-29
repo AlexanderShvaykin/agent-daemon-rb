@@ -99,7 +99,7 @@ module AgentDaemon
 
         return if post["user_id"] == @bot_id
         if data["channel_type"] == "D"
-          return unless @direct_users.include?(data["sender_name"])
+          return unless @direct_users.include?(username(data["sender_name"]))
         else
           return unless data["team_id"] == @team_id
           return unless @channels.include?(data["channel_name"])
@@ -143,6 +143,10 @@ module AgentDaemon
       def mentions(data)
         parsed = parse_json_value(data["mentions"])
         parsed.is_a?(Array) ? parsed : []
+      end
+
+      def username(sender_name)
+        sender_name.to_s.delete_prefix("@")
       end
 
       def parse_json_object(raw)

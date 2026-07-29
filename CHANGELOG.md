@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.2] - 2026-07-29
+
+### Fixed
+- Normalize Mattermost `sender_name` before matching `direct_users`, so the
+  event's leading `@` does not prevent an allowlisted direct message from
+  reaching its runner.
+
 ## [0.7.1] - 2026-07-29
 
 ### Changed
