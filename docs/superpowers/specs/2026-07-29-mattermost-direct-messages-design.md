@@ -41,6 +41,19 @@ and failed directories. Accepted direct messages use the existing work-item
 format, so `Runner::Mattermost` and the Mattermost transport reply into the
 same direct-message channel using `channel_id` and `root_id`.
 
+Every message from an allowlisted user in a direct-message channel is eligible;
+an `@` mention is not required, including for replies inside an existing
+thread. A reply carries the original `root_id`, so the agent's response stays
+in that thread.
+
+## Conversational context
+
+The gem only routes each accepted post and exposes its `root_id`. The prompt
+for a conversational assistant must fetch the Mattermost thread by that id
+before answering. This gives every run the preceding discussion while keeping
+the daemon stateless. The prompt then writes its reply with the received
+`channel_id` and `root_id`.
+
 ## Validation and compatibility
 
 When present, `direct_users` must be a non-empty list of non-empty strings.
@@ -63,5 +76,6 @@ Listener tests will cover:
 ## Scope boundary
 
 This change only provides generic, allowlisted incoming DM support in the gem.
-It does not add an assistant runner, prompts, or production configuration to a
-deployment repository.
+The deployment's assistant runner and prompt are a follow-up: the prompt must
+fetch the thread for conversational context and reply using `channel_id` and
+`root_id`.
