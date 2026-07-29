@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.0] - 2026-07-29
+
+### Added
+- Optional `trigger.direct_users` allowlist for Mattermost runners. One-to-one direct messages from listed usernames trigger an agent run without an `@` mention; all non-DM posts retain the existing configured-team, channel-allowlist, and mention checks.
+
 ## [0.6.0] - 2026-07-23
 
 ### Added
