@@ -98,7 +98,8 @@ runners:
   #     base_url: "https://chat.example.com"   # Mattermost/Loop server root
   #     token: <%= secret('MM_BOT_TOKEN') %>   # bot access token
   #     team: your-team-slug                   # channel names resolve within this team
-  #     channels:                              # only @-mentions in these channels trigger
+  #     channels:                              # only @-mentions in these channels trigger;
+  #                                            # may be [] when direct_users is configured
   #       - support
   #       - general
   #     # Optional: incoming one-to-one direct messages from these usernames

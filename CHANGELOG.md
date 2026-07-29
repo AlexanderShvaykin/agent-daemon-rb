@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.1] - 2026-07-29
+
+### Changed
+- Mattermost runners with a valid `trigger.direct_users` allowlist may now set
+  `channels: []` for direct-message-only operation. Runners without that
+  allowlist still require a non-empty channel list.
+
 ## [0.7.0] - 2026-07-29
 
 ### Added

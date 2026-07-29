@@ -319,6 +319,18 @@ class TestConfigRunners < Minitest::Test
     end
   end
 
+  def test_accepts_direct_message_only_mattermost_runner
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runner = mattermost_runner
+      runner["trigger"]["channels"] = []
+      runner["trigger"]["direct_users"] = ["alexander.shvaykin"]
+      path = write_config(dir, base_config(project_path, [runner]))
+
+      assert_equal [], AgentDaemon::Config.new(path).runners.first.dig("trigger", "channels")
+    end
+  end
+
   def test_rejects_invalid_mattermost_direct_users
     [nil, [], [""], "alexander.shvaykin"].each do |direct_users|
       Dir.mktmpdir do |dir|
