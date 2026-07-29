@@ -61,6 +61,7 @@ module AgentDaemon
 
     def process_file(file)
       message_data = YAML.safe_load_file(file)
+      route_system_alert(message_data)
       task_key = message_data["task_key"]
       Log.info("[Messenger] Sending message for #{task_key}")
 
@@ -83,6 +84,21 @@ module AgentDaemon
       sent_dir = File.join(to_message_path, "sent")
       FileUtils.mkdir_p(sent_dir)
       FileUtils.mv(file, File.join(sent_dir, File.basename(file)))
+    end
+
+    def route_system_alert(message_data)
+      return unless message_data["system_alert"]
+      return unless @messenger_config["type"] == "mattermost"
+
+      alerts = @messenger_config["alerts"]
+      return unless alerts
+
+      message_data.delete("channel_id")
+      message_data.delete("channel")
+      message_data.delete("user")
+      message_data.delete("root_id")
+      destination = alerts.key?("user") ? "user" : "channel"
+      message_data[destination] = alerts.fetch(destination)
     end
 
     def to_message_path

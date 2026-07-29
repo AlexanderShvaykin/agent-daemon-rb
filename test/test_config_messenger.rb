@@ -46,6 +46,34 @@ class TestConfigMessenger < Minitest::Test
     end
   end
 
+  def test_mattermost_alerts_user_is_valid
+    build_config(mattermost_keys("alerts" => { "user" => "alexander.shvaykin" })) do |config|
+      assert_equal "alexander.shvaykin", config.messenger.dig("alerts", "user")
+    end
+  end
+
+  def test_mattermost_alerts_channel_is_valid
+    build_config(mattermost_keys("alerts" => { "channel" => "dev-alerts" })) do |config|
+      assert_equal "dev-alerts", config.messenger.dig("alerts", "channel")
+    end
+  end
+
+  def test_mattermost_alerts_rejects_empty_and_simultaneous_destinations
+    [{ "user" => "" }, { "user" => "alexander.shvaykin", "channel" => "dev-alerts" }].each do |alerts|
+      err = assert_raises(AgentDaemon::ConfigError) do
+        build_config(mattermost_keys("alerts" => alerts)) { |_config| }
+      end
+      assert_includes err.message, "messenger.alerts"
+    end
+  end
+
+  def test_webhook_alerts_are_rejected
+    err = assert_raises(AgentDaemon::ConfigError) do
+      build_config("type" => "webhook", "alerts" => { "user" => "alexander.shvaykin" }) { |_config| }
+    end
+    assert_includes err.message, "messenger.alerts is only supported"
+  end
+
   def test_mattermost_missing_keys_raise_listing_each
     err = assert_raises(AgentDaemon::ConfigError) do
       build_config("type" => "mattermost") { |_c| }

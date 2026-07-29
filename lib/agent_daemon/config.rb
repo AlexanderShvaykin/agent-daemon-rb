@@ -202,13 +202,35 @@ module AgentDaemon
         return ["messenger.type must be one of #{VALID_MESSENGER_TYPES.join(', ')} (got #{type.inspect})"]
       end
 
-      return [] unless type == "mattermost"
+      return validate_alerts(messenger, type) unless type == "mattermost"
 
-      MATTERMOST_REQUIRED.filter_map do |key|
+      errors = MATTERMOST_REQUIRED.filter_map do |key|
         next if messenger[key].is_a?(String) && !messenger[key].empty?
 
         "messenger.#{key} is required when messenger.type is mattermost"
       end
+      errors.concat(validate_alerts(messenger, type))
+    end
+
+    def validate_alerts(messenger, type)
+      return [] unless messenger.key?("alerts")
+
+      return ["messenger.alerts is only supported when messenger.type is mattermost"] unless type == "mattermost"
+
+      alerts = messenger["alerts"]
+      unless alerts.is_a?(Hash)
+        return ["messenger.alerts must be a Hash with exactly one of user or channel"]
+      end
+
+      destinations = %w[user channel].select { |key| alerts.key?(key) }
+      unless destinations.size == 1
+        return ["messenger.alerts must contain exactly one of user or channel"]
+      end
+
+      key = destinations.first
+      return [] if alerts[key].is_a?(String) && !alerts[key].empty?
+
+      ["messenger.alerts.#{key} must be a non-empty String"]
     end
 
     def validate_duplicate_names

@@ -135,10 +135,38 @@ class TestRunnerTracker < Minitest::Test
 
     payload = YAML.safe_load_file(error_files.first)
     assert_equal "SYSTEM:default", payload["task_key"]
+    assert_equal true, payload["system_alert"]
+    assert_equal "trigger_error", payload["error_type"]
     assert_includes payload["message"], "kaboom"
 
     # Counter resets after escalation
     assert_equal 0, runner.instance_variable_get(:@consecutive_errors)
+  end
+
+  def test_final_cli_failure_creates_one_system_alert
+    runner = build_runner([:failed, :failed, :failed])
+
+    3.times { runner.send(:process_item, { "key" => "TI-7" }) }
+
+    alerts = Dir.glob(File.join(@message_dir, "error-default-*.yml"))
+    assert_equal 1, alerts.size
+    payload = YAML.safe_load_file(alerts.first)
+    assert_equal true, payload["system_alert"]
+    assert_equal "cli_failed", payload["error_type"]
+    assert_equal "TI-7", payload["work_item"]
+    assert_includes payload["message"], "work item TI-7"
+  end
+
+  def test_final_timeout_creates_one_system_alert
+    runner = build_runner([:timeout, :timeout, :timeout])
+
+    3.times { runner.send(:process_item, { "key" => "TI-8" }) }
+
+    alerts = Dir.glob(File.join(@message_dir, "error-default-*.yml"))
+    assert_equal 1, alerts.size
+    payload = YAML.safe_load_file(alerts.first)
+    assert_equal "timeout", payload["error_type"]
+    assert_equal "TI-8", payload["work_item"]
   end
 
   def test_rate_limit_does_not_escalate_and_sets_backoff

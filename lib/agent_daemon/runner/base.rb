@@ -87,7 +87,7 @@ module AgentDaemon
         Log.error("[#{log_tag}] trigger error (#{@consecutive_errors}/#{MAX_CONSECUTIVE_ERRORS}): #{e.message}")
 
         if @consecutive_errors >= MAX_CONSECUTIVE_ERRORS
-          create_error_message(e.message)
+          create_error_message("trigger_error", error_text: e.message)
           @consecutive_errors = 0
         end
 
@@ -121,9 +121,11 @@ module AgentDaemon
           after_success(item)
         when :timeout
           Log.error("[#{log_tag}] CLI timeout for #{key} (attempt #{attempt_no}/#{@max_attempts})")
+          create_error_message("timeout", work_item: key) if attempt_no >= @max_attempts
           after_failure(item)
         when :failed
           Log.error("[#{log_tag}] CLI failed for #{key} (attempt #{attempt_no}/#{@max_attempts}): #{result.stderr.strip}")
+          create_error_message("cli_failed", work_item: key, error_text: result.stderr) if attempt_no >= @max_attempts
           after_failure(item)
         when :killed
           @attempts[key] -= 1
@@ -156,16 +158,24 @@ module AgentDaemon
 
       # --- Shared helpers ---
 
-      def create_error_message(error_text)
+      def create_error_message(error_type, work_item: nil, error_text: nil)
         FileUtils.mkdir_p(@message_dir)
         filename = "error-#{@name}-#{Time.now.strftime('%Y%m%d%H%M%S%L')}.yml"
         path = ::File.join(@message_dir, filename)
+        message = "Ошибка runner #{@name}: #{error_type}"
+        message += "; work item #{work_item}" if work_item
+        message += "."
+        message += " #{error_text.to_s.strip.slice(0, 500)}" unless error_text.to_s.strip.empty?
         content = {
           "task_key"   => "SYSTEM:#{@name}",
           "summary"    => "Runner #{@name} error",
-          "message"    => "Runner #{@name}: #{error_text.to_s.slice(0, 500)}",
+          "message"    => message,
+          "system_alert" => true,
+          "runner"     => @name,
+          "error_type" => error_type,
           "created_at" => Time.now.iso8601
         }
+        content["work_item"] = work_item if work_item
         ::File.write(path, content.to_yaml)
         Log.warn("[#{log_tag}] Created error message file: #{path}")
       end
