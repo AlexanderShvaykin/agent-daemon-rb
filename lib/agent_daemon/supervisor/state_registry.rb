@@ -36,6 +36,7 @@ module AgentDaemon
     class StateRegistry
       def initialize
         @entries = {}
+        @revision = 0
         @mutex = Mutex.new
       end
 
@@ -55,7 +56,12 @@ module AgentDaemon
             observed_at: Time.now.utc.iso8601,
             observed_monotonic: Process.clock_gettime(Process::CLOCK_MONOTONIC)
           )
+          @revision += 1
         end
+      end
+
+      def revision
+        @mutex.synchronize { @revision }
       end
 
       def snapshot(entity_id)

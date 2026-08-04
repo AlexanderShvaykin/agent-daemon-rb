@@ -25,6 +25,7 @@ class TestConsoleAuth < Minitest::Test
   SessionStore = AgentDaemon::Supervisor::Console::SessionStore
   GitlabOAuth = AgentDaemon::Supervisor::Console::GitlabOAuth
   COOKIE = Auth::COOKIE_NAME
+  PENDING_COOKIE = Auth::PENDING_COOKIE_NAME
 
   class FakeClock
     def initialize(now = 1_000.0)
@@ -49,7 +50,11 @@ class TestConsoleAuth < Minitest::Test
     end
 
     def call(env)
-      @calls << { path: env["PATH_INFO"], session: env["agent_daemon.session"] }
+      @calls << {
+        path: env["PATH_INFO"],
+        session: env["agent_daemon.session"],
+        authorization: env["agent_daemon.authorization"]
+      }
       # No body for HEAD — Rack::Lint enforces it, and the real App obeys the
       # same rule.
       body = env["REQUEST_METHOD"] == "HEAD" ? [] : ["app:#{env['PATH_INFO']}"]
@@ -60,14 +65,15 @@ class TestConsoleAuth < Minitest::Test
   # Collaborator fake for the ONE network seam. `fail_at` makes any stage raise
   # the real GitlabOAuth::Error the production class raises.
   class FakeGitlab
-    attr_accessor :username, :groups, :fail_at, :after_exchange
-    attr_reader :codes, :states
+    attr_accessor :username, :groups, :fail_at, :after_exchange, :before_groups
+    attr_reader :codes, :states, :group_tokens
 
     def initialize(username: "alice", groups: ["backoffice"])
       @username = username
       @groups = groups
       @codes = []
       @states = []
+      @group_tokens = []
     end
 
     def authorize_url(state:)
@@ -79,7 +85,7 @@ class TestConsoleAuth < Minitest::Test
       @codes << code
       boom(:exchange)
       @after_exchange&.call
-      :access_token
+      "oauth-token-secret"
     end
 
     def fetch_username(_token)
@@ -87,7 +93,9 @@ class TestConsoleAuth < Minitest::Test
       @username
     end
 
-    def member_group_paths(_token)
+    def member_group_paths(token)
+      @group_tokens << token
+      @before_groups&.call
       boom(:member_group_paths)
       @groups
     end
@@ -139,9 +147,22 @@ class TestConsoleAuth < Minitest::Test
     { "HTTP_COOKIE" => "#{COOKIE}=#{id}" }
   end
 
-  def cookie_id(response)
-    value = response.cookie(COOKIE)&.value&.first.to_s
+  def cookie_id(response, name = COOKIE)
+    value = response.cookie(name)&.value&.first.to_s
     value.empty? ? nil : value
+  end
+
+  def pending_cookie_id(response) = cookie_id(response, PENDING_COOKIE)
+
+  def with_pending_cookie(id)
+    { "HTTP_COOKIE" => "#{PENDING_COOKIE}=#{id}" }
+  end
+
+  def with_cookies(auth_id: nil, pending_id: nil)
+    values = []
+    values << "#{COOKIE}=#{auth_id}" if auth_id
+    values << "#{PENDING_COOKIE}=#{pending_id}" if pending_id
+    { "HTTP_COOKIE" => values.join("; ") }
   end
 
   def set_cookie_header(response)
@@ -159,9 +180,9 @@ class TestConsoleAuth < Minitest::Test
   # Drives a full real login and returns the authenticated session cookie id.
   def login!
     started = @stack.get("/auth/login")
-    pending_id = cookie_id(started)
+    pending_id = pending_cookie_id(started)
     state = query_params(started.headers["location"])["state"]
-    callback = @stack.get("/auth/callback?code=the-code&state=#{Rack::Utils.escape(state)}", with_cookie(pending_id))
+    callback = @stack.get("/auth/callback?code=the-code&state=#{Rack::Utils.escape(state)}", with_pending_cookie(pending_id))
     [callback, pending_id, cookie_id(callback)]
   end
 
@@ -237,7 +258,7 @@ class TestConsoleAuth < Minitest::Test
     response = stack.get("/fleet")
 
     assert_equal 302, response.status
-    assert_equal "/auth/login", response.headers["location"]
+    assert_equal "/auth/login?return_to=%2Ffleet", response.headers["location"]
     assert_empty future_app.calls, "an unauthenticated request must never reach the app"
   end
 
@@ -245,7 +266,15 @@ class TestConsoleAuth < Minitest::Test
     response = @stack.get("/")
 
     assert_equal 302, response.status
-    assert_equal "/auth/login", response.headers["location"]
+    assert_equal "/auth/login?return_to=%2F", response.headers["location"]
+    assert_empty @app.calls
+  end
+
+  def test_unauthenticated_events_request_streams_no_bytes
+    response = @stack.get("/events", "rack.hijack?" => true)
+
+    assert_equal 302, response.status
+    assert_equal "", response.body
     assert_empty @app.calls
   end
 
@@ -279,10 +308,10 @@ class TestConsoleAuth < Minitest::Test
     refute_nil state
     assert_operator state.length, :>=, 32
 
-    pending = @sessions.fetch(cookie_id(response))
+    pending = @sessions.fetch(pending_cookie_id(response))
     refute_nil pending, "the pending session must be retrievable by the cookie id"
     assert_equal :pending, pending.kind
-    assert_equal state, pending.state
+    assert_equal [state], pending.states.keys
   end
 
   def test_each_login_mints_a_fresh_state
@@ -336,26 +365,228 @@ class TestConsoleAuth < Minitest::Test
     assert_equal 200, response.status
     assert_equal 1, @app.calls.size
     assert_equal "alice", @app.calls.first[:session].username
+    refute_respond_to @app.calls.first[:session], :access_token
+    assert_respond_to @app.calls.first[:authorization], :call
+  end
+
+  def test_access_token_stays_server_side_and_out_of_cookie_body_and_logs
+    prior = AgentDaemon::Log.instance_variable_get(:@logger)
+    log_io = StringIO.new
+    AgentDaemon::Log.use(Logger.new(log_io))
+
+    response, _pending_id, session_id = login!
+    session = @sessions.fetch(session_id)
+
+    assert_equal "oauth-token-secret", session.access_token
+    refute_includes set_cookie_header(response), "oauth-token-secret"
+    refute_includes response.body, "oauth-token-secret"
+
+    page = @stack.get("/", with_cookie(session_id))
+    refute_includes page.body, "oauth-token-secret"
+    refute_includes log_io.string, "oauth-token-secret"
+  ensure
+    AgentDaemon::Log.instance_variable_set(:@logger, prior)
+  end
+
+  def test_authorization_callable_observes_expiry_logout_group_loss_and_lookup_failure
+    _response, _pending_id, session_id = login!
+    @stack.get("/", with_cookie(session_id))
+    authorization = @app.calls.last[:authorization]
+
+    assert authorization.call
+    @clock.advance(60)
+    @gitlab.groups = ["other"]
+    refute authorization.call
+    assert_nil @sessions.fetch(session_id)
+
+    _response, _pending_id, expiring_id = login!
+    @stack.get("/", with_cookie(expiring_id))
+    expiring = @app.calls.last[:authorization]
+    @clock.advance(TTL)
+    refute expiring.call
+
+    _response, _pending_id, logout_id = login!
+    @stack.get("/", with_cookie(logout_id))
+    logged_out = @app.calls.last[:authorization]
+    @sessions.destroy(logout_id)
+    refute logged_out.call
+
+    _response, _pending_id, failing_id = login!
+    @stack.get("/", with_cookie(failing_id))
+    failing = @app.calls.last[:authorization]
+    @clock.advance(60)
+    @gitlab.fail_at = :member_group_paths
+    refute failing.call
+    assert_nil @sessions.fetch(failing_id)
+  end
+
+  def test_group_verification_is_shared_for_sixty_seconds
+    _response, _pending_id, session_id = login!
+    @stack.get("/", with_cookie(session_id))
+    authorization = @app.calls.last[:authorization]
+    login_lookups = @gitlab.group_tokens.size
+
+    3.times { assert authorization.call }
+    @clock.advance(59)
+    assert authorization.call
+    assert_equal login_lookups, @gitlab.group_tokens.size
+
+    @clock.advance(1)
+    assert authorization.call
+    assert_equal login_lookups + 1, @gitlab.group_tokens.size
+    assert authorization.call
+    assert_equal login_lookups + 1, @gitlab.group_tokens.size
+  end
+
+  def test_two_stream_authorizers_share_one_due_gitlab_lookup_and_result
+    _response, _pending_id, session_id = login!
+    @stack.get("/", with_cookie(session_id))
+    first = @app.calls.last[:authorization]
+    @stack.get("/", with_cookie(session_id))
+    second = @app.calls.last[:authorization]
+    login_lookups = @gitlab.group_tokens.size
+    @clock.advance(60)
+
+    entered = Queue.new
+    release = Queue.new
+    @gitlab.before_groups = lambda do
+      entered << true
+      release.pop
+    end
+    first_thread = Thread.new { first.call }
+    entered.pop
+    second_thread = Thread.new { second.call }
+    100.times { Thread.pass }
+    2.times { release << true }
+
+    assert first_thread.value
+    assert second_thread.value
+    assert_equal login_lookups + 1, @gitlab.group_tokens.size
+  end
+
+  def test_two_login_tabs_coexist_and_successful_relogin_rotates_only_the_replaced_auth_session
+    first = @stack.get("/auth/login")
+    pending_id = pending_cookie_id(first)
+    first_state = query_params(first.headers["location"])["state"]
+    second = @stack.get("/auth/login", with_pending_cookie(pending_id))
+    assert_equal pending_id, pending_cookie_id(second)
+    second_state = query_params(second.headers["location"])["state"]
+
+    first_callback = @stack.get(
+      "/auth/callback?code=first&state=#{Rack::Utils.escape(first_state)}",
+      with_pending_cookie(pending_id)
+    )
+    first_auth_id = cookie_id(first_callback)
+    refute_nil @sessions.fetch(first_auth_id)
+
+    second_callback = @stack.get(
+      "/auth/callback?code=second&state=#{Rack::Utils.escape(second_state)}",
+      with_cookies(auth_id: first_auth_id, pending_id: pending_id)
+    )
+    second_auth_id = cookie_id(second_callback)
+
+    assert_nil @sessions.fetch(first_auth_id), "successful re-login must revoke the id it replaces"
+    refute_nil @sessions.fetch(second_auth_id)
+    assert_equal 403, @stack.get(
+      "/auth/callback?code=replay&state=#{Rack::Utils.escape(first_state)}",
+      with_pending_cookie(pending_id)
+    ).status
+  end
+
+  def test_failure_in_one_login_tab_does_not_consume_the_other_state
+    first = @stack.get("/auth/login")
+    pending_id = pending_cookie_id(first)
+    first_state = query_params(first.headers["location"])["state"]
+    second = @stack.get("/auth/login", with_pending_cookie(pending_id))
+    second_state = query_params(second.headers["location"])["state"]
+
+    assert_equal 403, @stack.get(
+      "/auth/callback?state=#{Rack::Utils.escape(first_state)}",
+      with_pending_cookie(pending_id)
+    ).status
+    assert_equal 302, @stack.get(
+      "/auth/callback?code=ok&state=#{Rack::Utils.escape(second_state)}",
+      with_pending_cookie(pending_id)
+    ).status
+  end
+
+  def test_starting_login_while_authenticated_keeps_the_old_session_until_successful_rotation
+    _response, _pending_id, old_id = login!
+
+    started = @stack.get("/auth/login?return_to=%2Fentity", with_cookie(old_id))
+    pending_id = pending_cookie_id(started)
+    state = query_params(started.headers["location"])["state"]
+
+    refute_nil @sessions.fetch(old_id), "starting OAuth must not orphan the authenticated session"
+    assert_equal 200, @stack.get("/", with_cookie(old_id)).status
+    assert_includes set_cookie_header(started), PENDING_COOKIE
+    refute_match(/\A#{Regexp.escape(COOKIE)}=/, set_cookie_header(started))
+
+    callback = @stack.get(
+      "/auth/callback?code=relogin&state=#{Rack::Utils.escape(state)}",
+      with_cookies(auth_id: old_id, pending_id: pending_id)
+    )
+    new_id = cookie_id(callback)
+
+    assert_equal "/entity", callback.headers["location"]
+    assert_nil @sessions.fetch(old_id)
+    refute_nil @sessions.fetch(new_id)
+  end
+
+  def test_deep_link_return_is_preserved_and_hostile_or_auth_loop_targets_fall_back_to_root
+    redirect = @stack.get("/entity?id=runner%3Awf%3Aalpha")
+    assert_equal "/auth/login?return_to=%2Fentity%3Fid%3Drunner%253Awf%253Aalpha", redirect.headers["location"]
+
+    started = @stack.get(redirect.headers["location"])
+    pending_id = pending_cookie_id(started)
+    state = query_params(started.headers["location"])["state"]
+    callback = @stack.get(
+      "/auth/callback?code=ok&state=#{Rack::Utils.escape(state)}",
+      with_pending_cookie(pending_id)
+    )
+    assert_equal "/entity?id=runner%3Awf%3Aalpha", callback.headers["location"]
+
+    ["https://evil.example/x", "//evil.example/x", "/auth/login", "/auth/callback", "/auth/logout"].each do |target|
+      fresh_stack!
+      login = @stack.get("/auth/login?return_to=#{Rack::Utils.escape(target)}")
+      state = query_params(login.headers["location"])["state"]
+      result = @stack.get(
+        "/auth/callback?code=ok&state=#{Rack::Utils.escape(state)}",
+        with_pending_cookie(pending_cookie_id(login))
+      )
+      assert_equal "/", result.headers["location"], "hostile return target #{target.inspect}"
+    end
+  end
+
+  def test_mixed_shape_auth_parameters_deny_cleanly
+    started = @stack.get("/auth/login")
+    pending_id = pending_cookie_id(started)
+
+    response = @stack.get("/auth/callback?state=x&state[]=y&code=z", with_pending_cookie(pending_id))
+
+    assert_equal 403, response.status
+    assert_equal "forbidden", response.body
+    refute_nil @sessions.fetch(pending_id)
   end
 
   # --- AC3: state validation ----------------------------------------------
 
-  def test_callback_with_a_mismatched_state_is_forbidden_and_consumes_the_pending
+  def test_callback_with_a_mismatched_state_is_forbidden_and_preserves_other_pending_states
     started = @stack.get("/auth/login")
-    pending_id = cookie_id(started)
+    pending_id = pending_cookie_id(started)
 
-    response = @stack.get("/auth/callback?code=c&state=wrong", with_cookie(pending_id))
+    response = @stack.get("/auth/callback?code=c&state=wrong", with_pending_cookie(pending_id))
 
     assert_equal 403, response.status
-    assert_nil @sessions.fetch(pending_id), "a failed callback must consume the pending session"
-    assert expired_cookie?(response), "a denied callback must clear the cookie"
+    refute_nil @sessions.fetch(pending_id), "a callback may consume only its matching state"
+    assert_nil response.headers["set-cookie"], "other pending tabs must keep their cookie"
     assert_empty @gitlab.codes, "the code must never be exchanged when state fails"
     assert_empty @app.calls
   end
 
   def test_callback_without_a_state_parameter_is_forbidden
     started = @stack.get("/auth/login")
-    response = @stack.get("/auth/callback?code=c", with_cookie(cookie_id(started)))
+    response = @stack.get("/auth/callback?code=c", with_pending_cookie(pending_cookie_id(started)))
 
     assert_equal 403, response.status
     assert_empty @gitlab.codes
@@ -401,14 +632,14 @@ class TestConsoleAuth < Minitest::Test
   # that consumes the pending session, leaving its `state` replayable.
   def test_a_hostile_query_string_denies_instead_of_raising
     started = @stack.get("/auth/login")
-    pending_id = cookie_id(started)
+    pending_id = pending_cookie_id(started)
 
     flood = (1..5_000).map { |i| "p#{i}=1" }.join("&")
-    response = @stack.get("/auth/callback?#{flood}", with_cookie(pending_id))
+    response = @stack.get("/auth/callback?#{flood}", with_pending_cookie(pending_id))
 
     assert_equal 403, response.status
-    assert_nil @sessions.fetch(pending_id), "the pending state must still be consumed"
-    assert_equal 0, @sessions.size
+    refute_nil @sessions.fetch(pending_id), "a malformed callback cannot identify a matching state to consume"
+    assert_equal 1, @sessions.size
     assert_empty @app.calls
   end
 
@@ -416,20 +647,20 @@ class TestConsoleAuth < Minitest::Test
   # second session.
   def test_a_replayed_callback_is_forbidden
     started = @stack.get("/auth/login")
-    pending_id = cookie_id(started)
+    pending_id = pending_cookie_id(started)
     state = query_params(started.headers["location"])["state"]
     url = "/auth/callback?code=the-code&state=#{Rack::Utils.escape(state)}"
 
-    assert_equal 302, @stack.get(url, with_cookie(pending_id)).status
-    assert_equal 403, @stack.get(url, with_cookie(pending_id)).status
+    assert_equal 302, @stack.get(url, with_pending_cookie(pending_id)).status
+    assert_equal 403, @stack.get(url, with_pending_cookie(pending_id)).status
   end
 
   def test_callback_without_a_code_is_forbidden
     started = @stack.get("/auth/login")
-    pending_id = cookie_id(started)
+    pending_id = pending_cookie_id(started)
     state = query_params(started.headers["location"])["state"]
 
-    response = @stack.get("/auth/callback?state=#{Rack::Utils.escape(state)}", with_cookie(pending_id))
+    response = @stack.get("/auth/callback?state=#{Rack::Utils.escape(state)}", with_pending_cookie(pending_id))
 
     assert_equal 403, response.status
     assert_empty @gitlab.codes
@@ -437,11 +668,11 @@ class TestConsoleAuth < Minitest::Test
 
   def test_an_expired_pending_session_cannot_complete_a_login
     started = @stack.get("/auth/login")
-    pending_id = cookie_id(started)
+    pending_id = pending_cookie_id(started)
     state = query_params(started.headers["location"])["state"]
     @clock.advance(SessionStore::PENDING_TTL)
 
-    response = @stack.get("/auth/callback?code=c&state=#{Rack::Utils.escape(state)}", with_cookie(pending_id))
+    response = @stack.get("/auth/callback?code=c&state=#{Rack::Utils.escape(state)}", with_pending_cookie(pending_id))
 
     assert_equal 403, response.status
     assert_equal 0, @sessions.size
@@ -451,11 +682,11 @@ class TestConsoleAuth < Minitest::Test
   # pending session can expire between the state check and the promotion.
   def test_a_pending_session_expiring_mid_flight_denies_the_login
     started = @stack.get("/auth/login")
-    pending_id = cookie_id(started)
+    pending_id = pending_cookie_id(started)
     state = query_params(started.headers["location"])["state"]
     @gitlab.after_exchange = -> { @clock.advance(SessionStore::PENDING_TTL) }
 
-    response = @stack.get("/auth/callback?code=c&state=#{Rack::Utils.escape(state)}", with_cookie(pending_id))
+    response = @stack.get("/auth/callback?code=c&state=#{Rack::Utils.escape(state)}", with_pending_cookie(pending_id))
 
     assert_equal 403, response.status
     assert_equal 0, @sessions.size, "no session may be minted from an expired login"
@@ -468,10 +699,10 @@ class TestConsoleAuth < Minitest::Test
       fresh_stack!
       @gitlab.fail_at = stage
       started = @stack.get("/auth/login")
-      pending_id = cookie_id(started)
+      pending_id = pending_cookie_id(started)
       state = query_params(started.headers["location"])["state"]
 
-      response = @stack.get("/auth/callback?code=c&state=#{Rack::Utils.escape(state)}", with_cookie(pending_id))
+      response = @stack.get("/auth/callback?code=c&state=#{Rack::Utils.escape(state)}", with_pending_cookie(pending_id))
 
       assert_equal 403, response.status, "#{stage} failure must deny"
       assert_nil @sessions.fetch(pending_id)
@@ -579,7 +810,7 @@ class TestConsoleAuth < Minitest::Test
     response = @stack.get("/", with_cookie(session_id))
 
     assert_equal 302, response.status
-    assert_equal "/auth/login", response.headers["location"]
+    assert_equal "/auth/login?return_to=%2F", response.headers["location"]
     assert_equal 1, @app.calls.size, "the expired request must not reach the app"
   end
 
@@ -590,7 +821,7 @@ class TestConsoleAuth < Minitest::Test
     payload = "<script>alert(1)</script>"
 
     response = @stack.get("/auth/callback?code=#{Rack::Utils.escape(payload)}&state=#{Rack::Utils.escape(payload)}",
-                          with_cookie(cookie_id(started)))
+                          with_pending_cookie(pending_cookie_id(started)))
 
     assert_equal 403, response.status
     refute_includes response.body, "script"

@@ -7,6 +7,7 @@ require "rack"
 require "agent_daemon/supervisor/console/app"
 require "agent_daemon/supervisor/console/auth"
 require "agent_daemon/supervisor/console/session_store"
+require "agent_daemon/supervisor/console/live_updates"
 require "agent_daemon/supervisor/fleet"
 require "agent_daemon/supervisor/state_registry"
 require "agent_daemon/supervisor/runner_identity"
@@ -29,6 +30,7 @@ class TestConsoleApp < Minitest::Test
   ActivityLog = AgentDaemon::Supervisor::ActivityLog
   EventBus = AgentDaemon::Supervisor::EventBus
   GenerationStamp = AgentDaemon::Supervisor::GenerationStamp
+  LiveUpdates = AgentDaemon::Supervisor::Console::LiveUpdates
 
   def setup
     @registry = StateRegistry.new
@@ -37,15 +39,27 @@ class TestConsoleApp < Minitest::Test
     @sessions = SessionStore.new(ttl: 3_600)
   end
 
-  def build_app(fleet, activity_log: ActivityLog.new(event_bus: EventBus.new))
-    Rack::MockRequest.new(Rack::Lint.new(App.new(fleet: fleet, activity_log: activity_log)))
+  def build_app(fleet, activity_log: ActivityLog.new(event_bus: EventBus.new),
+                live_updates: LiveUpdates.new(event_bus: EventBus.new, state_registry: StateRegistry.new))
+    Rack::MockRequest.new(Rack::Lint.new(App.new(fleet: fleet, activity_log: activity_log, live_updates: live_updates)))
   end
 
   # A real, freshly promoted session — the same object the middleware puts in
   # env, not a hand-rolled stand-in (AI-1).
   def session_for(username)
     pending = @sessions.create_pending(state: "s")
+    @sessions.claim_pending(pending.id, "s")
     @sessions.promote(pending.id, username: username)
+  end
+
+  # The page carries exactly one intentional <script>: the static live-update
+  # constant. Strip that one known-static block and NOTHING may reintroduce a
+  # script token — the class-level guard that predates the SSE work, restored
+  # rather than narrowed to whichever payload a test happens to inject.
+  def inert_body(body)
+    stripped = body.sub(App::LIVE_SCRIPT, "")
+    refute_includes stripped, "<script", "the live-update script must be the page's only <script> block"
+    stripped
   end
 
   def get(path, username: "alice", session: :build)
@@ -108,7 +122,7 @@ class TestConsoleApp < Minitest::Test
     response = get("/", username: "<script>alert(1)</script>")
 
     assert_equal 200, response.status
-    refute_includes response.body, "<script>"
+    refute_includes inert_body(response.body), "<script"
     assert_includes response.body, "&lt;script&gt;"
   end
 
@@ -128,7 +142,7 @@ class TestConsoleApp < Minitest::Test
 
     body = get("/", session: session).body
 
-    refute_includes body, "<script>"
+    refute_includes inert_body(body), "<script"
     assert_includes body, "&lt;script&gt;"
   end
 
@@ -153,6 +167,93 @@ class TestConsoleApp < Minitest::Test
   def test_non_get_requests_are_not_found
     assert_equal 404, @app.post("/").status
     assert_equal 404, @app.post("/healthz").status
+  end
+
+  def test_authenticated_pages_have_a_stable_live_content_region_and_static_refresh_script
+    body = get("/").body
+
+    assert_equal 1, body.scan('<main id="console-content">').size
+    assert_equal 1, body.scan('new EventSource("/events")').size
+    assert_includes body, 'source.addEventListener("open", refreshContent)'
+    assert_includes body, 'source.addEventListener("refresh", refreshContent)'
+    assert_includes body, 'source.addEventListener("authorization_lost"'
+    assert_includes body, 'fetch(window.location.href, { credentials: "same-origin" })'
+    assert_includes body, 'response.headers.get("content-type")'
+    assert_includes body, 'document.querySelector("#console-content")'
+    assert_includes body, "current.replaceWith(replacement)"
+    assert_includes body, "dirty = true"
+    assert_includes body, "source.close()"
+    refute_includes body, "innerHTML"
+
+    # A CLOSED EventSource is fatal per the SSE specification — the browser
+    # will not reconnect — so the page must leave for login rather than sit on
+    # state that stopped updating while still looking live.
+    assert_includes body, 'source.addEventListener("error"'
+    assert_includes body, "EventSource.CLOSED"
+
+    # pagehide also fires into the back/forward cache. A one-shot listener plus
+    # no pageshow is how Back restores a page whose stream is closed forever.
+    assert_includes body, 'window.addEventListener("pageshow"'
+    assert_includes body, "event.persisted"
+    refute_includes body, "{ once: true }"
+  end
+
+  def test_head_for_authenticated_pages_is_bodiless
+    session = session_for("alice")
+    env = { Auth::SESSION_ENV_KEY => session }
+
+    root = @app.request("HEAD", "/", env)
+    assert_equal 200, root.status
+    assert_empty root.body
+
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new))
+    detail = app.request("HEAD", "/entity?id=runner%3Awf%3Aalpha", env)
+    assert_equal 200, detail.status
+    assert_empty detail.body
+  end
+
+  def test_events_uses_partial_hijack_with_exact_headers_and_fixed_frames
+    bus = EventBus.new
+    registry = StateRegistry.new
+    live_updates = LiveUpdates.new(event_bus: bus, state_registry: registry, wait: ->(_seconds) {})
+    raw_app = App.new(fleet: @fleet, activity_log: ActivityLog.new(event_bus: bus), live_updates: live_updates)
+    env = Rack::MockRequest.env_for(
+      "/events",
+      "rack.hijack?" => true,
+      Auth::AUTHORIZATION_ENV_KEY => -> { false }
+    )
+
+    status, headers, body = raw_app.call(env)
+
+    assert_equal 200, status
+    assert_equal "text/event-stream; charset=utf-8", headers["content-type"]
+    assert_equal "no-cache, no-store", headers["cache-control"]
+    assert_equal "no", headers["x-accel-buffering"]
+    assert_respond_to headers["rack.hijack"], :call
+    assert_empty body
+
+    io = StringIO.new
+    headers["rack.hijack"].call(io)
+    assert_includes io.string, "event: refresh\n"
+    assert_includes io.string, "event: authorization_lost\n"
+  end
+
+  def test_events_fails_closed_without_partial_hijack_and_rejects_other_verbs
+    unavailable = get("/events")
+    assert_equal 503, unavailable.status
+    assert_equal "streaming unavailable", unavailable.body
+
+    response = @app.post("/events")
+    assert_equal 405, response.status
+    assert_equal "method not allowed", response.body
+
+    # Rack::Lint fails the request if a HEAD response carries a body, which is
+    # the same RFC 9110 rule / and /entity already honour.
+    head = @app.request("HEAD", "/events")
+    assert_equal 405, head.status
+    assert_empty head.body
   end
 
   # The page embeds the session's CSRF token and the username, so a shared
@@ -321,7 +422,7 @@ class TestConsoleApp < Minitest::Test
 
     body = get_on(app, "/").body
 
-    refute_includes body, "<script>"
+    refute_includes inert_body(body), "<script"
     assert_includes body, "&lt;script&gt;"
   end
 

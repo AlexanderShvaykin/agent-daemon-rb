@@ -8,6 +8,7 @@ require_relative "../../log"
 require_relative "app"
 require_relative "auth"
 require_relative "gitlab_oauth"
+require_relative "live_updates"
 require_relative "session_store"
 
 module AgentDaemon
@@ -30,9 +31,16 @@ module AgentDaemon
         # thread that was serving in-flight requests.
         STOP_TIMEOUT = 5
 
+        # Puma's own stop can consume the whole budget, and Thread#join(0)
+        # returns nil immediately even for a thread microseconds from exiting
+        # — which would warn about a deadline the thread never got, then drop
+        # the reference to a thread that is still running.
+        JOIN_FLOOR = 0.5
+
         attr_reader :port
 
-        def initialize(console_config, fleet:, activity_log:, log_writer: Puma::LogWriter.stdio)
+        def initialize(console_config, fleet:, activity_log:, event_bus:, state_registry:,
+                       log_writer: Puma::LogWriter.stdio)
           @bind = console_config.fetch("bind")
           @port = console_config.fetch("port")
           @max_threads = console_config.fetch("max_threads")
@@ -42,10 +50,15 @@ module AgentDaemon
           @auth_config = console_config.fetch("auth")
           @fleet = fleet
           @activity_log = activity_log
+          @live_updates = LiveUpdates.new(event_bus: event_bus, state_registry: state_registry)
           @log_writer = log_writer
         end
 
         def start
+          # #stop latches the stream loop for the drain; this object is
+          # re-enterable, so a restarted console must un-latch it or every
+          # stream it accepts would close on its first iteration.
+          @live_updates.resume!
           @server = Puma::Server.new(app, nil, {
                                        min_threads: 0,
                                        # Must exceed the peak count of concurrent
@@ -85,9 +98,13 @@ module AgentDaemon
         def stop
           return unless @server
 
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          @live_updates.stop!
           @server.stop(true)
-          if @thread && !@thread.join(STOP_TIMEOUT)
-            Log.warn("[Console] server thread did not finish within #{STOP_TIMEOUT}s")
+          remaining = [STOP_TIMEOUT - (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started), JOIN_FLOOR].max
+          if @thread && !@thread.join(remaining)
+            waited = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).round(1)
+            Log.warn("[Console] server thread did not finish within #{waited}s")
           end
           @server = nil
           @thread = nil
@@ -115,11 +132,18 @@ module AgentDaemon
           @thread = nil
         end
 
+        # Memoized: the store IS the session state. Building it twice would
+        # silently invalidate every live session, so the single-construction
+        # contract is enforced here rather than left to call order.
         def app
-          sessions = SessionStore.new(ttl: @session_ttl)
+          @app ||= build_app
+        end
+
+        def build_app
+          @sessions = SessionStore.new(ttl: @session_ttl)
           Auth.new(
-            App.new(fleet: @fleet, activity_log: @activity_log),
-            sessions: sessions,
+            App.new(fleet: @fleet, activity_log: @activity_log, live_updates: @live_updates),
+            sessions: @sessions,
             gitlab: gitlab,
             allowed_groups: @auth_config.fetch("allowed_groups"),
             secure_cookies: @secure_cookies

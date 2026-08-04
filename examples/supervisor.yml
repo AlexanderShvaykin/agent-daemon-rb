@@ -35,7 +35,9 @@ workflows:
 #                          # in front rather than binding this to 0.0.0.0.
 #   port: 9292             # default 9292
 #   max_threads: 16        # default 16 — must stay ABOVE the peak number of
-#                          # concurrent live views; each one parks a thread.
+#                          # concurrent SSE views; each one parks a thread.
+#                          # For the supported <10 viewers, 16 leaves headroom
+#                          # for HTML, OAuth, health and reconnect requests.
 #   session_ttl: 28800     # default 28800 (8 hours), in seconds
 #   secure_cookies: true   # default true; set false ONLY for plain-HTTP local dev
 #   base_url: https://console.example.com   # REQUIRED — the public origin of this
@@ -73,3 +75,17 @@ workflows:
 # (/auth/login, /auth/callback) are necessarily reachable without a session
 # too, but they are answered by the auth middleware and never reach the app.
 # Everything else requires a GitLab login.
+#
+# Authenticated pages open GET /events using SSE. The server revalidates the
+# local session every 250 ms and GitLab group membership at most once per
+# session per 60 s; lookup failure or group loss revokes the session. The
+# stream sends fixed refresh invalidations and an approximately 15 s comment
+# heartbeat. A reverse proxy must disable response buffering for /events
+# (the app also sends X-Accel-Buffering: no) and must permit long-lived
+# text/event-stream responses. On reconnect the browser fetches the current
+# page, so gaps are repaired from current state plus bounded in-memory events.
+#
+# Exact unauthenticated boundary: GET/HEAD /healthz serves the bare probe;
+# GET /auth/login and GET /auth/callback are handled by Auth; POST /auth/logout
+# still requires an authenticated session and CSRF token. /events is never
+# public.

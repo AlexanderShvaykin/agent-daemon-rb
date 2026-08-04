@@ -23,6 +23,19 @@ class TestStateRegistry < Minitest::Test
 
   # --- AC1/AC2: generation compare-and-set --------------------------------
 
+  def test_revision_advances_only_for_accepted_publications
+    assert_equal 0, @registry.revision
+
+    @registry.publish("ent-1", { status: :waiting, generation: 2 })
+    assert_equal 1, @registry.revision
+
+    @registry.publish("ent-1", { status: :running, generation: 1 })
+    assert_equal 1, @registry.revision, "a stale generation must not announce a state change"
+
+    @registry.publish("ent-1", { status: :in_progress, generation: 2 })
+    assert_equal 2, @registry.revision, "an equal-generation overwrite is accepted"
+  end
+
   # The retro's stale-state defect: a dying instance's :in_progress and the
   # master thread's :crashed publish arrive on the SAME generation. Equal
   # generation must be accepted (last write wins), or the console shows a
@@ -129,5 +142,29 @@ class TestStateRegistry < Minitest::Test
 
   def test_snapshot_returns_nil_for_unknown_entity
     assert_nil @registry.snapshot("never-published")
+  end
+
+  def test_concurrent_publishes_and_reads_return_complete_mutex_protected_snapshots
+    @registry.publish("ent-1", { status: :waiting, generation: 1 })
+    errors = Queue.new
+    publisher = Thread.new do
+      500.times do |index|
+        @registry.publish("ent-1", { status: index.even? ? :waiting : :running, generation: 1 })
+      end
+    end
+    readers = Array.new(4) do
+      Thread.new do
+        500.times do
+          snapshot = @registry.snapshot("ent-1")
+          errors << snapshot unless %i[waiting running].include?(snapshot[:status]) &&
+                                    snapshot[:observed_at] && snapshot[:observed_monotonic]
+        end
+      end
+    end
+
+    ([publisher] + readers).each(&:join)
+
+    assert errors.empty?, "observed an incomplete concurrent snapshot: #{errors.pop.inspect unless errors.empty?}"
+    assert_equal 501, @registry.revision
   end
 end

@@ -50,6 +50,82 @@ module AgentDaemon
         ACTIVITY_NOTE = '<p class="activity-note">Recent activity only — the event buffer is bounded and ' \
                          "does not survive a supervisor restart.</p>"
 
+        LIVE_SCRIPT = <<~HTML.freeze
+          <script>
+          (() => {
+            let source = null;
+            let refreshing = false;
+            let dirty = false;
+
+            async function fetchAndReplace() {
+              const response = await fetch(window.location.href, { credentials: "same-origin" });
+              const contentType = response.headers.get("content-type") || "";
+              if (!response.ok || !contentType.startsWith("text/html")) return;
+
+              const parsed = new DOMParser().parseFromString(await response.text(), "text/html");
+              const replacement = parsed.querySelector("#console-content");
+              const current = document.querySelector("#console-content");
+              if (replacement && current) current.replaceWith(replacement);
+            }
+
+            async function refreshContent() {
+              if (refreshing) {
+                dirty = true;
+                return;
+              }
+
+              refreshing = true;
+              try {
+                do {
+                  dirty = false;
+                  try { await fetchAndReplace(); } catch (_) {}
+                } while (dirty);
+              } finally {
+                refreshing = false;
+              }
+            }
+
+            function toLogin() {
+              if (source) source.close();
+              source = null;
+              const returnPath = window.location.pathname + window.location.search;
+              const login = new URL("/auth/login", window.location.origin);
+              login.searchParams.set("return_to", returnPath);
+              window.location.assign(login.pathname + login.search);
+            }
+
+            function connect() {
+              if (source) return;
+              source = new EventSource("/events");
+              source.addEventListener("open", refreshContent);
+              source.addEventListener("refresh", refreshContent);
+              source.addEventListener("authorization_lost", toLogin);
+              // A CLOSED EventSource is fatal per the SSE specification: the
+              // browser will not reconnect on its own. That is what an expired
+              // session looks like once the socket is already down — /events
+              // answers with a redirect, not text/event-stream. Without this
+              // the page would sit on stale state looking live forever.
+              source.addEventListener("error", () => {
+                if (source && source.readyState === EventSource.CLOSED) toLogin();
+              });
+            }
+
+            connect();
+            // pagehide also fires when the page enters the back/forward cache,
+            // so the listener must stay registered and pageshow must re-open —
+            // otherwise pressing Back restores a live-looking page with a
+            // closed stream that never updates again.
+            window.addEventListener("pagehide", () => {
+              if (source) source.close();
+              source = null;
+            });
+            window.addEventListener("pageshow", (event) => {
+              if (event.persisted) connect();
+            });
+          })();
+          </script>
+        HTML
+
         # Rack raises out of query parsing for a string that exceeds its
         # depth/count limits, carries a bad encoding, or mixes a scalar and an
         # array under one key (?id=1&id[]=2) — the id arrives on a path a
@@ -58,9 +134,10 @@ module AgentDaemon
         # enumerating the leaf classes is what let ParameterTypeError through.
         PARAM_ERRORS = [Rack::BadRequest].freeze
 
-        def initialize(fleet:, activity_log:)
+        def initialize(fleet:, activity_log:, live_updates:)
           @fleet = fleet
           @activity_log = activity_log
+          @live_updates = live_updates
         end
 
         def call(env)
@@ -70,8 +147,9 @@ module AgentDaemon
           # HEAD is how most liveness probes ask; the middleware lets it through
           # on this path for the same reason.
           when "/healthz" then probe(request)
-          when "/"        then request.get? ? home(env[Auth::SESSION_ENV_KEY]) : not_found
-          when "/entity"  then request.get? ? entity_detail(request, env[Auth::SESSION_ENV_KEY]) : not_found
+          when "/"        then page_request?(request) ? home(request, env[Auth::SESSION_ENV_KEY]) : not_found
+          when "/entity"  then page_request?(request) ? entity_detail(request, env[Auth::SESSION_ENV_KEY]) : not_found
+          when "/events"  then events(request, env)
           else                 not_found
           end
         rescue StandardError => e
@@ -98,8 +176,8 @@ module AgentDaemon
         # middleware, which the server never does. Render rather than raise: an
         # access decision here would be exactly the auth code this app must not
         # contain.
-        def home(session)
-          [200, HTML_HEADERS.dup, [layout(session, fleet_html)]]
+        def home(request, session)
+          html(request, layout(session, fleet_html))
         end
 
         # GET /entity?id=<entity id>. A query parameter, not a path segment —
@@ -114,7 +192,34 @@ module AgentDaemon
           entry = @fleet.find(id)
           return not_found unless entry
 
-          [200, HTML_HEADERS.dup, [layout(session, entity_page(entry))]]
+          html(request, layout(session, entity_page(entry)))
+        end
+
+        def page_request?(request)
+          request.get? || request.head?
+        end
+
+        def html(request, body)
+          [200, HTML_HEADERS.dup, request.head? ? [] : [body]]
+        end
+
+        # SSE is GET-only, so every other verb is a 405 — bodiless for HEAD,
+        # which must carry no body per RFC 9110 exactly as / and /entity do.
+        def events(request, env)
+          return [405, TEXT_HEADERS.dup, request.head? ? [] : ["method not allowed"]] unless request.get?
+
+          authorized = env[Auth::AUTHORIZATION_ENV_KEY]
+          unless env["rack.hijack?"] && authorized.respond_to?(:call)
+            return [503, TEXT_HEADERS.dup, ["streaming unavailable"]]
+          end
+
+          headers = {
+            "content-type" => "text/event-stream; charset=utf-8",
+            "cache-control" => "no-cache, no-store",
+            "x-accel-buffering" => "no",
+            "rack.hijack" => ->(io) { @live_updates.stream(io, authorized: authorized) }
+          }
+          [200, headers, []]
         end
 
         # #GET, not #params: the Routing contract is one exact path and one
@@ -154,7 +259,9 @@ module AgentDaemon
             <input type="hidden" name="_csrf" value="#{esc(csrf_token)}">
             <button type="submit">Log out</button>
             </form>
-            #{content}
+            <main id="console-content">
+            #{content}</main>
+            #{LIVE_SCRIPT}
             </body>
             </html>
           HTML

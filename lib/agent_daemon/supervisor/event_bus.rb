@@ -54,10 +54,23 @@ module AgentDaemon
         end
       end
 
-      def subscribe
+      def subscribe(from: :backlog)
         cursor = Cursor.new(self)
-        @mutex.synchronize { @subscribers[cursor] = { position: 0, dropped: 0 } }
-        cursor
+        @mutex.synchronize do
+          position = case from
+                     when :backlog then 0
+                     when :tail then @next_seq - 1
+                     else raise ArgumentError, "unknown subscription start #{from.inspect}"
+                     end
+          @subscribers[cursor] = { position: position, dropped: 0 }
+        end
+        return cursor unless block_given?
+
+        begin
+          yield cursor
+        ensure
+          unsubscribe(cursor)
+        end
       end
 
       def unsubscribe(cursor)

@@ -4,13 +4,11 @@
 
 AgentDaemon is a Ruby daemon that runs one thread per configured runner plus a
 dedicated Messenger thread. Threads communicate exclusively through the
-filesystem (YAML files in a shared directory). The daemon is stdlib-only with
-two exceptions: `eventmachine` and `faye-websocket`. Those two are runtime
-dependencies used *only* by the `mattermost` trigger, which needs a WebSocket
-client to receive @-mentions; rather than hand-roll RFC 6455 over a raw socket,
-that one trigger leans on faye-websocket running inside an EventMachine reactor.
-Everything else — tracker/file triggers, backends, the Messenger and its
-transports — stays on the standard library alone.
+filesystem (YAML files in a shared directory). The core daemon is stdlib-only
+except for `eventmachine` and `faye-websocket`, confined to the `mattermost`
+trigger's WebSocket client. The optional supervisor web console separately owns
+`puma`, `rack`, and `oauth2`; those dependencies are not loaded by
+`require "agent_daemon"` or used outside `lib/agent_daemon/supervisor/console/`.
 
 ## Component Map
 
@@ -307,8 +305,8 @@ not know it exists (see "Dependency isolation" below). The full invariant set
 this subsystem is built against (AD-1…AD-16) is captured in the project's
 internal architecture spine — a planning artifact kept outside this repository,
 not a shipped document; this section describes the shape actually implemented in Epic 1
-— the console, SQLite history, and metrics exporter referenced by later AD
-numbers ship in Epics 2/5/6 and are not part of this codebase yet.
+— the in-memory live console shipped in Epic 2; SQLite history and the metrics
+exporter remain assigned to Epics 5 and 6.
 
 ### Layout
 
@@ -320,6 +318,11 @@ One file per concern under `lib/agent_daemon/supervisor/`:
 | `master.rb`              | Boots and drives every workflow's threads in one process     |
 | `runner_supervisor.rb`   | Per-entity crash/restart state machine (generation tracking) |
 | `runner_identity.rb`     | Composite `(workflow, runner)` identity value object          |
+| `state_registry.rb`      | Generation-CAS current state plus accepted-write revision     |
+| `event_bus.rb`           | Bounded event ring with independent pull cursors               |
+| `fleet.rb`               | Config roster left-joined with current registry state          |
+| `activity_log.rb`        | Per-entity recent events projected from the bounded bus         |
+| `console/`               | Rack/Puma UI, GitLab OAuth sessions and authenticated SSE       |
 
 ### Supervisor config
 
@@ -388,10 +391,64 @@ change, NFR5). The supervisor injects a real `Bundle` per generation
 (`RunnerSupervisor#default_sinks_factory`, gen-stamped via `GenerationStamp`)
 at entity-construction time; the core class being supervised is identical to
 the one the standalone daemon instantiates and never names a supervisor type.
-Today, with no console/history/metrics consumer yet, the injected sinks are
-still the no-op defaults — this seam is what made stories 1.1–1.7 additive
-rather than a core rewrite, and is what Epic 2 hooks a real `StateRegistry`
-into without touching runner/backend/messenger code.
+The standalone daemon keeps the no-op defaults. `Supervisor::Master` instead
+injects its one `StateRegistry` and one `EventBus`, both generation-stamped,
+without touching runner/backend/messenger code. Accepted registry writes
+increment a mutex-protected revision; stale-generation writes do not. The bus
+retains a bounded drop-oldest ring, supports backlog or tail cursors, and keeps
+cursor cleanup exception-safe without producer-thread callbacks.
+
+### Epic 2 read model and console
+
+`Fleet` left-joins the master's immutable configured roster with current
+`StateRegistry` snapshots, so an entity that has never published remains
+visible as unknown. `ActivityLog` projects the newest retained records for one
+entity from `EventBus`; this history is bounded, in-memory, and lost on process
+restart. Neither observer reads runners, threads, or `RunnerSupervisor`.
+
+The optional console is one non-clustered Puma server in the master process.
+`Auth` is a default-deny Rack middleware: `/healthz` (GET/HEAD) is the only
+public app route; `/auth/login` and `/auth/callback` are unauthenticated OAuth
+legs handled inside the middleware, and `/auth/logout` is a CSRF-protected
+POST. Every other route, including `GET /events`, requires a live server-side
+session. GitLab tokens remain in private session records; HTML receives only an
+immutable username/CSRF view. Group membership is rechecked fail-closed at most
+once per session per 60 seconds, with concurrent streams coalesced onto one
+lookup and no store mutex held during network I/O.
+
+That recheck is driven by the live SSE stream, not by page rendering: `Auth`
+publishes the revalidation callable into the Rack environment and `GET /events`
+is its only caller. Page renders (`/`, `/entity`) validate the local session
+only, deliberately — a GitLab round-trip on the render path would put network
+latency in front of every page and would put access-control code inside `App`,
+which owns none by design. Because every rendered page carries the live-update
+script, a browser session loses access within one recheck interval; a client
+that never opens the stream (scripting disabled, a stolen cookie replayed by a
+CLI) keeps its already-issued session until `session_ttl` expires or it is
+destroyed. Shortening that window is a session-TTL decision, not a rendering
+one.
+
+`GET /events` uses Rack partial hijack and emits only fixed SSE invalidations:
+an initial `refresh`, one coalesced `refresh` when the registry revision, event
+cursor, or cursor-loss count changes, an approximately 15-second comment
+heartbeat, and `authorization_lost` before a detected revocation closes the
+stream. The poll interval is 250 ms. Every terminal path closes the IO and
+unsubscribes the tail cursor; server shutdown first stops these loops, then
+stops Puma. Each live stream occupies one Puma request thread, so `max_threads`
+must stay above peak concurrent viewers with headroom for HTML, OAuth, health,
+and reconnect requests.
+
+The browser owns one `EventSource` per page. On open/reconnect and every
+`refresh`, it fetches the current authenticated URL and replaces only
+`<main id="console-content">`; a trailing dirty flag coalesces notifications
+that arrive during a fetch. Server-rendered escaping remains the only HTML
+formatting contract, and a successful reconnect fetch repairs gaps by re-reading
+current registry state plus the retained activity ring rather than promising
+durable replay; a fetch that fails leaves the previous DOM in place until the
+next notification. A stream the browser closes as fatal — which is how an
+expired session appears once the socket is already down, since `/events` then
+answers with a redirect rather than `text/event-stream` — navigates to the login
+path instead of leaving a stale page that still looks live.
 
 ### Centralized, tagged logging
 
@@ -413,17 +470,15 @@ requires no supervisor file and defines no `AgentDaemon::Supervisor` constant.
 `test/test_require_isolation.rb` asserts this in a clean child Ruby process
 (the shared Minitest process is unsuitable: sibling test files already load
 supervisor code into it before this test runs), and asserts by *feature path*
-that none of `sqlite3`/`puma`/`rack`/`oauth2` (the Epic 2/5/6 console/OAuth/
-SQLite stack) are loaded either — those gems are not yet gemspec dependencies,
-so today the check is forward-guarding a boundary that does not yet have
-anything to violate it. `agent_daemon.gemspec` declares `agent-supervisor` as
-a second `executables` entry alongside `agent-daemon`, so both binstubs
-install with the gem.
+that none of `sqlite3`/`puma`/`rack`/`oauth2` are loaded. Puma, Rack and OAuth2
+are installed runtime dependencies for the console but remain lazily isolated;
+SQLite is still forward-guarded for Epic 5. `agent_daemon.gemspec` declares
+`agent-supervisor` as a second executable alongside `agent-daemon`.
 
-**Accepted residual:** isolation is *load-time*, not *install-time* — once
-`sqlite3`/`puma`/`rack`/`oauth2` are added as gemspec dependencies in later
-epics, they are still *installed* on every host that installs this gem, even
-one that only ever runs the standalone `agent-daemon` CLI.
+**Accepted residual:** isolation is *load-time*, not *install-time* —
+`puma`/`rack`/`oauth2` are installed on every host that installs this gem, even
+one that only runs the standalone `agent-daemon` CLI. The same will apply to
+SQLite if Epic 5 adds it.
 
 ## Deployment
 

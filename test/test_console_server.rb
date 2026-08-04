@@ -2,6 +2,7 @@
 
 require "test_helper"
 require "net/http"
+require "socket"
 require "uri"
 
 # AD-5 lazy-require isolation: console files are loaded explicitly here. This
@@ -39,6 +40,10 @@ class TestConsoleServer < Minitest::Test
   def setup
     stub_null_logger!
     @servers = []
+    @state_registry = AgentDaemon::Supervisor::StateRegistry.new
+    @event_bus = AgentDaemon::Supervisor::EventBus.new
+    @fleet = AgentDaemon::Supervisor::Fleet.new(roster: [], state_registry: @state_registry)
+    @activity_log = AgentDaemon::Supervisor::ActivityLog.new(event_bus: @event_bus)
   end
 
   def teardown
@@ -50,16 +55,15 @@ class TestConsoleServer < Minitest::Test
     restore_logger!
   end
 
-  def empty_fleet
-    AgentDaemon::Supervisor::Fleet.new(roster: [], state_registry: AgentDaemon::Supervisor::StateRegistry.new)
-  end
-
-  def empty_activity_log
-    AgentDaemon::Supervisor::ActivityLog.new(event_bus: AgentDaemon::Supervisor::EventBus.new)
-  end
-
   def start_server(config = CONSOLE_CONFIG)
-    server = Server.new(config, fleet: empty_fleet, activity_log: empty_activity_log, log_writer: Puma::LogWriter.strings)
+    server = Server.new(
+      config,
+      fleet: @fleet,
+      activity_log: @activity_log,
+      event_bus: @event_bus,
+      state_registry: @state_registry,
+      log_writer: Puma::LogWriter.strings
+    )
     @servers << server
     server.start
     server
@@ -70,6 +74,50 @@ class TestConsoleServer < Minitest::Test
     Net::HTTP.start(uri.host, uri.port, open_timeout: 2, read_timeout: 2) do |http|
       http.request(Net::HTTP::Get.new(uri, "Cookie" => "irrelevant=1"))
     end
+  end
+
+  def authenticated_session(server)
+    sessions = server.instance_variable_get(:@sessions)
+    pending = sessions.create_pending(state: "integration")
+    sessions.claim_pending(pending.id, "integration")
+    sessions.promote(
+      pending.id,
+      state: "integration",
+      username: "alice",
+      access_token: "server-side-token"
+    )
+  end
+
+  def open_event_stream(server, session_id)
+    socket = TCPSocket.new("127.0.0.1", server.port)
+    socket.write(
+      "GET /events HTTP/1.1\r\n" \
+      "Host: 127.0.0.1\r\n" \
+      "Cookie: #{AgentDaemon::Supervisor::Console::Auth::COOKIE_NAME}=#{session_id}\r\n" \
+      "Connection: close\r\n\r\n"
+    )
+    response = +""
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
+    until response.include?("event: refresh\n")
+      remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      raise "timed out waiting for SSE refresh" unless remaining.positive? && IO.select([socket], nil, nil, remaining)
+
+      response << socket.read_nonblock(4096)
+    end
+    [socket, response]
+  end
+
+  def wait_until(timeout: 2)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    until yield
+      raise "condition not met within #{timeout}s" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      IO.select(nil, nil, nil, 0.01)
+    end
+  end
+
+  def subscriber_count
+    @event_bus.instance_variable_get(:@subscribers).size
   end
 
   def test_serves_the_public_health_probe
@@ -87,7 +135,7 @@ class TestConsoleServer < Minitest::Test
     response = get(server, "/")
 
     assert_equal "302", response.code
-    assert_equal "/auth/login", response["location"]
+    assert_equal "/auth/login?return_to=%2F", response["location"]
   end
 
   def test_login_redirects_to_the_configured_gitlab_host
@@ -138,7 +186,9 @@ class TestConsoleServer < Minitest::Test
   end
 
   def test_stop_before_start_is_a_no_op
-    server = Server.new(CONSOLE_CONFIG, fleet: empty_fleet, activity_log: empty_activity_log, log_writer: Puma::LogWriter.strings)
+    server = Server.new(CONSOLE_CONFIG, fleet: @fleet, activity_log: @activity_log,
+                        event_bus: @event_bus, state_registry: @state_registry,
+                        log_writer: Puma::LogWriter.strings)
     @servers << server
 
     server.stop
@@ -168,6 +218,40 @@ class TestConsoleServer < Minitest::Test
     assert_equal Server::STOP_TIMEOUT, puma.options[:force_shutdown_after]
   end
 
+  def test_authenticated_sse_receives_refresh_and_disconnect_releases_cursor
+    server = start_server
+    session = authenticated_session(server)
+
+    socket, response = open_event_stream(server, session.id)
+
+    assert_includes response, "HTTP/1.1 200"
+    assert_includes response.downcase, "content-type: text/event-stream; charset=utf-8"
+    assert_includes response, "retry: 1000\n"
+    assert_includes response, "event: refresh\n"
+    assert_equal 1, subscriber_count
+
+    socket.setsockopt(Socket::SOL_SOCKET, Socket::SO_LINGER, [1, 0].pack("ii"))
+    socket.close
+    @event_bus.publish("integration", { type: :started })
+    wait_until { subscriber_count.zero? }
+  end
+
+  def test_stop_remains_bounded_and_cleans_up_with_an_open_stream
+    server = start_server
+    session = authenticated_session(server)
+    socket, = open_event_stream(server, session.id)
+    assert_equal 1, subscriber_count
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    server.stop
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+    assert_operator elapsed, :<=, Server::STOP_TIMEOUT + 2
+    wait_until(timeout: Server::STOP_TIMEOUT + 1) { subscriber_count.zero? }
+  ensure
+    socket&.close
+  end
+
   # The listener is bound before the server thread exists, and Master records
   # the console only after #start returns — so a failure in between would leak
   # the socket for the life of the master with nothing able to close it.
@@ -182,7 +266,8 @@ class TestConsoleServer < Minitest::Test
       end
     end
 
-    server = failing.new(CONSOLE_CONFIG.merge("port" => port), fleet: empty_fleet, activity_log: empty_activity_log,
+    server = failing.new(CONSOLE_CONFIG.merge("port" => port), fleet: @fleet, activity_log: @activity_log,
+                          event_bus: @event_bus, state_registry: @state_registry,
                           log_writer: Puma::LogWriter.strings)
     assert_raises(RuntimeError) { server.start }
 

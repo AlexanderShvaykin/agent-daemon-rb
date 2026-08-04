@@ -521,6 +521,8 @@ class TestSupervisorConfig < Minitest::Test
       assert_equal "127.0.0.1", console["bind"]
       assert_equal 9292, console["port"]
       assert_equal 16, console["max_threads"]
+      assert_operator console["max_threads"], :>, 10,
+                      "the default must leave request headroom above the <10-viewer SSE envelope"
       assert_equal 28_800, console["session_ttl"]
       assert_equal true, console["secure_cookies"]
       assert_equal "https://console.example.com", console["base_url"]

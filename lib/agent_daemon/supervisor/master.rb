@@ -35,7 +35,15 @@ module AgentDaemon
       # Builds the console server from the config's `console` block. Injectable
       # for the same reason join_timeout is: a test must be able to make the
       # console fail on purpose and watch the fleet carry on regardless.
-      CONSOLE_FACTORY = ->(console_config, fleet, activity_log) { Console::Server.new(console_config, fleet: fleet, activity_log: activity_log) }
+      CONSOLE_FACTORY = lambda do |console_config, fleet, activity_log, event_bus, state_registry|
+        Console::Server.new(
+          console_config,
+          fleet: fleet,
+          activity_log: activity_log,
+          event_bus: event_bus,
+          state_registry: state_registry
+        )
+      end
 
       attr_reader :state_registry, :event_bus
 
@@ -139,7 +147,7 @@ module AgentDaemon
       def start_console
         return if @config.console.nil?
 
-        console = @console_factory.call(@config.console, fleet, activity_log)
+        console = @console_factory.call(@config.console, fleet, activity_log, @event_bus, @state_registry)
         console.start
         @console = console
         Log.info("[Console] listening on #{@config.console['bind']}:#{console.port}")

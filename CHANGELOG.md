@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+- Epic 2 supervisor read model: one master-owned generation-CAS `StateRegistry`, one bounded/drop-oldest `EventBus`, config-rostered `Fleet` liveness, per-entity detail, and newest-first `ActivityLog` timelines.
+- Optional single-process Puma console with fail-closed GitLab OAuth, authenticated fleet/detail/activity pages, stable escaped live-content markup, and bare GET/HEAD `/healthz` liveness.
+- Authenticated `GET /events` SSE invalidations for state and activity changes, 250 ms observation polling, approximately 15 s heartbeats, reconnect reconciliation through a current-page refresh, exception-safe tail cursor cleanup, and cooperative shutdown of open streams.
+
+### Security
+- OAuth access tokens remain only in private server-side sessions; renderers receive an immutable username/CSRF view. GitLab membership is revalidated fail-closed at most once per session per 60 seconds **for sessions with a live SSE stream**, coalescing concurrent streams without holding the session-store mutex over network I/O. Page renders validate the local session only, so a client that never opens the stream keeps its session until `session_ttl` expires.
+- Separate bounded multi-tab OAuth pending states, single-use/session-bound callbacks, authenticated-id rotation, validated origin-local deep-link returns, fixed denial responses, and clean rejection of malformed Rack parameter shapes.
+- `/events` remains behind the default-deny middleware and carries no agent-influenced payload; browser updates reuse the existing escaped server renderer.
+
+### Notes
+- Activity history is bounded and in-memory: it can evict old records and does not survive supervisor restart. Reconnect repairs state gaps from the current registry and retained ring; it does not provide durable replay.
+- Each SSE stream occupies one Puma thread. The default `max_threads: 16` leaves request headroom for the supported `<10` concurrent viewers, but operators must size it above their own peak streams plus ordinary requests.
+
 ## [0.7.2] - 2026-07-29
 
 ### Fixed

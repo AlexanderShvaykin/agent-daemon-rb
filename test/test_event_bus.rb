@@ -46,6 +46,48 @@ class TestEventBus < Minitest::Test
     assert_equal :picked_up, records.first[:type]
   end
 
+  def test_tail_subscription_receives_only_records_published_after_subscribing
+    @bus.publish("ent-1", { type: :before, generation: 1 })
+
+    cursor = @bus.subscribe(from: :tail)
+    assert_empty cursor.read
+
+    @bus.publish("ent-1", { type: :after, generation: 1 })
+    assert_equal [:after], cursor.read.map { |record| record[:type] }
+  end
+
+  def test_default_subscription_still_replays_retained_records
+    @bus.publish("ent-1", { type: :before, generation: 1 })
+
+    assert_equal [:before], @bus.subscribe.read.map { |record| record[:type] }
+  end
+
+  def test_block_subscription_unsubscribes_after_normal_return
+    result = @bus.subscribe(from: :tail) do |cursor|
+      assert_equal 1, @bus.instance_variable_get(:@subscribers).size
+      assert_empty cursor.read
+      :done
+    end
+
+    assert_equal :done, result
+    assert_empty @bus.instance_variable_get(:@subscribers)
+  end
+
+  def test_block_subscription_unsubscribes_after_raise
+    cursor = nil
+
+    error = assert_raises(RuntimeError) do
+      @bus.subscribe(from: :tail) do |subscribed|
+        cursor = subscribed
+        raise "stream failed"
+      end
+    end
+
+    assert_equal "stream failed", error.message
+    assert_raises(KeyError) { @bus.dropped(cursor) }
+    assert_empty @bus.instance_variable_get(:@subscribers)
+  end
+
   # Copy-on-read: the ring retains its records for every other subscriber and
   # for every future subscriber replaying the backlog, so a consumer that
   # transforms what it drains must not be handed the retained hash itself.
