@@ -1,0 +1,7 @@
+worktree:
+  sharedDirectories:
+    - _bmad
+    - _bmad-output
+    - .claude
+    - .codex
+    - .agents
