@@ -35,6 +35,20 @@ module AgentDaemon
 
         EM_DASH = "—"
 
+        # Robot-head favicon, inlined as a data URI so no extra route is needed:
+        # a real /favicon.ico would sit behind the default-deny middleware and
+        # answer the browser's unauthenticated probe with a login redirect.
+        # Percent-encoded where the data-URI grammar demands it ('#' would start
+        # a fragment); the mid-tone fill reads on both light and dark tab bars.
+        FAVICON = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E" \
+                  "%3Crect%20x='6'%20y='12'%20width='20'%20height='16'%20rx='5'%20fill='%234f6bed'/%3E" \
+                  "%3Ccircle%20cx='16'%20cy='6'%20r='2'%20fill='%234f6bed'/%3E" \
+                  "%3Crect%20x='15'%20y='7'%20width='2'%20height='5'%20fill='%234f6bed'/%3E" \
+                  "%3Ccircle%20cx='12'%20cy='19'%20r='2.5'%20fill='%23fff'/%3E" \
+                  "%3Ccircle%20cx='20'%20cy='19'%20r='2.5'%20fill='%23fff'/%3E" \
+                  "%3Crect%20x='11'%20y='23'%20width='10'%20height='2'%20rx='1'%20fill='%23fff'/%3E" \
+                  "%3C/svg%3E"
+
         # Pinned wording (Story 2.4 Dev Notes → Detail page contract). The
         # <strong> markup is intentional HTML, not agent-influenced text, so
         # it is never passed through #esc.
@@ -251,7 +265,7 @@ module AgentDaemon
           <<~HTML
             <!DOCTYPE html>
             <html lang="en">
-            <head><meta charset="utf-8"><title>agent-daemon console</title></head>
+            <head><meta charset="utf-8"><title>agent-daemon console</title><link rel="icon" href="#{FAVICON}"></head>
             <body>
             <h1>agent-daemon console</h1>
             <p>Signed in as <strong>#{esc(username)}</strong></p>

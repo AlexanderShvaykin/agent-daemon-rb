@@ -116,6 +116,15 @@ class TestConsoleApp < Minitest::Test
     assert_includes response.body, "alice"
   end
 
+  # The favicon is inlined rather than served from /favicon.ico, which the
+  # default-deny middleware would answer with a login redirect.
+  def test_root_inlines_the_favicon_as_a_data_uri
+    body = get("/").body
+
+    assert_includes body, %(<link rel="icon" href="data:image/svg+xml,)
+    refute_includes App::FAVICON, "#", "'#' must be percent-encoded inside a data URI"
+  end
+
   # AD-7: every interpolated value is rendered inert. The username comes from
   # GitLab, so it is not ours to trust.
   def test_root_escapes_the_username

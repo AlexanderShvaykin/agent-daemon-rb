@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.9.1] - 2026-08-05
+
+### Added
+- A robot-head favicon on the console, inlined into `<head>` as a data URI. No `/favicon.ico` route is added: the default-deny middleware would answer the browser's unauthenticated probe with a login redirect, so the unauthenticated boundary is unchanged.
+
 ## [0.9.0] - 2026-08-05
 
 ### Added
