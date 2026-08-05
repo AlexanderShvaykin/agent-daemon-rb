@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.9.0] - 2026-08-05
 
 ### Added
 - Epic 2 supervisor read model: one master-owned generation-CAS `StateRegistry`, one bounded/drop-oldest `EventBus`, config-rostered `Fleet` liveness, per-entity detail, and newest-first `ActivityLog` timelines.
