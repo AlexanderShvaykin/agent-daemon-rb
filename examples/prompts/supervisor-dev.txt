@@ -1,0 +1,4 @@
+This is a local supervisor-console browser check.
+
+Read the work item at {{input_file}} and return a concise confirmation that it
+was processed. Do not modify project files or contact external services.

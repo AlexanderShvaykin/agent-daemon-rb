@@ -1,0 +1,24 @@
+# Harmless local workflow used to populate the console during browser QA.
+# It stays idle until a *.yml file is placed in tmp/supervisor-dev/inbox.
+
+project_path: <%= (ENV['AGENT_DAEMON_DEV_PROJECT_PATH'] || Dir.pwd).to_json %>
+message_dir: tmp/supervisor-dev/messages
+
+runners:
+  - name: browser-check
+    backend: claude
+    agent: task-analyst
+    timeout: 60
+    max_attempts: 1
+    trigger:
+      type: file
+      input_dir: tmp/supervisor-dev/inbox
+      archive_dir: tmp/supervisor-dev/done
+      failed_dir: tmp/supervisor-dev/failed
+      interval: 1
+      jitter: 0
+    prompt_template: ../prompts/supervisor-dev.txt
+
+logging:
+  level: debug
+  output: stdout

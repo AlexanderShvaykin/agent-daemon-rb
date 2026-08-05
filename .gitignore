@@ -5,6 +5,9 @@ vendor/
 Gemfile.lock
 pkg/
 tmp/
+.env
+.env.*
+!.env.example
 .ruby-version
 .ruby-gemset
 .claude/

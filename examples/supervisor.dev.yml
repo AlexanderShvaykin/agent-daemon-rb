@@ -1,0 +1,30 @@
+# Local browser-QA configuration for the supervisor console.
+#
+# From the repository root:
+#   cp .env.example .env
+#   # Fill in the GitLab values in .env, then:
+#   set -a; source .env; set +a
+#   bundle exec bin/agent-supervisor examples/supervisor.dev.yml
+#
+# Register this exact redirect URI in the GitLab OAuth application:
+#   http://127.0.0.1:9292/auth/callback
+# Required OAuth scope: read_api
+
+workflows:
+  - name: local-dev
+    config: workflows/supervisor-dev.yml
+
+console:
+  bind: 127.0.0.1
+  port: 9292
+  max_threads: 16
+  session_ttl: 28800
+  secure_cookies: false
+  base_url: http://127.0.0.1:9292
+  auth:
+    gitlab_host: <%= secret('GITLAB_HOST') %>
+    app_id: <%= secret('GITLAB_APP_ID') %>
+    app_secret: <%= secret('GITLAB_APP_SECRET') %>
+    allowed_groups:
+      - support-team
+      - teachbase
