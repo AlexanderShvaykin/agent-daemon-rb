@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "delegate"
 require "rack"
 
 # AD-5 lazy-require isolation: console files are loaded explicitly here.
@@ -31,6 +32,20 @@ class TestConsoleApp < Minitest::Test
   EventBus = AgentDaemon::Supervisor::EventBus
   GenerationStamp = AgentDaemon::Supervisor::GenerationStamp
   LiveUpdates = AgentDaemon::Supervisor::Console::LiveUpdates
+
+  class CountingFleet < SimpleDelegator
+    attr_reader :entries_calls
+
+    def initialize(fleet)
+      super
+      @entries_calls = 0
+    end
+
+    def entries
+      @entries_calls += 1
+      __getobj__.entries
+    end
+  end
 
   def setup
     @registry = StateRegistry.new
@@ -207,6 +222,45 @@ class TestConsoleApp < Minitest::Test
     refute_includes body, "{ once: true }"
   end
 
+  def test_authenticated_pages_emit_one_frozen_static_stylesheet_outside_live_content
+    body = get("/").body
+
+    assert App::STYLESHEET.frozen?
+    assert_equal 1, body.scan("<style>").size
+    assert_equal 1, body.scan("</style>").size
+    assert_operator body.index("</style>"), :<, body.index('<main id="console-content">')
+    assert_includes body, App::STYLESHEET
+  end
+
+  def test_live_content_region_contains_the_complete_replaceable_fleet_view
+    roster = [
+      Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha",
+                          entity_id: RunnerIdentity.new(workflow: "wf", runner: "alpha")),
+      Fleet::Rostered.new(kind: :reactor, workflow: nil, name: "mattermost_reactor",
+                          entity_id: "mattermost_reactor")
+    ]
+    body = get_on(build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new)), "/").body
+    content = body[/<main id="console-content">(.*?)<\/main>/m, 1]
+
+    refute_nil content
+    assert_includes content, "Fleet summary"
+    assert_includes content, ">wf</h2>"
+    assert_includes content, ">Fleet-wide</h2>"
+    assert_includes content, "alpha"
+    assert_includes content, "mattermost_reactor"
+    refute_includes content, "<style>"
+    refute_includes content, "console-header"
+  end
+
+  def test_stylesheet_provides_responsive_reflow_and_keyboard_focus_contracts
+    stylesheet = App::STYLESHEET
+
+    assert_includes stylesheet, "grid-template-columns"
+    assert_includes stylesheet, "@media"
+    assert_includes stylesheet, ":focus-visible"
+    assert_includes stylesheet, "overflow-wrap"
+  end
+
   def test_head_for_authenticated_pages_is_bodiless
     session = session_for("alice")
     env = { Auth::SESSION_ENV_KEY => session }
@@ -283,17 +337,55 @@ class TestConsoleApp < Minitest::Test
   # --- Story 2.3: the fleet list (AC1, AC2, AC3, AC4) ----------------------
 
   def test_root_shows_no_supervised_entities_when_roster_is_empty
-    assert_includes get("/").body, "No supervised entities."
+    body = get("/").body
+
+    assert_includes body, "Fleet summary"
+    assert_includes body, "No supervised entities."
+    refute_includes section(body, "Supervised entities"), "<ul"
   end
 
   # Substring matches against the whole document prove nothing about which
-  # table a row landed in, so every grouping assertion below is scoped to one
+  # group a card landed in, so every grouping assertion below is scoped to one
   # section. A missing section fails here with its own name rather than as a
   # NoMethodError on nil further down.
   def section(body, heading)
-    found = body[/<h2>#{Regexp.escape(heading)}<\/h2>.*?<\/table>/m]
-    refute_nil found, "no <h2>#{heading}</h2> section with a table in the page"
+    found = body[/<section[^>]*>\s*<h2[^>]*>#{Regexp.escape(heading)}<\/h2>.*?<\/section>/m]
+    refute_nil found, "no labelled <h2>#{heading}</h2> section in the page"
     found
+  end
+
+  def test_root_reads_the_real_fleet_snapshot_exactly_once
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    fleet = CountingFleet.new(Fleet.new(roster: roster, state_registry: StateRegistry.new))
+
+    response = get_on(build_app(fleet), "/")
+
+    assert_equal 200, response.status
+    assert_includes response.body, "alpha"
+    assert_equal 1, fleet.entries_calls
+  end
+
+  def test_root_renders_a_truthful_summary_before_groups_from_the_same_fleet
+    registry = StateRegistry.new
+    roster = {
+      "waiting" => :waiting,
+      "working" => :in_progress,
+      "flaky" => :crashed,
+      "done" => :exited,
+      "ghost" => nil
+    }.map do |name, status|
+      id = RunnerIdentity.new(workflow: "wf", runner: name)
+      registry.publish(id, { status: status, generation: 1 }) if status
+      Fleet::Rostered.new(kind: :runner, workflow: "wf", name: name, entity_id: id)
+    end
+    body = get_on(build_app(Fleet.new(roster: roster, state_registry: registry)), "/").body
+    summary = section(body, "Fleet summary")
+
+    { "Total" => 5, "Alive" => 2, "Restarting" => 1, "Dead" => 1, "Unknown" => 1 }.each do |label, count|
+      assert_includes summary, "<dt>#{label}</dt><dd>#{count}</dd>"
+    end
+    assert_operator body.index("Fleet summary"), :<, body.index(">wf</h2>"), "summary must precede entity groups"
   end
 
   def test_root_lists_every_workflow_with_its_runners
@@ -312,30 +404,36 @@ class TestConsoleApp < Minitest::Test
     wf_a = section(body, "wfA")
     wf_b = section(body, "wfB")
 
-    assert_includes wf_a, %(<td><a href="/entity?id=runner%3AwfA%3Aalpha">alpha</a></td>)
+    assert_includes wf_a, %(<a href="/entity?id=runner%3AwfA%3Aalpha">alpha</a>)
     assert_includes wf_a, %(<span class="liveness liveness-alive">alive</span>)
     refute_includes wf_a, "beta"
-    assert_includes wf_b, %(<td><a href="/entity?id=runner%3AwfB%3Abeta">beta</a></td>)
+    assert_includes wf_b, %(<a href="/entity?id=runner%3AwfB%3Abeta">beta</a>)
     refute_includes wf_b, "alpha"
-    assert_operator body.index("<h2>wfA</h2>"), :<, body.index("<h2>wfB</h2>"), "workflows must render in config order"
+    assert_operator body.index(">wfA</h2>"), :<, body.index(">wfB</h2>"), "workflows must render in config order"
   end
 
-  # The Page contract pins the column set and its order. Without this, a
-  # silent reorder or a dropped header passes the whole suite.
-  def test_the_entity_table_has_the_pinned_columns_in_the_pinned_order
+  # The Page contract pins the field set and its order. The exact-match
+  # assertion on the whole <dl> is the point: without it a silent reorder or
+  # a dropped field passes the whole suite.
+  def test_each_entity_card_has_a_semantic_link_and_complete_labelled_values
     id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
     registry = StateRegistry.new
     registry.publish(id, { status: :waiting, generation: 1 })
     roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
     app = build_app(Fleet.new(roster: roster, state_registry: registry))
 
-    body = get_on(app, "/").body
+    group = section(get_on(app, "/").body, "wf")
 
-    assert_includes body, "<tr><th>Entity</th><th>Kind</th><th>Liveness</th><th>Note</th><th></th></tr>"
-    assert_includes body,
-                    "<tr><td><a href=\"/entity?id=runner%3Awf%3Aalpha\">alpha</a></td><td>runner</td>" \
-                    "<td><span class=\"liveness liveness-alive\">alive</span></td>" \
-                    "<td></td><td><button type=\"button\" disabled>Restart</button></td></tr>"
+    assert_includes group, '<ul aria-label="Entities in workflow wf" role="list">'
+    assert_includes group, '<h3><a href="/entity?id=runner%3Awf%3Aalpha">alpha</a></h3>'
+    assert_includes group, <<~HTML.chomp
+      <dl>
+      <div><dt>Kind</dt><dd>runner</dd></div>
+      <div><dt>Liveness</dt><dd><span class="liveness liveness-alive">alive</span></dd></div>
+      <div><dt>Note</dt><dd>—</dd></div>
+      </dl>
+    HTML
+    assert_includes group, '<button type="button" disabled>Restart</button>'
   end
 
   # AC2: supervisor-owned entities are not just listed — each carries its own
@@ -354,9 +452,9 @@ class TestConsoleApp < Minitest::Test
     wf_section = section(body, "wf")
     fleet_wide_section = section(body, "Fleet-wide")
 
-    assert_includes wf_section, %(<td><a href="/entity?id=messenger%3Awf">messenger</a></td>)
+    assert_includes wf_section, %(<a href="/entity?id=messenger%3Awf">messenger</a>)
     refute_includes wf_section, "mattermost_reactor"
-    assert_includes fleet_wide_section, %(<td><a href="/entity?id=mattermost_reactor">mattermost_reactor</a></td>)
+    assert_includes fleet_wide_section, %(<a href="/entity?id=mattermost_reactor">mattermost_reactor</a>)
     refute_includes fleet_wide_section, ">messenger<"
 
     [wf_section, fleet_wide_section].each do |sect|
@@ -433,6 +531,19 @@ class TestConsoleApp < Minitest::Test
 
     refute_includes inert_body(body), "<script"
     assert_includes body, "&lt;script&gt;"
+  end
+
+  def test_a_hostile_workflow_name_is_rendered_inert_in_heading_and_label
+    malicious = %(<script>alert("workflow")</script>)
+    id = RunnerIdentity.new(workflow: malicious, runner: "alpha")
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: malicious, name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new))
+
+    body = get_on(app, "/").body
+
+    refute_includes inert_body(body), malicious
+    assert_includes body, '&lt;script&gt;alert(&quot;workflow&quot;)&lt;/script&gt;'
+    assert_includes body, 'aria-label="Entities in workflow &lt;script&gt;alert(&quot;workflow&quot;)&lt;/script&gt;"'
   end
 
   # AC2/AD-13: the restart action exists for every kind, but Epic 4 owns the

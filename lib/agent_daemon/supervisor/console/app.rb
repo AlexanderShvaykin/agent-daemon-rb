@@ -64,6 +64,189 @@ module AgentDaemon
         ACTIVITY_NOTE = '<p class="activity-note">Recent activity only — the event buffer is bounded and ' \
                          "does not survive a supervisor restart.</p>"
 
+        STYLESHEET = <<~CSS.freeze
+          :root {
+            color-scheme: light;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: #172033;
+            background: #f3f6f8;
+          }
+
+          * { box-sizing: border-box; }
+
+          body {
+            margin: 0;
+            min-width: 0;
+            background: #f3f6f8;
+            color: #172033;
+            line-height: 1.5;
+          }
+
+          a { color: #075ca8; text-underline-offset: 0.16em; }
+          a:hover { color: #064779; }
+
+          button {
+            min-height: 2.5rem;
+            padding: 0.55rem 0.9rem;
+            border: 1px solid #31506f;
+            border-radius: 0.5rem;
+            background: #ffffff;
+            color: #172033;
+            font: inherit;
+          }
+
+          button:disabled {
+            border-color: #9da9b5;
+            background: #e7ebef;
+            color: #52606d;
+            cursor: not-allowed;
+          }
+
+          a:focus-visible,
+          button:focus-visible,
+          input:focus-visible {
+            outline: 3px solid #b45309;
+            outline-offset: 3px;
+          }
+
+          .console-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1.5rem;
+            /* The bar is full-bleed but its contents line up with the centred
+               #console-content column: half the leftover width, plus that
+               column's own padding. */
+            padding: 1.25rem calc(max(0px, (100% - 76rem) / 2) + clamp(1rem, 3vw, 2rem));
+            border-bottom: 1px solid #cbd5df;
+            background: #ffffff;
+          }
+
+          .console-header h1,
+          .console-header p { margin: 0; }
+
+          .console-session {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+          }
+
+          #console-content {
+            width: min(100%, 76rem);
+            margin: 0 auto;
+            padding: clamp(1rem, 3vw, 2rem);
+          }
+
+          #console-content > section {
+            padding: clamp(1rem, 2.5vw, 1.5rem);
+            border: 1px solid #d4dce4;
+            border-radius: 0.75rem;
+            background: #ffffff;
+            box-shadow: 0 1px 2px rgb(23 32 51 / 8%);
+          }
+
+          #console-content > section + section { margin-top: 1.25rem; }
+          section h2 { margin: 0 0 1rem; font-size: 1.25rem; }
+
+          .fleet-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+            gap: 0.75rem;
+            margin: 0;
+          }
+
+          .fleet-summary > div {
+            padding: 0.8rem;
+            border-radius: 0.5rem;
+            background: #eef3f7;
+          }
+
+          .fleet-summary dt { color: #425466; font-size: 0.875rem; }
+          .fleet-summary dd { margin: 0.15rem 0 0; font-size: 1.5rem; font-weight: 700; }
+
+          section > ul {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr));
+            gap: 1rem;
+            margin: 0;
+            padding: 0;
+            list-style: none;
+          }
+
+          section > ul > li { min-width: 0; }
+
+          article {
+            height: 100%;
+            padding: 1rem;
+            border: 1px solid #cbd5df;
+            border-radius: 0.65rem;
+            background: #fbfcfd;
+            overflow-wrap: anywhere;
+          }
+
+          article h3 { margin: 0 0 0.9rem; font-size: 1.05rem; }
+          article dl { margin: 0 0 1rem; }
+
+          article dl > div {
+            display: grid;
+            grid-template-columns: minmax(5.5rem, auto) 1fr;
+            gap: 0.75rem;
+            padding: 0.45rem 0;
+            border-top: 1px solid #e1e7ec;
+          }
+
+          article dt { color: #425466; font-weight: 600; }
+          article dd { min-width: 0; margin: 0; }
+
+          .liveness {
+            display: inline-block;
+            padding: 0.1rem 0.5rem;
+            border: 1px solid currentColor;
+            border-radius: 999px;
+            font-weight: 700;
+          }
+
+          .liveness-alive { color: #17633a; background: #e5f5ea; }
+          .liveness-restarting { color: #7a4300; background: #fff1d6; }
+          .liveness-dead { color: #8a2432; background: #fde8eb; }
+          .liveness-unknown { color: #4b5563; background: #eceff2; }
+
+          /* No display override here. The detail and activity tables are
+             Story 3.2's (DR5), and `display: block` would drop their implicit
+             table/row/cell roles in Blink and WebKit — the row/column
+             association a screen reader needs to read the activity log at
+             all. Cells wrap instead of scrolling: an overflow container would
+             also need tabindex to be keyboard-operable. */
+          table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #ffffff;
+          }
+
+          th,
+          td {
+            padding: 0.6rem;
+            border-bottom: 1px solid #dbe2e8;
+            text-align: left;
+            vertical-align: top;
+            overflow-wrap: anywhere;
+          }
+          .staleness,
+          .activity-note { color: #425466; }
+
+          @media (max-width: 40rem) {
+            .console-header,
+            .console-session { align-items: stretch; flex-direction: column; }
+            .console-header { padding: 1.25rem 1rem; }
+            .console-session { gap: 0.75rem; }
+            .console-session button { width: 100%; }
+            #console-content { padding: 1rem; }
+            #console-content > section { padding: 1rem; }
+            .fleet-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            article dl > div { grid-template-columns: 1fr; gap: 0.1rem; }
+          }
+        CSS
+
         LIVE_SCRIPT = <<~HTML.freeze
           <script>
           (() => {
@@ -265,14 +448,27 @@ module AgentDaemon
           <<~HTML
             <!DOCTYPE html>
             <html lang="en">
-            <head><meta charset="utf-8"><title>agent-daemon console</title><link rel="icon" href="#{FAVICON}"></head>
+            <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>agent-daemon console</title>
+            <link rel="icon" href="#{FAVICON}">
+            <style>
+            #{STYLESHEET}</style>
+            </head>
             <body>
+            <header class="console-header">
+            <div>
             <h1>agent-daemon console</h1>
             <p>Signed in as <strong>#{esc(username)}</strong></p>
+            </div>
+            <div class="console-session">
             <form method="post" action="/auth/logout">
             <input type="hidden" name="_csrf" value="#{esc(csrf_token)}">
             <button type="submit">Log out</button>
             </form>
+            </div>
+            </header>
             <main id="console-content">
             #{content}</main>
             #{LIVE_SCRIPT}
@@ -289,32 +485,74 @@ module AgentDaemon
           workflows = @fleet.workflows(entries)
           fleet_wide = @fleet.fleet_wide(entries)
 
-          return "<p>No supervised entities.</p>" if workflows.empty? && fleet_wide.empty?
+          html = +fleet_summary(entries)
+          if workflows.empty? && fleet_wide.empty?
+            html << <<~HTML
+              <section aria-labelledby="fleet-entities-heading">
+              <h2 id="fleet-entities-heading">Supervised entities</h2>
+              <p>No supervised entities.</p>
+              </section>
+            HTML
+            return html
+          end
 
-          html = +""
-          workflows.each do |name, entries|
-            html << "<h2>#{esc(name)}</h2>\n"
-            html << entity_table(entries)
+          workflows.each_with_index do |(name, group_entries), index|
+            html << entity_group(name, group_entries, heading_id: "workflow-#{index}-heading",
+                                  label: "Entities in workflow #{name}")
           end
           unless fleet_wide.empty?
-            html << "<h2>Fleet-wide</h2>\n"
-            html << entity_table(fleet_wide)
+            html << entity_group("Fleet-wide", fleet_wide, heading_id: "fleet-wide-heading",
+                                  label: "Fleet-wide entities")
           end
           html
         end
 
-        def entity_table(entries)
-          rows = entries.map { |entry| entity_row(entry) }.join
+        def fleet_summary(entries)
+          counts = entries.each_with_object(Hash.new(0)) { |entry, result| result[entry.liveness] += 1 }
+          items = [["Total", entries.size], ["Alive", counts[:alive]], ["Restarting", counts[:restarting]],
+                   ["Dead", counts[:dead]]]
+          items << ["Unknown", counts[:unknown]] if counts[:unknown].positive?
+          values = items.map { |label, count| "<div><dt>#{label}</dt><dd>#{count}</dd></div>" }.join("\n")
+
           <<~HTML
-            <table>
-            <tr><th>Entity</th><th>Kind</th><th>Liveness</th><th>Note</th><th></th></tr>
-            #{rows}</table>
+            <section aria-labelledby="fleet-summary-heading">
+            <h2 id="fleet-summary-heading">Fleet summary</h2>
+            <dl class="fleet-summary">
+            #{values}
+            </dl>
+            </section>
           HTML
         end
 
-        def entity_row(entry)
+        # role="list" is not redundant: `list-style: none` suppresses the
+        # implicit list role in Safari/VoiceOver, which would take the group's
+        # aria-label and its item count with it — the whole point of labelling
+        # the group.
+        def entity_group(name, entries, heading_id:, label:)
+          cards = entries.map { |entry| entity_card(entry) }.join
           <<~HTML
-            <tr><td>#{entity_link(entry)}</td><td>#{esc(entry.kind)}</td><td>#{liveness_cell(entry.liveness)}</td><td>#{esc(note_for(entry.status))}</td><td>#{restart_placeholder}</td></tr>
+            <section aria-labelledby="#{heading_id}">
+            <h2 id="#{heading_id}">#{esc(name)}</h2>
+            <ul aria-label="#{esc(label)}" role="list">
+            #{cards}</ul>
+            </section>
+          HTML
+        end
+
+        def entity_card(entry)
+          note = note_for(entry.status)
+          note = EM_DASH if note.empty?
+
+          <<~HTML
+            <li><article>
+            <h3>#{entity_link(entry)}</h3>
+            <dl>
+            <div><dt>Kind</dt><dd>#{esc(entry.kind)}</dd></div>
+            <div><dt>Liveness</dt><dd>#{liveness_cell(entry.liveness)}</dd></div>
+            <div><dt>Note</dt><dd>#{esc(note)}</dd></div>
+            </dl>
+            #{restart_placeholder}
+            </article></li>
           HTML
         end
 
