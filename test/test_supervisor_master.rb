@@ -468,7 +468,7 @@ class TestSupervisorMaster < Minitest::Test
   end
 
   def spy_factory(spies, **kwargs)
-    lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry|
+    lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry, _output_buffers|
       spies << ConsoleSpy.new(console_config, **kwargs)
       spies.last
     end
@@ -596,7 +596,9 @@ class TestSupervisorMaster < Minitest::Test
   # A factory that blows up before returning an object is the misconfiguration
   # case (bad base_url, unusable auth block) — same rule applies.
   def test_a_console_factory_that_raises_does_not_stop_the_fleet
-    exploding = ->(_console_config, _fleet, _activity_log, _event_bus, _state_registry) { raise "factory boom" }
+    exploding = lambda do |_console_config, _fleet, _activity_log, _event_bus, _state_registry, _output_buffers|
+      raise "factory boom"
+    end
     with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config, console_factory: exploding)
       master.send(:build_factories)
@@ -661,7 +663,7 @@ class TestSupervisorMaster < Minitest::Test
 
   def test_console_factory_receives_a_fleet_whose_roster_covers_runners_messenger_and_reactor_in_order
     received_fleet = nil
-    factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry|
+    factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers|
       received_fleet = fleet
       ConsoleSpy.new(console_config)
     end
@@ -691,7 +693,7 @@ class TestSupervisorMaster < Minitest::Test
   # it back through the activity_log the factory received.
   def test_console_factory_receives_an_activity_log_reading_the_masters_own_event_bus
     received_activity_log = nil
-    factory = lambda do |console_config, _fleet, activity_log, _event_bus, _state_registry|
+    factory = lambda do |console_config, _fleet, activity_log, _event_bus, _state_registry, _output_buffers|
       received_activity_log = activity_log
       ConsoleSpy.new(console_config)
     end
@@ -711,7 +713,7 @@ class TestSupervisorMaster < Minitest::Test
 
   def test_console_factory_receives_the_masters_exact_event_bus_and_state_registry
     received = nil
-    factory = lambda do |console_config, _fleet, _activity_log, event_bus, state_registry|
+    factory = lambda do |console_config, _fleet, _activity_log, event_bus, state_registry, _output_buffers|
       received = [event_bus, state_registry]
       ConsoleSpy.new(console_config)
     end
@@ -722,6 +724,25 @@ class TestSupervisorMaster < Minitest::Test
 
       assert_same master.event_bus, received[0]
       assert_same master.state_registry, received[1]
+    end
+  end
+
+  # DR1: the default CONSOLE_FACTORY must forward the Master's OWN
+  # output_buffers, not a fresh empty store — the same wiring-guard shape
+  # DR10 demanded for event_bus/state_registry above. A fresh store would
+  # make snapshot(entry.entity_id) return :empty forever, silently.
+  def test_console_factory_receives_the_masters_exact_output_buffers
+    received = nil
+    factory = lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry, output_buffers|
+      received = output_buffers
+      ConsoleSpy.new(console_config)
+    end
+
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: factory)
+      master.send(:start_console)
+
+      assert_same master.output_buffers, received
     end
   end
 

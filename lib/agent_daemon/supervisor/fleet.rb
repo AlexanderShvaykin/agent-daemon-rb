@@ -35,9 +35,13 @@ module AgentDaemon
       # The first five members and :id, :generation, :work_item, :attempt,
       # :observed_at are the join itself; :seconds_since_published and
       # :stuck_restarting are derived at read time from the single clock
-      # reading #entries takes, so every row describes one instant.
+      # reading #entries takes, so every row describes one instant. :entity_id
+      # is the raw value Rostered carries — a RunnerIdentity Struct for a
+      # runner, an opaque String for messenger/reactor — kept alongside the
+      # derived :id (the URL/display key) because OutputBuffers (Story 3.5
+      # DR2) keys its buffers by that raw value, not by #id.
       Entry = Struct.new(:kind, :workflow, :name, :status, :liveness,
-                          :id, :generation, :work_item, :attempt,
+                          :id, :entity_id, :generation, :work_item, :attempt,
                           :observed_at, :seconds_since_published, :stuck_restarting,
                           keyword_init: true)
 
@@ -142,6 +146,7 @@ module AgentDaemon
           status: status,
           liveness: liveness,
           id: entity_id(rostered.entity_id),
+          entity_id: rostered.entity_id,
           generation: snapshot && snapshot[:generation],
           work_item: snapshot && snapshot[:work_item],
           attempt: snapshot && snapshot[:attempt],

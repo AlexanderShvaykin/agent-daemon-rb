@@ -12,6 +12,11 @@ require "agent_daemon/supervisor/fleet"
 require "agent_daemon/supervisor/state_registry"
 require "agent_daemon/supervisor/activity_log"
 require "agent_daemon/supervisor/event_bus"
+require "agent_daemon/supervisor/output_buffers"
+require "agent_daemon/supervisor/output_pipeline"
+require "agent_daemon/supervisor/redactor"
+require "agent_daemon/supervisor/runner_identity"
+require "agent_daemon/supervisor/master"
 
 # Story 2.2 AC7 — the console really runs. AI-1: this boots a REAL Puma with
 # the REAL middleware stack on an ephemeral port and speaks HTTP to it; the
@@ -44,6 +49,7 @@ class TestConsoleServer < Minitest::Test
     @event_bus = AgentDaemon::Supervisor::EventBus.new
     @fleet = AgentDaemon::Supervisor::Fleet.new(roster: [], state_registry: @state_registry)
     @activity_log = AgentDaemon::Supervisor::ActivityLog.new(event_bus: @event_bus)
+    @output_buffers = AgentDaemon::Supervisor::OutputBuffers.new(capacity_bytes: 262_144)
   end
 
   def teardown
@@ -55,15 +61,20 @@ class TestConsoleServer < Minitest::Test
     restore_logger!
   end
 
-  def start_server(config = CONSOLE_CONFIG)
-    server = Server.new(
+  def build_server(config = CONSOLE_CONFIG)
+    Server.new(
       config,
       fleet: @fleet,
       activity_log: @activity_log,
       event_bus: @event_bus,
       state_registry: @state_registry,
+      output_buffers: @output_buffers,
       log_writer: Puma::LogWriter.strings
     )
+  end
+
+  def start_server(config = CONSOLE_CONFIG)
+    server = build_server(config)
     @servers << server
     server.start
     server
@@ -188,6 +199,7 @@ class TestConsoleServer < Minitest::Test
   def test_stop_before_start_is_a_no_op
     server = Server.new(CONSOLE_CONFIG, fleet: @fleet, activity_log: @activity_log,
                         event_bus: @event_bus, state_registry: @state_registry,
+                        output_buffers: @output_buffers,
                         log_writer: Puma::LogWriter.strings)
     @servers << server
 
@@ -268,6 +280,7 @@ class TestConsoleServer < Minitest::Test
 
     server = failing.new(CONSOLE_CONFIG.merge("port" => port), fleet: @fleet, activity_log: @activity_log,
                           event_bus: @event_bus, state_registry: @state_registry,
+                          output_buffers: @output_buffers,
                           log_writer: Puma::LogWriter.strings)
     assert_raises(RuntimeError) { server.start }
 
@@ -275,5 +288,69 @@ class TestConsoleServer < Minitest::Test
     reclaimed = TCPServer.new("127.0.0.1", port)
     assert_equal port, reclaimed.addr[1]
     reclaimed.close
+  end
+
+  # --- Story 3.5 DR1: the output_buffers wiring, proven end to end ----------
+
+  # DR1 asks for a guard that the console reads the Master's OWN store rather
+  # than a fresh empty one. The master-side test asserts the `start_console`
+  # call site; these two close the remaining hops. Both are behavioral: they
+  # populate a store, ask the running console for the runner's page over HTTP,
+  # and require the output back. Replacing either forwarding expression with
+  # `OutputBuffers.new(capacity_bytes: 1)` turns them red — nothing else in the
+  # suite notices, because a mis-wired store fails by rendering the empty
+  # state forever, which is indistinguishable from a runner that never ran.
+  def runner_console(server_builder)
+    id = AgentDaemon::Supervisor::RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    roster = [AgentDaemon::Supervisor::Fleet::Rostered.new(kind: :runner, workflow: "wf",
+                                                            name: "alpha", entity_id: id)]
+    @fleet = AgentDaemon::Supervisor::Fleet.new(roster: roster, state_registry: @state_registry)
+
+    pipeline = AgentDaemon::Supervisor::OutputPipeline.new(
+      redactor: AgentDaemon::Supervisor::Redactor.new([])
+    )
+    pipeline.subscribe(@output_buffers)
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "wired-through-marker\n")
+
+    server = server_builder.call
+    @servers << server
+    server.start
+    server
+  end
+
+  def get_authenticated(server, path, session)
+    uri = URI("http://127.0.0.1:#{server.port}#{path}")
+    cookie = "#{AgentDaemon::Supervisor::Console::Auth::COOKIE_NAME}=#{session.id}"
+    Net::HTTP.start(uri.host, uri.port, open_timeout: 2, read_timeout: 2) do |http|
+      http.request(Net::HTTP::Get.new(uri, "Cookie" => cookie))
+    end
+  end
+
+  def test_the_server_forwards_its_own_output_buffers_to_the_app
+    server = runner_console(-> { build_server(CONSOLE_CONFIG) })
+    session = authenticated_session(server)
+
+    response = get_authenticated(server, "/entity?id=runner%3Awf%3Aalpha", session)
+
+    assert_equal "200", response.code
+    assert_includes response.body, "wired-through-marker"
+  end
+
+  # The same proof one hop further out: through the REAL default
+  # Master::CONSOLE_FACTORY, so the positional-argument → kwarg mapping added
+  # for this story is executed rather than replaced by a test lambda.
+  def test_the_default_console_factory_maps_output_buffers_through_to_the_app
+    factory = AgentDaemon::Supervisor::Master::CONSOLE_FACTORY
+    server = runner_console(lambda {
+      factory.call(CONSOLE_CONFIG, @fleet, @activity_log, @event_bus, @state_registry, @output_buffers)
+    })
+    session = authenticated_session(server)
+
+    response = get_authenticated(server, "/entity?id=runner%3Awf%3Aalpha", session)
+
+    assert_equal "200", response.code
+    assert_includes response.body, "wired-through-marker"
   end
 end

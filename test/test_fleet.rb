@@ -292,6 +292,32 @@ class TestFleet < Minitest::Test
     refute fleet.entries.first.stuck_restarting
   end
 
+  # --- Story 3.5 DR2: the raw entity_id rides along for the output join ----
+
+  # OutputBuffers keys its buffers by the raw entity_id the pipeline saw (a
+  # RunnerIdentity Struct for runners), not by the derived String #id. If
+  # Entry only carried #id, the console could never look output up for a
+  # runner at all.
+  def test_entry_carries_the_raw_entity_id_alongside_the_derived_id
+    id = runner_identity("wf", "alpha")
+    roster = [Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    fleet = Fleet.new(roster: roster, state_registry: @registry)
+
+    entry = fleet.entries.first
+
+    assert_same id, entry.entity_id
+    assert_equal "runner:wf:alpha", entry.id
+  end
+
+  def test_entry_carries_the_opaque_string_entity_id_for_a_messenger
+    roster = [Rostered.new(kind: :messenger, workflow: "wf", name: "messenger", entity_id: "messenger:wf")]
+    fleet = Fleet.new(roster: roster, state_registry: @registry)
+
+    entry = fleet.entries.first
+
+    assert_equal "messenger:wf", entry.entity_id
+  end
+
   # --- Empty roster ---------------------------------------------------------
 
   def test_an_empty_roster_yields_empty_results

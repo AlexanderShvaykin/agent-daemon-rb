@@ -59,6 +59,24 @@ module AgentDaemon
         ACTIVITY_NOTE = '<p class="activity-note">Recent activity only — the event buffer is bounded and ' \
                          "does not survive a supervisor restart.</p>"
 
+        # Story 3.5 DR4/AC4: no run has been selected for this entity at all.
+        TERMINAL_EMPTY_NOTE = "<p>No run output captured.</p>"
+
+        # DR4: a selected run that has not printed anything yet — distinct
+        # wording from TERMINAL_EMPTY_NOTE so an operator can tell "no run
+        # selected" from "run running silently".
+        TERMINAL_NO_OUTPUT_YET = "(no output yet)"
+
+        # DR4's fourth row: the backend aborted before Sinks::Bundle#end_output_run
+        # was ever given a reason (lib/agent_daemon/sinks.rb:71-73). reason.nil?
+        # must never be read as "still running" — `finished` does that job.
+        TERMINAL_NO_REASON_LABEL = "Finished — run ended without a recorded reason"
+
+        # DR4: truncation is sticky for the run's lifetime and rendered
+        # whenever it is true, independent of the finished/running state.
+        TERMINAL_TRUNCATED_NOTE = '<p class="terminal-note">Earlier output was discarded — the per-run ' \
+                                   "output buffer is bounded.</p>"
+
         STYLESHEET = <<~CSS.freeze
           :root {
             color-scheme: light;
@@ -276,6 +294,52 @@ module AgentDaemon
           .staleness,
           .activity-note { color: #425466; }
 
+          .terminal-state { margin: 0 0 0.75rem; }
+          .terminal-note { margin: 0 0 0.75rem; color: #425466; }
+
+          /* Story 3.5: the first dark element in the console (DR6). Both
+             background and color are set explicitly since :root only
+             declares color-scheme: light — nothing here may rely on
+             inheriting a dark scheme that does not exist on this page.
+             overflow-x is never introduced here (standing prohibition,
+             :217-222 above): white-space: pre-wrap + overflow-wrap: anywhere
+             instead, so a long unbroken line reflows rather than scrolling
+             horizontally. The bounded overflow-y region is the one place a
+             tabindex is required for keyboard reachability (WCAG 2.4.7 /
+             2.4.11) — everything else on this page is reachable by default. */
+          .terminal-panel {
+            max-height: 24rem;
+            overflow-y: auto;
+            padding: 0.75rem;
+            border-radius: 0.5rem;
+            background: #161b22;
+          }
+
+          .terminal-panel:focus-visible {
+            outline: 3px solid #b45309;
+            outline-offset: -3px;
+          }
+
+          .terminal-panel pre {
+            margin: 0;
+            color: #e6edf3;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.85rem;
+            line-height: 1.6;
+          }
+
+          .terminal-stream {
+            display: inline-block;
+            min-width: 2.2rem;
+            margin-right: 0.5rem;
+            font-weight: 700;
+          }
+
+          .terminal-stream-stdout { color: #7ee787; }
+          .terminal-stream-stderr { color: #ff7b72; }
+
           @media (max-width: 40rem) {
             .console-header,
             .console-session { align-items: stretch; flex-direction: column; }
@@ -376,10 +440,11 @@ module AgentDaemon
         # enumerating the leaf classes is what let ParameterTypeError through.
         PARAM_ERRORS = [Rack::BadRequest].freeze
 
-        def initialize(fleet:, activity_log:, live_updates:)
+        def initialize(fleet:, activity_log:, live_updates:, output_buffers:)
           @fleet = fleet
           @activity_log = activity_log
           @live_updates = live_updates
+          @output_buffers = output_buffers
         end
 
         def call(env)
@@ -663,6 +728,7 @@ module AgentDaemon
             #{STALENESS_NOTE}
             </section>
             #{activity_section(entry)}
+            #{terminal_section(entry)}
           HTML
         end
 
@@ -799,6 +865,98 @@ module AgentDaemon
             actors.empty? ? EM_DASH : "actor: #{actors.join(', ')}"
           else EM_DASH
           end
+        end
+
+        # Story 3.5 AC1-AC7/DR3-DR5: the dark terminal panel showing the
+        # currently retained output of a runner's current or most recent run.
+        # AD-13: only :runner carries run semantics — a messenger/reactor has
+        # no agent process, so AC6 omits the whole section rather than
+        # rendering it with an empty state (unlike activity_section, which
+        # renders an empty state for every kind).
+        #
+        # DR8, known limitation: output records deliberately do NOT travel the
+        # lifecycle EventBus (3.3 DR7), and LiveUpdates watches only that bus
+        # and the StateRegistry revision — so NEW OUTPUT LINES ALONE DO NOT
+        # TRIGGER AN SSE REFRESH. The panel re-renders when some lifecycle
+        # event or state change happens to fire one; continuous output
+        # streaming is Story 3.6's whole job, not a bug to fix here.
+        #
+        # Heading is <h2>, not DR3's <h3>: DR3 justified <h3> with "the page's
+        # <h2> is the entity name", but activity_section also emits an <h2>
+        # (:770), so the three sibling sections must share one level or the
+        # outline claims this one is nested inside Recent activity. It also
+        # makes the heading match the existing `section h2` rule (:148) — an
+        # <h3> here matched neither that nor `article h3` (:186).
+        #
+        # Only the scroll container is a named region: a <section> with an
+        # accessible name IS a region landmark, so naming both it and DR6's
+        # inner role="region" produced two nested landmarks called "Run
+        # output". DR6's tab stop needs the name; the wrapper does not.
+        def terminal_section(entry)
+          return "" unless entry.kind == :runner
+
+          snapshot = @output_buffers.snapshot(entry.entity_id)
+          return empty_terminal_section if snapshot.status == :empty
+
+          <<~HTML
+            <section>
+            <h2 id="terminal-heading">Run output</h2>
+            #{snapshot.truncated ? TERMINAL_TRUNCATED_NOTE : ""}#{terminal_state_line(snapshot)}
+            <div class="terminal-panel" tabindex="0" role="region" aria-labelledby="terminal-heading">
+            <pre>#{terminal_lines(snapshot.records)}</pre>
+            </div>
+            </section>
+          HTML
+        end
+
+        def empty_terminal_section
+          <<~HTML
+            <section>
+            <h2 id="terminal-heading">Run output</h2>
+            #{TERMINAL_EMPTY_NOTE}
+            </section>
+          HTML
+        end
+
+        # DR4's mapping table, exactly: finished: false -> Running; finished:
+        # true with a reason -> the existing outcome vocabulary
+        # (activity_detail_html's pattern); finished: true with reason: nil ->
+        # the no-recorded-reason wording, never mistaken for "still running".
+        def terminal_state_line(snapshot)
+          return '<p class="terminal-state">Running</p>' unless snapshot.finished
+          return %(<p class="terminal-state">#{TERMINAL_NO_REASON_LABEL}</p>) unless snapshot.reason
+
+          outcome = %i[ok failed timeout killed].include?(snapshot.reason) ? snapshot.reason : :unknown
+          %(<p class="terminal-state">Finished — <span class="outcome outcome-#{outcome}">) +
+            "#{esc(snapshot.reason)}</span></p>"
+        end
+
+        # AC1: ascending seq (the order `records` already arrives in). AC4's
+        # :retained + records: [] case (a run started, nothing printed yet)
+        # gets its own wording, distinct from the no-run-selected empty state.
+        def terminal_lines(records)
+          return TERMINAL_NO_OUTPUT_YET if records.empty?
+
+          records.map { |record| terminal_line(record) }.join("\n")
+        end
+
+        # AC7: `esc` on every byte of record text, no exceptions — the
+        # container is a single <pre> (AC7's "preformatted text" is literal),
+        # so terminal control characters survive as inert bytes rather than
+        # being interpreted. AC1: the stream label is visible TEXT ("out" /
+        # "err"), not an aria-label on a bare <span> — Story 3.2's review
+        # proved browsers drop that (role="generic" cannot carry an
+        # accessible name). Stream is exactly :stdout/:stderr today (DR5:
+        # backend/base.rb:118-138 via sinks.rb:57), so the binary branch below
+        # is total over the real domain. Anything else would be LABELLED "out"
+        # rather than left unlabelled — a deliberate trade: an impossible input
+        # is not worth a third branch, and mislabelling beats raising on a Puma
+        # thread. Add the unlabelled path only if `stream` ever widens.
+        def terminal_line(record)
+          stderr = record.stream == :stderr
+          css = stderr ? "terminal-stream-stderr" : "terminal-stream-stdout"
+          label = stderr ? "err" : "out"
+          %(<span class="terminal-stream #{css}">#{label}</span>#{esc(record.text)})
         end
 
         def esc(value)

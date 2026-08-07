@@ -15,6 +15,9 @@ require "agent_daemon/supervisor/runner_identity"
 require "agent_daemon/supervisor/activity_log"
 require "agent_daemon/supervisor/event_bus"
 require "agent_daemon/supervisor/runner_supervisor"
+require "agent_daemon/supervisor/output_buffers"
+require "agent_daemon/supervisor/output_pipeline"
+require "agent_daemon/supervisor/redactor"
 
 # Story 2.2 AC1/AC2 — the minimal authenticated surface. Story 2.3 adds the
 # fleet list itself.
@@ -32,6 +35,9 @@ class TestConsoleApp < Minitest::Test
   EventBus = AgentDaemon::Supervisor::EventBus
   GenerationStamp = AgentDaemon::Supervisor::GenerationStamp
   LiveUpdates = AgentDaemon::Supervisor::Console::LiveUpdates
+  OutputBuffers = AgentDaemon::Supervisor::OutputBuffers
+  OutputPipeline = AgentDaemon::Supervisor::OutputPipeline
+  Redactor = AgentDaemon::Supervisor::Redactor
 
   class CountingFleet < SimpleDelegator
     attr_reader :entries_calls
@@ -55,8 +61,10 @@ class TestConsoleApp < Minitest::Test
   end
 
   def build_app(fleet, activity_log: ActivityLog.new(event_bus: EventBus.new),
-                live_updates: LiveUpdates.new(event_bus: EventBus.new, state_registry: StateRegistry.new))
-    Rack::MockRequest.new(Rack::Lint.new(App.new(fleet: fleet, activity_log: activity_log, live_updates: live_updates)))
+                live_updates: LiveUpdates.new(event_bus: EventBus.new, state_registry: StateRegistry.new),
+                output_buffers: OutputBuffers.new(capacity_bytes: OutputPipeline::DEFAULT_MAX_LINE_BYTES))
+    Rack::MockRequest.new(Rack::Lint.new(App.new(fleet: fleet, activity_log: activity_log, live_updates: live_updates,
+                                                  output_buffers: output_buffers)))
   end
 
   # A real, freshly promoted session — the same object the middleware puts in
@@ -301,7 +309,8 @@ class TestConsoleApp < Minitest::Test
     bus = EventBus.new
     registry = StateRegistry.new
     live_updates = LiveUpdates.new(event_bus: bus, state_registry: registry, wait: ->(_seconds) {})
-    raw_app = App.new(fleet: @fleet, activity_log: ActivityLog.new(event_bus: bus), live_updates: live_updates)
+    raw_app = App.new(fleet: @fleet, activity_log: ActivityLog.new(event_bus: bus), live_updates: live_updates,
+                       output_buffers: OutputBuffers.new(capacity_bytes: OutputPipeline::DEFAULT_MAX_LINE_BYTES))
     env = Rack::MockRequest.env_for(
       "/events",
       "rack.hijack?" => true,
@@ -1285,5 +1294,338 @@ class TestConsoleApp < Minitest::Test
   ensure
     AgentDaemon::Log.instance_variable_set(:@logger, prior)
     AgentDaemon::Log.clear_context
+  end
+
+  # --- Story 3.5: the terminal / run-output panel ---------------------------
+
+  # Scoped to the terminal section, not the whole body — the same rule
+  # activity_section/diagnostic_section follow above. The wrapper is the page's
+  # only unnamed <section> (the name lives on the inner scroll region, so the
+  # two do not become duplicate nested landmarks), so anchoring on the heading
+  # that follows it keeps the match unambiguous.
+  def terminal_section(body)
+    found = body[%r{<section>\s*<h2 id="terminal-heading">.*?</section>}m]
+    refute_nil found, "no terminal section found in the page"
+    found
+  end
+
+  # Retro AI-1: a real OutputPipeline + real Redactor + real OutputBuffers,
+  # never a reimplementation of the store under test. The only double in this
+  # section is the raising one in the DR7 fault-isolation test below.
+  def build_terminal_app(roster:, capacity_bytes: OutputPipeline::DEFAULT_MAX_LINE_BYTES,
+                          state_registry: StateRegistry.new)
+    output_buffers = OutputBuffers.new(capacity_bytes: capacity_bytes)
+    pipeline = OutputPipeline.new(redactor: Redactor.new([]))
+    pipeline.subscribe(output_buffers)
+    fleet = Fleet.new(roster: roster, state_registry: state_registry)
+    app = build_app(fleet, output_buffers: output_buffers)
+    [app, pipeline]
+  end
+
+  def runner_roster(id)
+    [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+  end
+
+  # AC1: an in-progress run's lines render in seq order, each carrying a
+  # visible (not aria-label-only) stream label — Story 3.2's review proved a
+  # bare <span aria-label> is dropped by browsers.
+  def test_an_in_progress_run_renders_its_lines_in_seq_order_with_stream_labels
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "first line\n")
+    bundle.append_output(:stderr, "second line\n")
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, %(<span class="terminal-stream terminal-stream-stdout">out</span>first line)
+    assert_includes section, %(<span class="terminal-stream terminal-stream-stderr">err</span>second line)
+    assert_includes section, '<p class="terminal-state">Running</p>'
+    assert_operator section.index("first line"), :<, section.index("second line"),
+                    "records must render in ascending seq order"
+  end
+
+  # AC8/DR6: the scrollable region must be keyboard-reachable (WCAG 2.4.7 /
+  # 2.4.11) — a semantic-attribute assertion, not a CSS/palette one.
+  def test_the_scrollable_panel_is_a_labelled_keyboard_reachable_region
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "hello\n")
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, '<h2 id="terminal-heading">Run output</h2>'
+    assert_match(
+      /<div class="terminal-panel" tabindex="0" role="region" aria-labelledby="terminal-heading">/,
+      section
+    )
+    # Exactly ONE thing may carry the "Run output" accessible name. A <section>
+    # with an accessible name is itself a region landmark, so naming the
+    # wrapper too would announce "Run output, region" twice, nested.
+    assert_equal 1, section.scan('aria-labelledby="terminal-heading"').size,
+                 "the scroll container is the only element that may be named by the heading"
+    refute_includes section, '<section aria-labelledby="terminal-heading">'
+  end
+
+  # AC2: a completed run stays visible with its final reason, rendered
+  # through the same outcome vocabulary activity_detail_html uses.
+  def test_a_completed_run_keeps_its_output_and_shows_the_finished_outcome
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "done\n")
+    bundle.end_output_run(1, :failed)
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, "done"
+    assert_includes section, %(Finished — <span class="outcome outcome-failed">failed</span>)
+    refute_includes section, '<p class="terminal-state">Running</p>'
+  end
+
+  def test_a_successfully_completed_run_shows_the_ok_outcome
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.end_output_run(1, :ok)
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, %(Finished — <span class="outcome outcome-ok">ok</span>)
+  end
+
+  # DR4's fourth row: reason.nil? must never be read as "still running".
+  def test_a_finished_run_with_no_recorded_reason_states_that_explicitly
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.end_output_run(1, nil)
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    # The literal, not App::TERMINAL_NO_REASON_LABEL: asserting the constant
+    # against itself passes for any wording, including "Running".
+    assert_includes section, "Finished — run ended without a recorded reason"
+    refute_includes section, '<p class="terminal-state">Running</p>'
+  end
+
+  # DR4's outcome vocabulary is a four-symbol whitelist; :ok and :failed are
+  # covered above. These pin the other two plus the whitelist-miss branch,
+  # where the CLASS is clamped to outcome-unknown while the TEXT is the
+  # escaped reason verbatim — the sink protocol declares `reason` opaque
+  # (sinks.rb:70-73), so both halves need pinning.
+  def test_the_remaining_whitelisted_reasons_render_their_own_outcome_class
+    %i[timeout killed].each do |reason|
+      id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+      app, pipeline = build_terminal_app(roster: runner_roster(id))
+      bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+      bundle.begin_output_run(1)
+      bundle.end_output_run(1, reason)
+
+      section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+      assert_includes section, %(Finished — <span class="outcome outcome-#{reason}">#{reason}</span>)
+    end
+  end
+
+  def test_a_reason_outside_the_whitelist_is_clamped_to_the_unknown_class_but_shown_verbatim
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.end_output_run(1, :"weird<reason>")
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, %(<span class="outcome outcome-unknown">)
+    # The reason reaches an attribute-adjacent context, so it must be escaped
+    # even though it can only come from core today.
+    assert_includes section, "weird&lt;reason&gt;"
+    refute_includes section, "weird<reason>"
+  end
+
+  # DR2's whole point: the panel joins on the RAW entity_id, so one runner's
+  # page must never show another's output. Every other terminal test uses a
+  # single-runner roster and would pass against a store keyed by anything.
+  def test_the_panel_shows_only_the_requested_runners_output
+    alpha = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    beta = RunnerIdentity.new(workflow: "wf", runner: "beta")
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: alpha),
+              Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "beta", entity_id: beta)]
+    output_buffers = OutputBuffers.new(capacity_bytes: OutputPipeline::DEFAULT_MAX_LINE_BYTES)
+    pipeline = OutputPipeline.new(redactor: Redactor.new([]))
+    pipeline.subscribe(output_buffers)
+    app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new),
+                    output_buffers: output_buffers)
+
+    AgentDaemon::Sinks::Bundle.new(entity_id: alpha, output: pipeline.ingress(1)).tap do |bundle|
+      bundle.begin_output_run(1)
+      bundle.append_output(:stdout, "alpha secret text\n")
+    end
+    AgentDaemon::Sinks::Bundle.new(entity_id: beta, output: pipeline.ingress(1)).tap do |bundle|
+      bundle.begin_output_run(1)
+      bundle.append_output(:stdout, "beta secret text\n")
+    end
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Abeta").body)
+
+    assert_includes section, "beta secret text"
+    refute_includes section, "alpha secret text"
+  end
+
+  # AC3: the store holds at most one buffer per entity, so the next render
+  # after a new run_started shows only the new run's content by construction.
+  def test_a_new_run_replaces_the_panels_content
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "first run text\n")
+    bundle.end_output_run(1, :ok)
+
+    bundle.begin_output_run(2)
+    bundle.append_output(:stdout, "second run text\n")
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    refute_includes section, "first run text"
+    assert_includes section, "second run text"
+  end
+
+  # AC4: no run has ever been selected for this entity.
+  def test_a_runner_with_no_runs_renders_the_pinned_empty_state
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, _pipeline = build_terminal_app(roster: runner_roster(id))
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    # The literal, not the constant — see the no-recorded-reason test above.
+    assert_includes section, "<p>No run output captured.</p>"
+  end
+
+  # DR4: :retained + records: [] is Running with distinct no-output-yet
+  # wording — an operator must be able to tell "no run selected" from "run
+  # running silently".
+  def test_a_started_run_with_no_output_yet_is_distinct_from_the_empty_state
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, '<p class="terminal-state">Running</p>'
+    # Literals, so the two states cannot be silently rewritten into each other.
+    assert_includes section, "(no output yet)"
+    refute_includes section, "<p>No run output captured.</p>"
+  end
+
+  # AC5: eviction is stated, not hidden.
+  def test_overflowing_the_buffer_states_that_earlier_output_was_discarded
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id), capacity_bytes: 16)
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "#{'a' * 20}\n")
+    bundle.append_output(:stdout, "#{'b' * 20}\n")
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    # The literal, not the constant — see the no-recorded-reason test above.
+    assert_includes section, '<p class="terminal-note">Earlier output was discarded — ' \
+                              "the per-run output buffer is bounded.</p>"
+  end
+
+  def test_the_truncation_notice_is_absent_when_nothing_was_evicted
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "short\n")
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    # Refuting the constant is vacuous the same way asserting it is: reword the
+    # notice and this passes no matter what the page says. Refute the class the
+    # notice is rendered with, plus its literal opening words.
+    refute_includes section, '<p class="terminal-note">'
+    refute_includes section, "Earlier output was discarded"
+  end
+
+  # AC6: only runners get a panel. Scoped to #console-content so the CSS
+  # class names inside <style> (.terminal-panel etc.) cannot satisfy the
+  # refutation — 3.2 review lesson.
+  def console_content(body)
+    found = body[%r{<main id="console-content">.*?</main>}m]
+    refute_nil found, "no #console-content region found in the page"
+    found
+  end
+
+  def test_a_messenger_entity_has_no_terminal_panel
+    roster = [Fleet::Rostered.new(kind: :messenger, workflow: "wf", name: "messenger", entity_id: "messenger:wf")]
+    app, _pipeline = build_terminal_app(roster: roster)
+
+    content = console_content(get_on(app, "/entity?id=messenger%3Awf").body)
+
+    refute_includes content, "terminal-heading"
+  end
+
+  def test_a_reactor_entity_has_no_terminal_panel
+    roster = [Fleet::Rostered.new(kind: :reactor, workflow: nil, name: "mattermost_reactor",
+                                  entity_id: "mattermost_reactor")]
+    app, _pipeline = build_terminal_app(roster: roster)
+
+    content = console_content(get_on(app, "/entity?id=mattermost_reactor").body)
+
+    refute_includes content, "terminal-heading"
+  end
+
+  # AC7: captured output is inert — escaped and displayed as text, never
+  # interpreted as markup, even a payload attempting to break out of the
+  # surrounding <pre>. Positive control first, then the negative (inert_body).
+  def test_captured_output_containing_html_is_rendered_escaped_and_inert
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    malicious = "</pre><script>alert(1)</script>"
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "#{malicious}\n")
+
+    body = get_on(app, "/entity?id=runner%3Awf%3Aalpha").body
+    section = terminal_section(body)
+
+    assert_includes section, Rack::Utils.escape_html(malicious)
+    inert_body(body)
+  end
+
+  # DR7: a raising store degrades to the same 500/no-echo/one-log behavior as
+  # the raising ActivityLog test above — the one legitimate double in this
+  # section.
+  def test_an_output_buffers_store_that_raises_on_snapshot_yields_a_500_with_no_echo_and_one_logged_error
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    fleet = Fleet.new(roster: runner_roster(id), state_registry: StateRegistry.new)
+    exploding_output_buffers = Object.new.tap do |o|
+      def o.snapshot(*) = raise "output buffers boom, path /entity?id=runner:wf:alpha"
+    end
+    app = build_app(fleet, output_buffers: exploding_output_buffers)
+
+    errors = capture_log_errors do
+      @response = get_on(app, "/entity?id=runner%3Awf%3Aalpha")
+    end
+
+    assert_equal 500, @response.status
+    assert_equal "internal error", @response.body
+    refute_includes @response.body, "boom"
+    refute_includes @response.body, "/entity"
+    assert_equal 1, errors.size
+    assert_match(/RuntimeError/, errors.first)
+    assert_includes errors.first, "output buffers boom"
+    assert_includes errors.first, "/entity"
   end
 end
