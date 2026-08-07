@@ -49,11 +49,6 @@ module AgentDaemon
                   "%3Crect%20x='11'%20y='23'%20width='10'%20height='2'%20rx='1'%20fill='%23fff'/%3E" \
                   "%3C/svg%3E"
 
-        # Pinned wording (Story 2.4 Dev Notes → Detail page contract). The
-        # <strong> markup is intentional HTML, not agent-influenced text, so
-        # it is never passed through #esc.
-        STUCK_FLAG = " — <strong>stuck: respawn is failing</strong>"
-
         STALENESS_NOTE = "<p class=\"staleness\">Liveness is observed on the supervisor's ~1 s supervision " \
                           "tick, so a crash can take up to ~1 s to appear here. This latency counts inside " \
                           "the ≤ 2 s freshness budget, not on top of it.</p>"
@@ -185,9 +180,16 @@ module AgentDaemon
           }
 
           article h3 { margin: 0 0 0.9rem; font-size: 1.05rem; }
-          article dl { margin: 0 0 1rem; }
+          article dl,
+          .entity-diagnostics { margin: 0 0 1rem; }
 
-          article dl > div {
+          /* The <dl> is the card's last child, so its own bottom margin would
+             stack on top of the card's padding. */
+          .activity-timeline li dl { margin: 0; }
+
+          article dl > div,
+          .entity-diagnostics > div,
+          .activity-timeline li dl > div {
             display: grid;
             grid-template-columns: minmax(5.5rem, auto) 1fr;
             gap: 0.75rem;
@@ -195,8 +197,13 @@ module AgentDaemon
             border-top: 1px solid #e1e7ec;
           }
 
-          article dt { color: #425466; font-weight: 600; }
-          article dd { min-width: 0; margin: 0; }
+          article dt,
+          .entity-diagnostics dt,
+          .activity-timeline dt { color: #425466; font-weight: 600; }
+
+          article dd,
+          .entity-diagnostics dd,
+          .activity-timeline dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 
           .liveness {
             display: inline-block;
@@ -211,26 +218,61 @@ module AgentDaemon
           .liveness-dead { color: #8a2432; background: #fde8eb; }
           .liveness-unknown { color: #4b5563; background: #eceff2; }
 
-          /* No display override here. The detail and activity tables are
-             Story 3.2's (DR5), and `display: block` would drop their implicit
-             table/row/cell roles in Blink and WebKit — the row/column
-             association a screen reader needs to read the activity log at
-             all. Cells wrap instead of scrolling: an overflow container would
-             also need tabindex to be keyboard-operable. */
-          table {
-            width: 100%;
-            border-collapse: collapse;
-            background: #ffffff;
+          .status-note { margin: 0.3rem 0 0; color: #425466; }
+
+          .restart-warning {
+            padding: 0.75rem;
+            border-left: 0.3rem solid #9a5700;
+            border-radius: 0.35rem;
+            background: #fff1d6;
+            color: #5f3600;
           }
 
-          th,
-          td {
-            padding: 0.6rem;
-            border-bottom: 1px solid #dbe2e8;
-            text-align: left;
-            vertical-align: top;
-            overflow-wrap: anywhere;
+          /* Standing prohibition, carried forward from Story 3.1's review: no
+             `display: block` on a tabular element, and no `overflow-x` scroll
+             container. The first drops the implicit table/row/cell roles in
+             Blink and WebKit; the second is not keyboard-reachable without a
+             tabindex. Story 3.2 routes around both by making the timeline an
+             ordered list that reflows natively — do not reintroduce either. */
+          .activity-timeline {
+            display: grid;
+            gap: 0.9rem;
+            margin: 0;
+            padding: 0;
+            list-style: none;
           }
+
+          .activity-timeline > li {
+            min-width: 0;
+            padding: 1rem;
+            border: 1px solid #cbd5df;
+            border-left: 0.3rem solid #52708f;
+            border-radius: 0.65rem;
+            background: #fbfcfd;
+          }
+
+          .generation-boundary {
+            margin: 0 0 0.75rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid #71869b;
+            color: #263f58;
+            font-weight: 700;
+          }
+
+          .outcome {
+            display: inline-block;
+            padding: 0.1rem 0.5rem;
+            border: 1px solid currentColor;
+            border-radius: 999px;
+            font-weight: 700;
+          }
+
+          .outcome-ok { color: #17633a; background: #e5f5ea; }
+          .outcome-failed { color: #8a2432; background: #fde8eb; }
+          .outcome-timeout { color: #7a4300; background: #fff1d6; }
+          .outcome-killed { color: #3f4650; background: #eceff2; }
+          .outcome-unknown { color: #4b5563; background: #eceff2; }
+
           .staleness,
           .activity-note { color: #425466; }
 
@@ -243,7 +285,10 @@ module AgentDaemon
             #console-content { padding: 1rem; }
             #console-content > section { padding: 1rem; }
             .fleet-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-            article dl > div { grid-template-columns: 1fr; gap: 0.1rem; }
+            article dl > div,
+            .entity-diagnostics > div,
+            .activity-timeline li dl > div { grid-template-columns: 1fr; gap: 0.1rem; }
+            .activity-timeline > li { padding: 0.8rem; }
           }
         CSS
 
@@ -604,17 +649,19 @@ module AgentDaemon
         def entity_page(entry)
           <<~HTML
             <p><a href="/">&larr; Fleet</a></p>
-            <h2>#{esc(entry.name)}</h2>
-            <table>
-            <tr><th>Workflow</th><td>#{esc(entry.workflow || EM_DASH)}</td></tr>
-            <tr><th>Kind</th><td>#{esc(entry.kind)}</td></tr>
-            <tr><th>Liveness</th><td>#{liveness_cell(entry.liveness)}</td></tr>
-            <tr><th>Activity</th><td>#{esc(entry.status || EM_DASH)}</td></tr>
-            <tr><th>Generation</th><td>#{esc(generation_cell(entry.generation))}</td></tr>
-            #{restarting_row(entry)}#{work_item_rows(entry)}<tr><th>State published</th><td>#{esc(entry.observed_at || "never")}</td></tr>
-            </table>
-            #{note_paragraph(entry.status)}<p>#{restart_placeholder}</p>
+            <section aria-labelledby="entity-diagnostics-heading">
+            <h2 id="entity-diagnostics-heading">#{esc(entry.name)}</h2>
+            <dl class="entity-diagnostics">
+            <div><dt>Workflow</dt><dd>#{esc(entry.workflow || EM_DASH)}</dd></div>
+            <div><dt>Kind</dt><dd>#{esc(entry.kind)}</dd></div>
+            <div><dt>Liveness</dt><dd>#{liveness_cell(entry.liveness)}</dd></div>
+            <div><dt>Activity</dt><dd>#{activity_status(entry.status)}</dd></div>
+            #{work_item_rows(entry)}#{restarting_row(entry)}<div><dt>Generation</dt><dd>#{esc(generation_cell(entry.generation))}</dd></div>
+            <div><dt>State published</dt><dd>#{esc(entry.observed_at || "never")}</dd></div>
+            </dl>
+            #{restart_delayed_warning(entry)}<p>#{restart_placeholder}</p>
             #{STALENESS_NOTE}
+            </section>
             #{activity_section(entry)}
           HTML
         end
@@ -627,31 +674,38 @@ module AgentDaemon
 
         # AC4: the current generation and time-in-restarting, so the operator
         # can distinguish a healthy respawn from a crash-loop where a respawn
-        # attempt has failed silently. Not escaped: seconds is our own integer
-        # and STUCK_FLAG is a static string carrying intentional <strong>
-        # markup, neither is agent-influenced.
+        # attempt has failed silently. Seconds is our own integer.
         def restarting_row(entry)
           return "" unless entry.liveness == :restarting
 
-          text = "#{entry.seconds_since_published}s"
-          text += STUCK_FLAG if entry.stuck_restarting
-          "<tr><th>Restarting for</th><td>#{text}</td></tr>\n"
+          "<div><dt>Restarting for</dt><dd>#{entry.seconds_since_published}s</dd></div>\n"
         end
 
         def work_item_rows(entry)
           return "" unless entry.kind == :runner && entry.work_item
 
           <<~HTML
-            <tr><th>Work item</th><td>#{esc(entry.work_item)}</td></tr>
-            <tr><th>Attempt</th><td>#{esc(entry.attempt)}</td></tr>
+            <div><dt>Work item</dt><dd>#{esc(entry.work_item)}</dd></div>
+            <div><dt>Attempt</dt><dd>#{esc(entry.attempt)}</dd></div>
           HTML
         end
 
-        def note_paragraph(status)
+        def activity_status(status)
           note = note_for(status)
-          return "" if note.empty?
+          value = esc(status || EM_DASH)
+          return value if note.empty?
 
-          "<p>#{esc(note)}</p>\n"
+          %(#{value}<p class="status-note">#{esc(note)}</p>)
+        end
+
+        # Guarded on liveness as well as the flag: `Fleet#stuck_restarting?`
+        # already refuses to set it outside `:restarting`, but that invariant
+        # lives one object away, and the failure mode here would be a warning
+        # on an entity with no "Restarting for" row to explain it.
+        def restart_delayed_warning(entry)
+          return "" unless entry.liveness == :restarting && entry.stuck_restarting
+
+          '<p class="restart-warning"><strong>Restart delayed</strong> — respawn is failing</p>'
         end
 
         # AC1/AC8: every entity kind gets this section — a messenger or the
@@ -659,25 +713,78 @@ module AgentDaemon
         # renders the empty state, never a missing heading (AC8).
         def activity_section(entry)
           events = @activity_log.recent(entry.id)
-          heading = "<h3>Recent activity (up to #{@activity_log.limit} events)</h3>"
-          body = events.empty? ? "<p>No activity recorded.</p>" : activity_table(events)
+          body = events.empty? ? "<p>No activity recorded.</p>" : activity_timeline(events)
 
-          "#{heading}\n#{body}#{ACTIVITY_NOTE}\n"
-        end
-
-        def activity_table(events)
-          rows = events.map { |event| activity_row(event) }.join
           <<~HTML
-            <table>
-            <tr><th>When</th><th>Gen</th><th>Event</th><th>Work item</th><th>Attempt</th><th>Detail</th></tr>
-            #{rows}</table>
+            <section aria-labelledby="activity-heading">
+            <h2 id="activity-heading">Recent activity (up to #{esc(@activity_log.limit)} events)</h2>
+            #{body}#{ACTIVITY_NOTE}
+            </section>
           HTML
         end
 
-        def activity_row(event)
+        # ActivityLog owns ordering and truncation. The renderer preserves its
+        # newest-first sequence verbatim and only marks transitions between
+        # adjacent generations. `reversed` keeps the ordinals honest: item one
+        # of a newest-first list is the *last* event, not the first.
+        def activity_timeline(events)
+          items = events.each_with_index.map do |event, index|
+            # The sequence is newest-first, so the preceding element is the
+            # event that happened *after* this one.
+            newer = index.positive? ? events[index - 1] : nil
+            activity_item(event, generation_changed: generation_changed?(event, newer))
+          end.join
+
           <<~HTML
-            <tr><td>#{esc(event.at || EM_DASH)}</td><td>#{esc(event.generation || EM_DASH)}</td><td>#{esc(event.type || EM_DASH)}</td><td>#{esc(event.work_item || EM_DASH)}</td><td>#{esc(event.attempt || EM_DASH)}</td><td>#{esc(activity_detail(event))}</td></tr>
+            <ol class="activity-timeline" role="list" reversed>
+            #{items}</ol>
           HTML
+        end
+
+        # A boundary needs two known generations to sit between. An event that
+        # carries none is a gap in the record, not a restart, and labelling it
+        # "Generation boundary: —" would assert a transition that never happened.
+        def generation_changed?(event, newer)
+          return false if newer.nil? || event.generation.nil? || newer.generation.nil?
+
+          event.generation != newer.generation
+        end
+
+        def activity_item(event, generation_changed:)
+          boundary = if generation_changed
+                       %(<p class="generation-boundary">Generation boundary: #{esc(event.generation)}</p>\n)
+                     else
+                       ""
+                     end
+
+          <<~HTML
+            <li>
+            #{boundary}<dl>
+            <div><dt>When</dt><dd>#{esc(event.at || EM_DASH)}</dd></div>
+            <div><dt>Generation</dt><dd>#{esc(event.generation || EM_DASH)}</dd></div>
+            <div><dt>Event</dt><dd>#{esc(event.type || EM_DASH)}</dd></div>
+            <div><dt>Work item</dt><dd>#{esc(event.work_item || EM_DASH)}</dd></div>
+            <div><dt>Attempt</dt><dd>#{esc(event.attempt || EM_DASH)}</dd></div>
+            <div><dt>Detail</dt><dd>#{activity_detail_html(event)}</dd></div>
+            </dl>
+            </li>
+          HTML
+        end
+
+        # The badge is presentation over `activity_detail`'s text, never a
+        # second source of it — a finished event's visible label is still the
+        # reason that method returns. No aria-label: a <span> maps to
+        # role="generic", which ARIA forbids from carrying an accessible name,
+        # so the label would be dropped by Chrome and Firefox and would
+        # *replace* the visible text where it is honoured. The <dt>Detail</dt>
+        # already supplies the association, and per AC8 the text carries the
+        # meaning while the colour is decoration.
+        def activity_detail_html(event)
+          detail = activity_detail(event)
+          return esc(detail) unless event.type == :finished
+
+          outcome = %i[ok failed timeout killed].include?(event.reason) ? event.reason : :unknown
+          %(<span class="outcome outcome-#{outcome}">#{esc(detail)}</span>)
         end
 
         # Detail cell contract (Story 2.5 Dev Notes): a finished row's reason

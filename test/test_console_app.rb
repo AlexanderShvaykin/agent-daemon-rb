@@ -252,6 +252,26 @@ class TestConsoleApp < Minitest::Test
     refute_includes content, "console-header"
   end
 
+  def test_live_content_region_contains_complete_detail_sections_but_not_chrome_or_css
+    body = get_on(one_runner_app, "/entity?id=runner%3Awf%3Aalpha").body
+    content = body[/<main id="console-content">(.*?)<\/main>/m, 1]
+
+    refute_nil content
+    assert_includes content, 'aria-labelledby="entity-diagnostics-heading"'
+    assert_includes content, 'aria-labelledby="activity-heading"'
+    assert_includes content, "alpha"
+    assert_includes content, "Recent activity"
+    refute_includes content, "<style>"
+    refute_includes content, "console-header"
+    # Anchored on the element, not the bare class name: `console-header` also
+    # appears as a CSS rule inside the <head> <style>, so indexing on the
+    # substring alone would pass even with the header element deleted.
+    assert_includes body, '<header class="console-header">'
+    assert_operator body.index("</style>"), :<, body.index('<main id="console-content">')
+    assert_operator body.index('<header class="console-header">'), :<,
+                    body.index('<main id="console-content">')
+  end
+
   def test_stylesheet_provides_responsive_reflow_and_keyboard_focus_contracts
     stylesheet = App::STYLESHEET
 
@@ -565,6 +585,12 @@ class TestConsoleApp < Minitest::Test
 
   # --- Story 2.4: per-runner detail page -----------------------------------
 
+  def diagnostic_section(body)
+    found = body[%r{<section aria-labelledby="entity-diagnostics-heading">.*?</section>}m]
+    refute_nil found, "no labelled diagnostics section in the page"
+    found
+  end
+
   def test_a_waiting_runner_shows_liveness_and_activity_but_no_work_item_row
     id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
     registry = StateRegistry.new
@@ -572,12 +598,12 @@ class TestConsoleApp < Minitest::Test
     roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
     app = build_app(Fleet.new(roster: roster, state_registry: registry))
 
-    body = get_on(app, "/entity?id=runner%3Awf%3Aalpha").body
+    diagnostics = diagnostic_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
-    assert_includes body, %(<span class="liveness liveness-alive">alive</span>)
-    assert_includes body, "<tr><th>Activity</th><td>waiting</td></tr>"
-    refute_includes body, "<th>Work item</th>"
-    refute_includes body, "<th>Attempt</th>"
+    assert_includes diagnostics, %(<span class="liveness liveness-alive">alive</span>)
+    assert_includes diagnostics, "<div><dt>Activity</dt><dd>waiting</dd></div>"
+    refute_includes diagnostics, "<dt>Work item</dt>"
+    refute_includes diagnostics, "<dt>Attempt</dt>"
   end
 
   # AC7
@@ -588,10 +614,20 @@ class TestConsoleApp < Minitest::Test
     roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
     app = build_app(Fleet.new(roster: roster, state_registry: registry))
 
-    body = get_on(app, "/entity?id=runner%3Awf%3Aalpha").body
+    diagnostics = diagnostic_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
-    assert_includes body, "<tr><th>Work item</th><td>T-1</td></tr>"
-    assert_includes body, "<tr><th>Attempt</th><td>2</td></tr>"
+    expected_fields = <<~HTML.chomp
+      <div><dt>Workflow</dt><dd>wf</dd></div>
+      <div><dt>Kind</dt><dd>runner</dd></div>
+      <div><dt>Liveness</dt><dd><span class="liveness liveness-alive">alive</span></dd></div>
+      <div><dt>Activity</dt><dd>in_progress</dd></div>
+      <div><dt>Work item</dt><dd>T-1</dd></div>
+      <div><dt>Attempt</dt><dd>2</dd></div>
+      <div><dt>Generation</dt><dd>1 (0 restart(s))</dd></div>
+    HTML
+    assert_includes diagnostics, expected_fields
+    assert_operator diagnostics.index("<dt>Work item</dt>"), :<, diagnostics.index("<dt>Generation</dt>")
+    assert_operator diagnostics.index("<dt>Attempt</dt>"), :<, diagnostics.index("<dt>State published</dt>")
   end
 
   # AC4-carried-forward: work_item is the first genuinely agent-influenced
@@ -609,6 +645,32 @@ class TestConsoleApp < Minitest::Test
     assert_includes body, "&lt;script&gt;alert(1)&lt;/script&gt;"
   end
 
+  def test_detail_page_escapes_hostile_entity_workflow_and_session_values
+    malicious_name = %(<script>alert("entity")</script>)
+    malicious_workflow = %(<img src=x onerror="workflow">)
+    id = RunnerIdentity.new(workflow: malicious_workflow, runner: malicious_name)
+    registry = StateRegistry.new
+    registry.publish(id, { status: :waiting, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: malicious_workflow,
+                                  name: malicious_name, entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry))
+    session = session_for(%(<svg onload="username">))
+    session.csrf_token = %("><script>csrf</script>)
+
+    entity_id = RunnerIdentity.key_for(id)
+    response = app.get("/entity?id=#{Rack::Utils.escape(entity_id)}", { Auth::SESSION_ENV_KEY => session })
+    assert_equal 200, response.status
+    body = response.body
+    diagnostics = diagnostic_section(body)
+
+    assert_includes diagnostics, '&lt;script&gt;alert(&quot;entity&quot;)&lt;/script&gt;'
+    assert_includes diagnostics, '&lt;img src=x onerror=&quot;workflow&quot;&gt;'
+    assert_includes body, '&lt;svg onload=&quot;username&quot;&gt;'
+    assert_includes body, '&quot;&gt;&lt;script&gt;csrf&lt;/script&gt;'
+    refute_includes inert_body(body), malicious_name
+    refute_includes diagnostics, malicious_workflow
+  end
+
   # AC6, rendered: the same-generation :crashed publish is a full overwrite,
   # so a crashed runner never renders a stale "working on X" row — this is
   # impossible by construction, so the render is checked against the AC6
@@ -621,13 +683,45 @@ class TestConsoleApp < Minitest::Test
     roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "flaky", entity_id: id)]
     app = build_app(Fleet.new(roster: roster, state_registry: registry, restart_delay: 60))
 
-    body = get_on(app, "/entity?id=runner%3Awf%3Aflaky").body
+    diagnostics = diagnostic_section(get_on(app, "/entity?id=runner%3Awf%3Aflaky").body)
 
-    assert_includes body, %(<span class="liveness liveness-restarting">restarting</span>)
-    assert_includes body, "<tr><th>Generation</th><td>1 (0 restart(s))</td></tr>"
-    assert_match(%r{<tr><th>Restarting for</th><td>\d+s</td></tr>}, body)
-    refute_includes body, "<th>Work item</th>"
-    refute_includes body, "T-1"
+    assert_includes diagnostics, %(<span class="liveness liveness-restarting">restarting</span>)
+    # DR2 item 8: the order guard built from an :in_progress runner cannot
+    # cover "Restarting for", which only renders in this state. Pinned here
+    # against the two fields it must precede.
+    assert_match(
+      %r{<div><dt>Restarting\ for</dt><dd>\d+s</dd></div>\n
+         <div><dt>Generation</dt><dd>1\ \(0\ restart\(s\)\)</dd></div>\n
+         <div><dt>State\ published</dt>}x,
+      diagnostics
+    )
+    refute_includes diagnostics, "<dt>Work item</dt>"
+    refute_includes diagnostics, "<dt>Attempt</dt>"
+    refute_includes diagnostics, "T-1"
+  end
+
+  def test_terminal_runner_states_omit_stale_work_and_keep_their_exact_adjacent_notes
+    {
+      exited: "exited cleanly — not auto-restarted",
+      stopped: "stopped — fleet is shutting down"
+    }.each do |status, note|
+      id = RunnerIdentity.new(workflow: "wf", runner: status.to_s)
+      registry = StateRegistry.new
+      registry.publish(id, { status: :in_progress, work_item: "STALE", attempt: 3, generation: 1 })
+      registry.publish(id, { status: status, generation: 2 })
+      roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: status.to_s, entity_id: id)]
+      app = build_app(Fleet.new(roster: roster, state_registry: registry))
+
+      entity_id = RunnerIdentity.key_for(id)
+      diagnostics = diagnostic_section(get_on(app, "/entity?id=#{Rack::Utils.escape(entity_id)}").body)
+
+      assert_includes diagnostics,
+                      "<div><dt>Activity</dt><dd>#{status}<p class=\"status-note\">#{note}</p></dd></div>"
+      assert_includes diagnostics, "<div><dt>Generation</dt><dd>2 (1 restart(s))</dd></div>"
+      refute_includes diagnostics, "<dt>Work item</dt>"
+      refute_includes diagnostics, "<dt>Attempt</dt>"
+      refute_includes diagnostics, "STALE"
+    end
   end
 
   # AC4: a healthy restart vs. a stuck crash-loop, driven by the injected
@@ -644,13 +738,15 @@ class TestConsoleApp < Minitest::Test
     fresh_app = build_app(Fleet.new(roster: roster, state_registry: registry, restart_delay: 60,
                                      clock: -> { published_at + 1 }))
 
-    stuck_body = get_on(stuck_app, "/entity?id=runner%3Awf%3Aflaky").body
-    fresh_body = get_on(fresh_app, "/entity?id=runner%3Awf%3Aflaky").body
+    stuck = diagnostic_section(get_on(stuck_app, "/entity?id=runner%3Awf%3Aflaky").body)
+    fresh = diagnostic_section(get_on(fresh_app, "/entity?id=runner%3Awf%3Aflaky").body)
 
-    assert_includes stuck_body,
-                    "<tr><th>Restarting for</th><td>66s — <strong>stuck: respawn is failing</strong></td></tr>"
-    assert_includes fresh_body, "<tr><th>Restarting for</th><td>1s</td></tr>"
-    refute_includes fresh_body, "stuck: respawn is failing"
+    assert_includes stuck, "<div><dt>Restarting for</dt><dd>66s</dd></div>"
+    assert_includes stuck, "<strong>Restart delayed</strong> — respawn is failing"
+    assert_operator stuck.index("Restart delayed"), :<, stuck.index("<button"),
+                    "the delayed warning must precede the restart control"
+    assert_includes fresh, "<div><dt>Restarting for</dt><dd>1s</dd></div>"
+    refute_includes fresh, "Restart delayed"
   end
 
   # AC9: a messenger/reactor entity has no work-item/attempt semantics at all.
@@ -660,11 +756,13 @@ class TestConsoleApp < Minitest::Test
     roster = [Fleet::Rostered.new(kind: :messenger, workflow: "wf", name: "messenger", entity_id: "messenger:wf")]
     app = build_app(Fleet.new(roster: roster, state_registry: registry))
 
-    body = get_on(app, "/entity?id=messenger%3Awf").body
+    diagnostics = diagnostic_section(get_on(app, "/entity?id=messenger%3Awf").body)
 
-    assert_includes body, %(<span class="liveness liveness-alive">alive</span>)
-    refute_includes body, "<th>Work item</th>"
-    refute_includes body, "<th>Attempt</th>"
+    assert_includes diagnostics, %(<span class="liveness liveness-alive">alive</span>)
+    assert_includes diagnostics, "<div><dt>Activity</dt><dd>running</dd></div>"
+    assert_includes diagnostics, "<div><dt>Generation</dt><dd>1 (0 restart(s))</dd></div>"
+    refute_includes diagnostics, "<dt>Work item</dt>"
+    refute_includes diagnostics, "<dt>Attempt</dt>"
   end
 
   def test_a_reactor_entity_shows_liveness_only
@@ -675,14 +773,16 @@ class TestConsoleApp < Minitest::Test
     ]
     app = build_app(Fleet.new(roster: roster, state_registry: registry))
 
-    body = get_on(app, "/entity?id=mattermost_reactor").body
+    diagnostics = diagnostic_section(get_on(app, "/entity?id=mattermost_reactor").body)
 
-    assert_includes body, %(<span class="liveness liveness-alive">alive</span>)
+    assert_includes diagnostics, %(<span class="liveness liveness-alive">alive</span>)
     # The reactor is fleet-wide, so its Workflow cell is the pinned em dash
     # rather than a blank cell.
-    assert_includes body, "<tr><th>Workflow</th><td>—</td></tr>"
-    refute_includes body, "<th>Work item</th>"
-    refute_includes body, "<th>Attempt</th>"
+    assert_includes diagnostics, "<div><dt>Workflow</dt><dd>—</dd></div>"
+    assert_includes diagnostics, "<div><dt>Activity</dt><dd>running</dd></div>"
+    assert_includes diagnostics, "<div><dt>Generation</dt><dd>1 (0 restart(s))</dd></div>"
+    refute_includes diagnostics, "<dt>Work item</dt>"
+    refute_includes diagnostics, "<dt>Attempt</dt>"
   end
 
   # AC5
@@ -721,7 +821,7 @@ class TestConsoleApp < Minitest::Test
     response = get_on(app, "/entity?id=runner%3Awf%3Aalpha")
 
     assert_equal 200, response.status
-    assert_includes response.body, "<h2>alpha</h2>"
+    assert_includes response.body, '<h2 id="entity-diagnostics-heading">alpha</h2>'
   end
 
   # The Detail page contract's empty markers: "— is the empty marker … never a
@@ -734,16 +834,23 @@ class TestConsoleApp < Minitest::Test
     app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new))
 
     body = get_on(app, "/entity?id=runner%3Awf%3Aghost").body
+    diagnostics = diagnostic_section(body)
 
+    # The Fleet link is page-level navigation, so it sits ahead of the named
+    # diagnostics region rather than being announced as content of it.
     assert_includes body, %(<p><a href="/">&larr; Fleet</a></p>)
-    assert_includes body, "<h2>ghost</h2>"
-    assert_includes body, "<tr><th>Workflow</th><td>wf</td></tr>"
-    assert_includes body, "<tr><th>Kind</th><td>runner</td></tr>"
-    assert_includes body, %(<span class="liveness liveness-unknown">unknown</span>)
-    assert_includes body, "<tr><th>Activity</th><td>—</td></tr>"
-    assert_includes body, "<tr><th>Generation</th><td>—</td></tr>"
-    assert_includes body, "<tr><th>State published</th><td>never</td></tr>"
-    assert_includes body, "<p>no state published — never started, or failed to start</p>"
+    refute_includes diagnostics, %(<a href="/">&larr; Fleet</a>)
+    assert_operator body.index(%(<a href="/">&larr; Fleet</a>)), :<,
+                    body.index('<section aria-labelledby="entity-diagnostics-heading">')
+    assert_includes diagnostics, '<h2 id="entity-diagnostics-heading">ghost</h2>'
+    assert_includes diagnostics, "<div><dt>Workflow</dt><dd>wf</dd></div>"
+    assert_includes diagnostics, "<div><dt>Kind</dt><dd>runner</dd></div>"
+    assert_includes diagnostics, %(<span class="liveness liveness-unknown">unknown</span>)
+    assert_includes diagnostics,
+                    '<div><dt>Activity</dt><dd>—<p class="status-note">' \
+                    'no state published — never started, or failed to start</p></dd></div>'
+    assert_includes diagnostics, "<div><dt>Generation</dt><dd>—</dd></div>"
+    assert_includes diagnostics, "<div><dt>State published</dt><dd>never</dd></div>"
   end
 
   # AC11: an unknown id is a plain 404 that echoes nothing.
@@ -845,7 +952,7 @@ class TestConsoleApp < Minitest::Test
 
     detail_body = get_on(app, href).body
 
-    assert_includes detail_body, "<h2>alpha</h2>"
+    assert_includes detail_body, '<h2 id="entity-diagnostics-heading">alpha</h2>'
   end
 
   # --- Story 2.5: the activity log section ----------------------------------
@@ -854,7 +961,7 @@ class TestConsoleApp < Minitest::Test
   # no-match, so a layout regression surfaces as a readable failure here
   # rather than as a NoMethodError further down.
   def activity_section(body)
-    found = body[%r{<h3>Recent activity \(up to \d+ events\)</h3>.*?<p class="activity-note">[^<]*</p>}m]
+    found = body[%r{<section aria-labelledby="activity-heading">.*?<p class="activity-note">[^<]*</p>\s*</section>}m]
     refute_nil found, "no activity section found in the page"
     found
   end
@@ -867,9 +974,13 @@ class TestConsoleApp < Minitest::Test
   # The section's two remaining pinned strings, asserted literally rather than
   # against the constants that render them: the note is only ever located by
   # activity_section's `[^<]*` regex, which passes for any wording, and the
-  # header row is only ever asserted in the negative by the empty-state test.
-  # Column set and order are part of the contract.
-  def test_the_pinned_note_and_table_header_render_verbatim
+  # field labels are otherwise only asserted piecemeal by event-specific tests.
+  # Field set AND order are part of the contract: this is the one
+  # order-sensitive assertion over the timeline, replacing the header row the
+  # table used to pin. An order-insensitive loop of `assert_includes` cannot
+  # fail on a reorder, a dropped field, or a field migrating into another <dl>
+  # — the exact regression Story 3.1's review had to undo once already.
+  def test_the_pinned_note_and_timeline_fields_render_verbatim_and_in_order
     id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
     bus = EventBus.new
     bus.publish(id, { type: :picked_up, work_item: "TASK-1", generation: 1 })
@@ -878,9 +989,18 @@ class TestConsoleApp < Minitest::Test
 
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
-    assert_includes section,
-                    "<tr><th>When</th><th>Gen</th><th>Event</th><th>Work item</th>" \
-                    "<th>Attempt</th><th>Detail</th></tr>"
+    assert_match(/<ol[^>]* role="list"[^>]*>/, section)
+    assert_match(
+      %r{<dl>\n
+         <div><dt>When</dt><dd>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z</dd></div>\n
+         <div><dt>Generation</dt><dd>1</dd></div>\n
+         <div><dt>Event</dt><dd>picked_up</dd></div>\n
+         <div><dt>Work\ item</dt><dd>TASK-1</dd></div>\n
+         <div><dt>Attempt</dt><dd>—</dd></div>\n
+         <div><dt>Detail</dt><dd>—</dd></div>\n
+         </dl>}x,
+      section
+    )
     assert_includes section,
                     "<p class=\"activity-note\">Recent activity only — the event buffer is bounded " \
                     "and does not survive a supervisor restart.</p>"
@@ -900,9 +1020,9 @@ class TestConsoleApp < Minitest::Test
 
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
-    assert_includes section, "<h3>Recent activity (up to 2 events)</h3>"
+    assert_includes section, '<h2 id="activity-heading">Recent activity (up to 2 events)</h2>'
     refute_includes section, "up to #{ActivityLog::DEFAULT_LIMIT} events"
-    assert_equal 2, section.scan("<tr><td>").size
+    assert_equal 2, section.scan("<li>").size
   end
 
   def test_a_full_work_item_cycle_renders_three_activity_rows
@@ -917,12 +1037,15 @@ class TestConsoleApp < Minitest::Test
 
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
-    assert_includes section, "<h3>Recent activity (up to 50 events)</h3>"
-    assert_equal 3, section.scan("<tr><td>").size
+    assert_includes section, '<h2 id="activity-heading">Recent activity (up to 50 events)</h2>'
+    assert_equal 3, section.scan("<li>").size
     assert_match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/, section)
-    assert_includes section, "<td>1</td><td>picked_up</td><td>T-1</td><td>—</td><td>—</td>"
-    assert_includes section, "<td>1</td><td>started</td><td>T-1</td><td>1</td><td>—</td>"
-    assert_includes section, "<td>1</td><td>finished</td><td>T-1</td><td>1</td><td>ok</td>"
+    assert_includes section, "<dt>Generation</dt><dd>1</dd>"
+    assert_includes section, "<dt>Work item</dt><dd>T-1</dd>"
+    assert_includes section, "<dt>Attempt</dt><dd>1</dd>"
+    assert_includes section, %(<dt>Detail</dt><dd><span class="outcome outcome-ok">ok</span></dd>)
+    assert_operator section.index("<dd>finished</dd>"), :<, section.index("<dd>started</dd>")
+    assert_operator section.index("<dd>started</dd>"), :<, section.index("<dd>picked_up</dd>")
   end
 
   def test_each_finished_reason_renders_verbatim_in_the_detail_cell
@@ -937,7 +1060,8 @@ class TestConsoleApp < Minitest::Test
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
     %w[ok failed timeout killed].each do |reason|
-      assert_includes section, "<td>#{reason}</td></tr>", "reason #{reason.inspect} did not render verbatim"
+      assert_includes section, %(<span class="outcome outcome-#{reason}">#{reason}</span>),
+                      "reason #{reason.inspect} did not render as a text-labelled outcome"
     end
   end
 
@@ -951,7 +1075,9 @@ class TestConsoleApp < Minitest::Test
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
     assert_match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/, section)
-    assert_includes section, "<td>restart</td><td>—</td><td>—</td><td>actor: crash_auto</td>"
+    assert_includes section, "<dt>Generation</dt><dd>2</dd>"
+    assert_includes section, "<dt>Event</dt><dd>restart</dd>"
+    assert_includes section, "<dt>Detail</dt><dd>actor: crash_auto</dd>"
   end
 
   def test_a_multi_actor_restart_set_renders_joined
@@ -975,7 +1101,29 @@ class TestConsoleApp < Minitest::Test
 
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
-    assert_includes section, "<td>restart</td><td>—</td><td>—</td><td>—</td>"
+    assert_includes section, "<dt>Event</dt><dd>restart</dd>"
+    assert_includes section, "<dt>Detail</dt><dd>—</dd>"
+  end
+
+  # A boundary marker claims "a restart happened between these two events". An
+  # event published through an unstamped bundle carries no generation, which is
+  # a gap in the record, not a transition — the positive control above it is the
+  # real boundary between generations 2 and 1.
+  def test_an_event_without_a_generation_does_not_manufacture_a_boundary
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    bus = EventBus.new
+    bus.publish(id, { type: :picked_up, work_item: "T-0" })
+    GenerationStamp.new(1, bus).publish(id, { type: :picked_up, work_item: "T-1" })
+    GenerationStamp.new(2, bus).publish(id, { type: :picked_up, work_item: "T-2" })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, event_bus: bus)
+
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, "<dt>Generation</dt><dd>—</dd>"
+    assert_equal 1, section.scan('<p class="generation-boundary">').size
+    assert_includes section, '<p class="generation-boundary">Generation boundary: 1</p>'
+    refute_includes section, "Generation boundary: —"
   end
 
   # AC4: two generations of the same restarted runner interleave, and each row
@@ -990,8 +1138,11 @@ class TestConsoleApp < Minitest::Test
 
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
-    assert_includes section, "<td>2</td><td>picked_up</td><td>T-2</td>"
-    assert_includes section, "<td>1</td><td>picked_up</td><td>T-1</td>"
+    assert_operator section.index("<dt>Generation</dt><dd>2</dd>"), :<,
+                    section.index("<dt>Generation</dt><dd>1</dd>"), "events must remain newest first"
+    assert_includes section, "<dt>Work item</dt><dd>T-2</dd>"
+    assert_includes section, "<dt>Work item</dt><dd>T-1</dd>"
+    assert_includes section, '<p class="generation-boundary">Generation boundary: 1</p>'
   end
 
   # AC4/Detail cell: a record shape this app does not know is rendered with
@@ -1006,7 +1157,8 @@ class TestConsoleApp < Minitest::Test
 
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
-    assert_includes section, "<td>some_future_event</td><td>—</td><td>—</td><td>—</td>"
+    assert_includes section, "<dt>Event</dt><dd>some_future_event</dd>"
+    assert_includes section, "<dt>Detail</dt><dd>—</dd>"
   end
 
   def test_a_hostile_work_item_is_rendered_inert
@@ -1050,7 +1202,7 @@ class TestConsoleApp < Minitest::Test
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
     assert_includes section, "<p>No activity recorded.</p>"
-    refute_includes section, "<tr><th>When</th><th>Gen</th><th>Event</th><th>Work item</th><th>Attempt</th><th>Detail</th></tr>"
+    refute_match(/<ol[^>]* role="list">/, section)
   end
 
   # AC8: a messenger's timeline is restart-only, never absent — and 2.4's
@@ -1068,8 +1220,9 @@ class TestConsoleApp < Minitest::Test
     section = activity_section(body)
 
     assert_includes section, "actor: crash_auto"
-    refute_includes body, "<tr><th>Work item</th><td>"
-    refute_includes body, "<tr><th>Attempt</th><td>"
+    diagnostics = diagnostic_section(body)
+    refute_includes diagnostics, "<dt>Work item</dt>"
+    refute_includes diagnostics, "<dt>Attempt</dt>"
   end
 
   # More events than the limit -> exactly ActivityLog::DEFAULT_LIMIT rows, the
@@ -1083,7 +1236,7 @@ class TestConsoleApp < Minitest::Test
 
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
-    assert_equal ActivityLog::DEFAULT_LIMIT, section.scan("<tr><td>").size
+    assert_equal ActivityLog::DEFAULT_LIMIT, section.scan("<li>").size
     assert_includes section, "item-#{ActivityLog::DEFAULT_LIMIT + 9}"
     refute_includes section, "item-0<"
   end
