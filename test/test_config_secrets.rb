@@ -106,4 +106,65 @@ class TestConfigSecrets < Minitest::Test
       with_config(token: "<%= secret('X' %>") { |_| }
     end
   end
+
+  # --- Story 3.3 / DR1: resolved secrets are recorded for the Redactor -------
+
+  # The recorder must keep the RAW value, not the .to_json quoted form: the raw
+  # string is what reaches the agent and can be echoed back on stdout.
+  def test_resolved_secrets_records_the_raw_value_not_the_json_form
+    value = "sekret-value-1"
+    with_env("TRACKER_TOKEN" => value) do
+      with_config(token: "<%= secret('TRACKER_TOKEN') %>") do |config|
+        assert_equal [value], config.resolved_secrets
+        refute_includes config.resolved_secrets, value.to_json
+      end
+    end
+  end
+
+  # Dedup is the Redactor's job (DR2), not the recorder's — verbatim capture.
+  def test_two_references_to_one_key_are_recorded_twice
+    with_env("TRACKER_TOKEN" => "sekret-value-1") do
+      with_config(token: "<%= secret('TRACKER_TOKEN') %>",
+                  extra_tracker: "  second: <%= secret('TRACKER_TOKEN') %>") do |config|
+        assert_equal %w[sekret-value-1 sekret-value-1], config.resolved_secrets
+      end
+    end
+  end
+
+  def test_config_without_secret_calls_exposes_an_empty_collection
+    with_config(token: "plain-token") do |config|
+      assert_empty config.resolved_secrets
+    end
+  end
+
+  # AD-8's accepted residual: raw ENV interpolation is not captured.
+  # The positive control is test_resolved_secrets_records_the_raw_value_...
+  def test_raw_env_interpolation_records_nothing
+    with_env("TRACKER_TOKEN" => "sekret-value-1") do
+      with_config(token: "<%= ENV['TRACKER_TOKEN'] %>") do |config|
+        assert_equal "sekret-value-1", config.tracker["token"], "positive control: the value did reach the config"
+        assert_empty config.resolved_secrets
+      end
+    end
+  end
+
+  # A missing secret raises before recording anything.
+  def test_missing_secret_records_nothing
+    config = AgentDaemon::Config.allocate
+
+    assert_raises(AgentDaemon::ConfigError) { config.send(:secret, "UNSET_SECRET_XYZ_3_3") }
+
+    assert_empty config.resolved_secrets
+  end
+
+  def test_resolved_secrets_hands_out_a_copy
+    with_env("TRACKER_TOKEN" => "sekret-value-1") do
+      with_config(token: "<%= secret('TRACKER_TOKEN') %>") do |config|
+        first = config.resolved_secrets
+        assert_raises(FrozenError) { first << "injected" }
+        assert_equal %w[sekret-value-1], config.resolved_secrets
+        refute_same first, config.resolved_secrets
+      end
+    end
+  end
 end

@@ -22,16 +22,28 @@ class TestableBackend < AgentDaemon::Backend::Base
   end
 end
 
-# Records every output-sink append as an [entity_id, stream, chunk] tuple.
+# Records every output-sink append as an [entity_id, stream, chunk] tuple,
+# plus the Story 3.3 run lifecycle in one ordered `events` log so a test can
+# assert that begin_run/end_run actually bracket the chunks.
 class RecordingOutputSink
-  attr_reader :calls
+  attr_reader :calls, :events
 
   def initialize
     @calls = []
+    @events = []
   end
 
   def append(entity_id, stream, chunk)
     @calls << [entity_id, stream, chunk]
+    @events << [:append, stream, chunk]
+  end
+
+  def begin_run(_entity_id, run_id)
+    @events << [:begin_run, run_id]
+  end
+
+  def end_run(_entity_id, run_id, reason)
+    @events << [:end_run, run_id, reason]
   end
 end
 
@@ -230,6 +242,92 @@ class TestBackendExecute < Minitest::Test
 
     assert_equal :ok, result.reason
     assert_includes result.stdout, "ok"
+  end
+
+  # --- Story 3.3 / DR4+DR9: the output run lifecycle -----------------------
+
+  def test_exactly_one_begin_run_brackets_the_chunks_and_one_end_run_closes_them
+    recorder = RecordingOutputSink.new
+    backend = build_backend(sinks: sink_bundle(recorder))
+
+    backend.call("echo one; echo two", timeout: 5)
+
+    kinds = recorder.events.map(&:first)
+    assert_includes kinds, :append, "positive control: chunks did reach the sink"
+    assert_equal :begin_run, kinds.first
+    assert_equal :end_run, kinds.last
+    assert_equal 1, kinds.count(:begin_run)
+    assert_equal 1, kinds.count(:end_run)
+  end
+
+  def test_the_run_id_increments_across_two_runs_on_one_backend_instance
+    recorder = RecordingOutputSink.new
+    backend = build_backend(sinks: sink_bundle(recorder))
+
+    backend.call("echo a", timeout: 5)
+    backend.call("echo b", timeout: 5)
+
+    assert_equal [[:begin_run, 1], [:end_run, 1, :ok], [:begin_run, 2], [:end_run, 2, :ok]],
+                 recorder.events.reject { |e| e.first == :append }
+  end
+
+  # AC7's teeth: for every terminal reason, the run is closed with THAT reason
+  # and the final newline-less line reached the sink before the close.
+  {
+    ok: %(sh -c 'printf tail-no-newline'),
+    failed: %(sh -c 'printf tail-no-newline; exit 3'),
+    timeout: %(sh -c 'trap "printf tail-no-newline; exit 0" TERM; sleep 30')
+  }.each do |expected_reason, command|
+    define_method(:"test_#{expected_reason}_run_closes_with_its_reason_after_a_newlineless_final_line") do
+      recorder = RecordingOutputSink.new
+      backend = build_backend(sinks: sink_bundle(recorder))
+
+      result = backend.call(command, timeout: expected_reason == :timeout ? 1 : 5)
+
+      assert_equal expected_reason, result.reason
+      close = recorder.events.last
+      assert_equal [:end_run, 1, expected_reason], close
+      tail_index = recorder.events.index { |e| e.first == :append && e[2].include?("tail-no-newline") }
+      refute_nil tail_index, "the newline-less final line must reach the sink"
+      assert_operator tail_index, :<, recorder.events.size - 1, "it must arrive before end_run"
+      refute_includes result.stdout, "\n"
+    end
+  end
+
+  def test_killed_run_closes_with_its_reason_after_a_newlineless_final_line
+    recorder = RecordingOutputSink.new
+    backend = build_backend(sinks: sink_bundle(recorder))
+    thread = Thread.new do
+      sleep(0.3)
+      @shutdown.value = true
+    end
+
+    result = backend.call(%(sh -c 'trap "printf tail-no-newline; exit 0" TERM; sleep 30'), timeout: 60)
+    thread.join
+
+    assert_equal :killed, result.reason
+    assert_equal [:end_run, 1, :killed], recorder.events.last
+    assert(recorder.events.any? { |e| e.first == :append && e[2].include?("tail-no-newline") })
+  end
+
+  # The lifecycle close sits in an ensure around the WHOLE execute body, so an
+  # exception escaping it still flushes the run.
+  def test_end_run_fires_when_the_execute_body_raises
+    recorder = RecordingOutputSink.new
+    # Not a Sinks::Bundle: Bundle#guard would swallow the error before it
+    # could escape execute, which is the very thing under test here.
+    exploding = Object.new
+    exploding.define_singleton_method(:begin_output_run) { |run_id| recorder.begin_run("ent", run_id) }
+    exploding.define_singleton_method(:end_output_run) { |run_id, reason| recorder.end_run("ent", run_id, reason) }
+    exploding.define_singleton_method(:append_output) { |_stream, _chunk| raise "sink boom" }
+    backend = build_backend(sinks: exploding)
+
+    assert_raises(RuntimeError) { backend.call("echo boom", timeout: 5) }
+
+    assert_equal [:begin_run, 1], recorder.events.first
+    # The body raised before a terminal reason was assigned, so the run is
+    # closed with a nil reason — pinned as protocol behavior.
+    assert_equal [:end_run, 1, nil], recorder.events.last
   end
 
   private

@@ -37,6 +37,10 @@ module AgentDaemon
         # restart lands.
         @cancel_flag = cancel_flag
         @current_pid = nil
+        # Per-instance monotonic run id. Deterministic and stdlib; unique
+        # enough because every record also carries entity_id and generation,
+        # and the supervisor mints a fresh backend per generation.
+        @run_seq = 0
       end
 
       def run(prompt)
@@ -76,6 +80,15 @@ module AgentDaemon
         reason = nil
         pid = nil
         finished_at = nil
+        run_id = (@run_seq += 1)
+
+        # The run is opened before the child exists and closed in an ensure
+        # around the WHOLE body — deliberately outside the popen3 block, where
+        # a block-level ensure would fire before Open3's own wait_thr.join
+        # (see the @current_pid note below). Outside, an exception escaping
+        # execute still flushes a buffered partial line and clears the
+        # entity's buffers, so the next run cannot inherit a fragment.
+        @sinks.begin_output_run(run_id)
 
         Open3.popen3(cmd, pgroup: true) do |stdin, out, err, wait_thr|
           stdin.close
@@ -137,6 +150,10 @@ module AgentDaemon
 
         success = reason == :ok
         Result.new(success, stdout_buf, stderr_buf, reason, started_at, finished_at, pid)
+      ensure
+        # `reason` is nil here when the body raised before a terminal reason
+        # was assigned; sinks accept nil as an opaque "run aborted" value.
+        @sinks.end_output_run(run_id, reason)
       end
 
       # The single ingress for agent output: every chunk — read in the select

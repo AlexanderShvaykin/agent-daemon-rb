@@ -7,6 +7,8 @@ require_relative "state_registry"
 require_relative "event_bus"
 require_relative "fleet"
 require_relative "activity_log"
+require_relative "redactor"
+require_relative "output_pipeline"
 require_relative "console/server"
 
 module AgentDaemon
@@ -45,7 +47,7 @@ module AgentDaemon
         )
       end
 
-      attr_reader :state_registry, :event_bus
+      attr_reader :state_registry, :event_bus, :output_pipeline
 
       def initialize(supervisor_config, join_timeout: JOIN_TIMEOUT, console_factory: CONSOLE_FACTORY)
         @config = supervisor_config
@@ -61,6 +63,7 @@ module AgentDaemon
         @console_dead = false
         @state_registry = StateRegistry.new
         @event_bus = EventBus.new(capacity: supervisor_config.event_bus_capacity)
+        @output_pipeline = OutputPipeline.new(redactor: Redactor.new(known_secrets(supervisor_config)))
       end
 
       def start
@@ -88,6 +91,16 @@ module AgentDaemon
 
       private
 
+      # Every value `secret()` resolved anywhere in the fleet's configuration:
+      # the supervisor's own plus EVERY workflow's, because a workflow secret
+      # the supervisor config never referenced must still be redacted (and
+      # vice versa). The returned array is handed straight to the Redactor and
+      # never retained, logged, or exposed.
+      def known_secrets(supervisor_config)
+        supervisor_config.resolved_secrets +
+          supervisor_config.workflows.filter_map { |w| w[:config] }.flat_map(&:resolved_secrets)
+      end
+
       def setup_signal_handlers
         %w[INT TERM].each do |signal|
           trap(signal) do
@@ -109,18 +122,25 @@ module AgentDaemon
         end
       end
 
-      # Mirrors RunnerSupervisor#default_sinks_factory exactly, except the
-      # state/event sinks are the Master's own StateRegistry/EventBus instead
-      # of Null — the read model (AD-4) that every Epic 2 observer reads.
-      # Output stays the Bundle default (NullOutput); the output pipeline is
-      # Epic 3.
+      # The supervised fleet's sink bundle. It deliberately does NOT mirror
+      # RunnerSupervisor#default_sinks_factory: all three sinks diverge, and
+      # the divergence is the point. State and event go to the Master's own
+      # StateRegistry/EventBus — the read model (AD-4) every Epic 2 observer
+      # reads — and output goes to the Master's OutputPipeline. Only the
+      # Master owns those; RunnerSupervisor's default serves the
+      # no-supervisor path and stays Null on purpose.
+      #
+      # GenerationStamp implements #publish only, so it cannot decorate the
+      # output protocol; the pipeline's own per-generation ingress carries the
+      # stamp instead (DR6).
       def read_model_sinks_factory(key)
         entity_id = @entity_ids.fetch(key)
         lambda do |generation|
           Sinks::Bundle.new(
             entity_id: entity_id,
             state: GenerationStamp.new(generation, @state_registry),
-            event: GenerationStamp.new(generation, @event_bus)
+            event: GenerationStamp.new(generation, @event_bus),
+            output: @output_pipeline.ingress(generation)
           )
         end
       end

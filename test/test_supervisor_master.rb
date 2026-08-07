@@ -777,4 +777,198 @@ class TestSupervisorMaster < Minitest::Test
       assert_equal %w[a], master.instance_variable_get(:@roster).map(&:name)
     end
   end
+
+  # --- Story 3.3 / DR6: the output pipeline is wired into the fleet ---------
+
+  class PipelineObserver
+    attr_reader :records
+
+    def initialize
+      @records = []
+    end
+
+    def call(record)
+      @records << record
+    end
+  end
+
+  # The guard the deferred "hand-copy nothing keeps in sync" finding asked
+  # for: this must fail if the Master's output sink is ever reverted to
+  # NullOutput.
+  def test_the_master_built_bundle_publishes_output_into_the_masters_own_pipeline
+    with_config([{ name: "wf", runners: [tracker_runner("r")] }]) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      observer = PipelineObserver.new
+      master.output_pipeline.subscribe(observer)
+
+      bundle = master.send(:read_model_sinks_factory, :"runner:wf:r").call(5)
+      bundle.begin_output_run(1)
+      bundle.append_output(:stdout, "hello\n")
+
+      record = observer.records.fetch(0)
+      assert_equal 5, record.generation
+      assert_equal 1, record.run_id
+      assert_equal :stdout, record.stream
+      assert_equal "hello", record.text
+      assert_equal AgentDaemon::Supervisor::RunnerIdentity.new(workflow: "wf", runner: "r"), record.entity_id
+    end
+  end
+
+  def test_a_respawn_stamps_the_new_generation_on_output
+    with_config([{ name: "wf", runners: [tracker_runner("r")] }]) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      observer = PipelineObserver.new
+      master.output_pipeline.subscribe(observer)
+      factory = master.send(:read_model_sinks_factory, :"runner:wf:r")
+
+      factory.call(1).append_output(:stdout, "gen-one\n")
+      factory.call(2).append_output(:stdout, "gen-two\n")
+
+      assert_equal [[1, "gen-one"], [2, "gen-two"]],
+                   observer.records.map { |r| [r.generation, r.text] }
+    end
+  end
+
+  def test_the_bundle_closes_the_run_so_a_newlineless_tail_is_flushed
+    with_config([{ name: "wf", runners: [tracker_runner("r")] }]) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      observer = PipelineObserver.new
+      master.output_pipeline.subscribe(observer)
+
+      bundle = master.send(:read_model_sinks_factory, :"runner:wf:r").call(1)
+      bundle.begin_output_run(1)
+      bundle.append_output(:stdout, "tail")
+      assert_empty observer.records, "a partial line must not escape before the run closes"
+      bundle.end_output_run(1, :ok)
+
+      assert_equal ["tail"], observer.records.map(&:text)
+    end
+  end
+
+  # RunnerSupervisor's own default is intentionally NOT the pipeline: it
+  # serves the no-supervisor path, and only the Master has one to inject.
+  def test_the_runner_supervisor_default_output_sink_stays_null
+    bundle = AgentDaemon::Supervisor::RunnerSupervisor
+             .new("ent", entity_factory: ->(_b) {}, shutdown_flag: AgentDaemon::ShutdownFlag.new)
+             .send(:default_sinks_factory, 1)
+
+    assert_instance_of AgentDaemon::Sinks::NullOutput, bundle.instance_variable_get(:@output)
+  end
+
+  # DR2: the Redactor is the union of the supervisor's and EVERY workflow's
+  # resolved secrets — a workflow secret the supervisor config never saw must
+  # still be redacted.
+  def test_a_secret_declared_only_in_a_workflow_config_is_redacted
+    with_env("WF_ONLY_SECRET" => "sekret-value-1") do
+      with_erb_workflow_config do |config|
+        master = AgentDaemon::Supervisor::Master.new(config)
+        master.send(:build_factories)
+        observer = PipelineObserver.new
+        master.output_pipeline.subscribe(observer)
+
+        bundle = master.send(:read_model_sinks_factory, :"runner:wf:r").call(1)
+        bundle.append_output(:stdout, "token=sekret-value-1 ok\n")
+
+        assert_equal ["token=[REDACTED] ok"], observer.records.map(&:text)
+      end
+    end
+  end
+
+  # DR2's "and vice versa": a secret the supervisor config resolved but no
+  # workflow config ever saw must still be redacted in pipeline output.
+  def test_a_secret_declared_only_in_the_supervisor_config_is_redacted
+    with_env("SUP_ONLY_SECRET" => "sup-sekret-1") do
+      Dir.mktmpdir do |dir|
+        wf_dir = File.join(dir, "workflows")
+        FileUtils.mkdir_p(File.join(wf_dir, "prompts"))
+        File.write(File.join(wf_dir, "prompts", "default.txt"), "Prompt {{task_key}}")
+        File.write(File.join(wf_dir, "wf.yml"), <<~YAML)
+          project_path: #{File.join(dir, "proj-wf")}
+          message_dir: to_message
+          tracker:
+            token: t
+            org_id: o
+          runners:
+            - name: r
+              prompt_template: prompts/default.txt
+              trigger:
+                type: tracker
+                query: 'Queue: TI'
+        YAML
+
+        path = File.join(dir, "supervisor.yml")
+        File.write(path, <<~YAML)
+          note: <%= secret('SUP_ONLY_SECRET') %>
+          workflows:
+            - name: wf
+              config: workflows/wf.yml
+        YAML
+
+        master = AgentDaemon::Supervisor::Master.new(AgentDaemon::Supervisor::Config.new(path))
+        master.send(:build_factories)
+        observer = PipelineObserver.new
+        master.output_pipeline.subscribe(observer)
+
+        bundle = master.send(:read_model_sinks_factory, :"runner:wf:r").call(1)
+        bundle.append_output(:stdout, "token=sup-sekret-1 ok\n")
+
+        assert_equal ["token=[REDACTED] ok"], observer.records.map(&:text)
+      end
+    end
+  end
+
+  def test_output_with_no_known_secret_passes_through_the_masters_pipeline_unchanged
+    with_env("WF_ONLY_SECRET" => "sekret-value-1") do
+      with_erb_workflow_config do |config|
+        master = AgentDaemon::Supervisor::Master.new(config)
+        master.send(:build_factories)
+        observer = PipelineObserver.new
+        master.output_pipeline.subscribe(observer)
+
+        bundle = master.send(:read_model_sinks_factory, :"runner:wf:r").call(1)
+        bundle.append_output(:stdout, "nothing to hide\n")
+
+        assert_equal ["nothing to hide"], observer.records.map(&:text)
+      end
+    end
+  end
+
+  def with_env(vars)
+    saved = {}
+    vars.each { |k, v| saved[k] = ENV[k]; ENV[k] = v }
+    yield
+  ensure
+    saved.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
+  end
+
+  # A supervisor config with NO secret() of its own, referencing a workflow
+  # config that resolves one through ERB (written raw so the tag survives).
+  def with_erb_workflow_config
+    Dir.mktmpdir do |dir|
+      wf_dir = File.join(dir, "workflows")
+      FileUtils.mkdir_p(File.join(wf_dir, "prompts"))
+      File.write(File.join(wf_dir, "prompts", "default.txt"), "Prompt {{task_key}}")
+      File.write(File.join(wf_dir, "wf.yml"), <<~YAML)
+        project_path: #{File.join(dir, "proj-wf")}
+        message_dir: to_message
+        tracker:
+          token: <%= secret('WF_ONLY_SECRET') %>
+          org_id: o
+        runners:
+          - name: r
+            prompt_template: prompts/default.txt
+            trigger:
+              type: tracker
+              query: 'Queue: TI'
+      YAML
+
+      path = File.join(dir, "supervisor.yml")
+      File.write(path, { "workflows" => [{ "name" => "wf", "config" => "workflows/wf.yml" }] }.to_yaml)
+
+      yield AgentDaemon::Supervisor::Config.new(path)
+    end
+  end
 end

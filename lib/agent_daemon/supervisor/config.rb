@@ -69,6 +69,7 @@ module AgentDaemon
       def initialize(path)
         @config_path = File.expand_path(path)
         @config_dir  = File.dirname(@config_path)
+        @resolved_secrets = []
         raw = YAML.safe_load(render(File.read(path))) || {}
         @data = deep_merge(DEFAULTS, raw)
         @workflows = build_workflows(@data["workflows"])
@@ -80,6 +81,14 @@ module AgentDaemon
       # Flat list of every loaded runner's composite identity.
       def runner_identities
         @workflows.flat_map { |w| w[:identities] || [] }
+      end
+
+      # Mirrors AgentDaemon::Config#resolved_secrets — the raw values this
+      # config's `secret()` calls resolved, as a frozen copy. Never log,
+      # inspect, render, or serialize these (the same rule `app_secret`
+      # already carries in validate_console_auth).
+      def resolved_secrets
+        (@resolved_secrets || []).dup.freeze
       end
 
       private
@@ -96,9 +105,11 @@ module AgentDaemon
       end
 
       # Resolve a secret from the environment as a YAML-safe, quoted scalar.
-      # Mirrors core Config#secret.
+      # Mirrors core Config#secret, including the raw-value recording (DR1).
       def secret(key)
-        ENV.fetch(key).to_json
+        value = ENV.fetch(key)
+        (@resolved_secrets ||= []) << value
+        value.to_json
       rescue KeyError
         raise AgentDaemon::ConfigError, "secret #{key} is not set in environment"
       end

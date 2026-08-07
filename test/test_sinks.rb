@@ -24,6 +24,29 @@ class RecordingSink
   end
 end
 
+# The Story 3.3 output protocol in full: #append plus the run lifecycle.
+# RecordingSink deliberately stays one-method (the legacy shape) so both
+# shapes keep being exercised.
+class RecordingLifecycleOutputSink
+  attr_reader :calls
+
+  def initialize
+    @calls = []
+  end
+
+  def append(entity_id, stream, chunk)
+    @calls << [:append, entity_id, stream, chunk]
+  end
+
+  def begin_run(entity_id, run_id)
+    @calls << [:begin_run, entity_id, run_id]
+  end
+
+  def end_run(entity_id, run_id, reason)
+    @calls << [:end_run, entity_id, run_id, reason]
+  end
+end
+
 # A sink whose every protocol method raises the given exception.
 class RaisingSink
   def initialize(error = RuntimeError.new("sink boom"))
@@ -35,6 +58,14 @@ class RaisingSink
   end
 
   def append(_entity_id, _stream, _chunk)
+    raise @error
+  end
+
+  def begin_run(_entity_id, _run_id)
+    raise @error
+  end
+
+  def end_run(_entity_id, _run_id, _reason)
     raise @error
   end
 end
@@ -140,6 +171,75 @@ class TestSinks < Minitest::Test
     bundle = AgentDaemon::Sinks::Bundle.new(entity_id: "ent", state: RaisingSink.new(SignalException.new("TERM")))
 
     assert_raises(SignalException) { bundle.publish_state(status: :waiting) }
+  end
+
+  # --- Story 3.3 / DR4: the output run lifecycle ---------------------------
+
+  def test_null_output_accepts_the_run_lifecycle_and_returns_nothing
+    null = AgentDaemon::Sinks::NullOutput.new
+
+    assert_nil null.begin_run("e", 1)
+    assert_nil null.end_run("e", 1, :ok)
+  end
+
+  def test_begin_output_run_stamps_entity_id
+    recorder = RecordingLifecycleOutputSink.new
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: "ent", output: recorder)
+
+    bundle.begin_output_run(7)
+
+    assert_equal [[:begin_run, "ent", 7]], recorder.calls
+  end
+
+  def test_end_output_run_stamps_entity_id_and_carries_the_reason
+    recorder = RecordingLifecycleOutputSink.new
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: "ent", output: recorder)
+
+    bundle.end_output_run(7, :timeout)
+
+    assert_equal [[:end_run, "ent", 7, :timeout]], recorder.calls
+  end
+
+  def test_standard_error_from_the_run_lifecycle_is_swallowed_and_logged
+    log_io = StringIO.new
+    AgentDaemon::Log.instance_variable_set(:@logger, ::Logger.new(log_io))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: "ent", output: RaisingSink.new)
+
+    bundle.begin_output_run(1)
+    bundle.end_output_run(1, :ok)
+
+    assert_equal 2, log_io.string.scan("sink error isolated: RuntimeError: sink boom").size
+  end
+
+  def test_signal_exception_from_the_run_lifecycle_is_not_swallowed
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: "ent", output: RaisingSink.new(SignalException.new("TERM")))
+
+    assert_raises(SignalException) { bundle.begin_output_run(1) }
+    assert_raises(SignalException) { bundle.end_output_run(1, :ok) }
+  end
+
+  # A minimal one-method output sink (the pre-3.3 shape) must keep working:
+  # letting guard swallow a NoMethodError would turn every run into two
+  # spurious WARN lines.
+  def test_a_legacy_one_method_output_sink_still_works_and_logs_nothing
+    log_io = StringIO.new
+    AgentDaemon::Log.instance_variable_set(:@logger, ::Logger.new(log_io))
+    recorder = RecordingSink.new
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: "ent", output: recorder)
+
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "chunk")
+    bundle.end_output_run(1, :ok)
+
+    assert_equal [["ent", :stdout, "chunk"]], recorder.calls, "positive control: #append still reached the sink"
+    refute_includes log_io.string, "sink error isolated"
+  end
+
+  def test_the_bundle_default_output_sink_accepts_the_run_lifecycle
+    bundle = AgentDaemon::Sinks::Bundle.null("ent")
+
+    assert_nil bundle.begin_output_run(1)
+    assert_nil bundle.end_output_run(1, :ok)
   end
 end
 

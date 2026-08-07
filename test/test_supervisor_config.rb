@@ -465,6 +465,93 @@ class TestSupervisorConfig < Minitest::Test
     end
   end
 
+  # --- Story 3.3 / DR1: resolved secrets are recorded ----------------------
+
+  def with_env(vars)
+    saved = {}
+    vars.each { |k, v| saved[k] = ENV[k]; ENV[k] = v }
+    yield
+  ensure
+    saved.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
+  end
+
+  # A loadable supervisor config whose console credentials come from ERB.
+  # `app_secret_expr` / `app_id_expr` are spliced in verbatim so a `secret()`
+  # call survives to render time (to_yaml would quote it away).
+  def with_erb_supervisor(app_secret_expr:, app_id_expr: "id")
+    specs = [{ name: "a", file: "a", data: sandboxed_workflow_data }]
+    with_supervisor(specs) do |_dir, path|
+      File.write(path, <<~YAML)
+        workflows:
+          - name: a
+            config: workflows/a.yml
+        console:
+          base_url: https://console.example.com
+          auth:
+            gitlab_host: https://gitlab.example.com
+            app_id: #{app_id_expr}
+            app_secret: #{app_secret_expr}
+            allowed_groups:
+              - backoffice
+      YAML
+      yield AgentDaemon::Supervisor::Config.new(path)
+    end
+  end
+
+  def test_resolved_secrets_records_the_raw_value_not_the_json_form
+    value = "sekret-value-1"
+    with_env("CONSOLE_APP_SECRET" => value) do
+      with_erb_supervisor(app_secret_expr: "<%= secret('CONSOLE_APP_SECRET') %>") do |config|
+        assert_equal value, config.console["auth"]["app_secret"], "positive control: the value did reach the config"
+        assert_equal [value], config.resolved_secrets
+        refute_includes config.resolved_secrets, value.to_json
+      end
+    end
+  end
+
+  def test_two_references_to_one_key_are_recorded_twice
+    with_env("CONSOLE_APP_SECRET" => "sekret-value-1") do
+      with_erb_supervisor(app_secret_expr: "<%= secret('CONSOLE_APP_SECRET') %>",
+                          app_id_expr: "<%= secret('CONSOLE_APP_SECRET') %>") do |config|
+        assert_equal %w[sekret-value-1 sekret-value-1], config.resolved_secrets
+      end
+    end
+  end
+
+  def test_config_without_secret_calls_exposes_an_empty_collection
+    with_erb_supervisor(app_secret_expr: "plain-secret") do |config|
+      assert_empty config.resolved_secrets
+    end
+  end
+
+  def test_raw_env_interpolation_records_nothing
+    with_env("CONSOLE_APP_SECRET" => "sekret-value-1") do
+      with_erb_supervisor(app_secret_expr: "<%= ENV['CONSOLE_APP_SECRET'] %>") do |config|
+        assert_equal "sekret-value-1", config.console["auth"]["app_secret"], "positive control: the value did reach the config"
+        assert_empty config.resolved_secrets
+      end
+    end
+  end
+
+  def test_missing_secret_records_nothing
+    config = AgentDaemon::Supervisor::Config.allocate
+
+    assert_raises(AgentDaemon::ConfigError) { config.send(:secret, "UNSET_SECRET_XYZ_3_3") }
+
+    assert_empty config.resolved_secrets
+  end
+
+  def test_resolved_secrets_hands_out_a_copy
+    with_env("CONSOLE_APP_SECRET" => "sekret-value-1") do
+      with_erb_supervisor(app_secret_expr: "<%= secret('CONSOLE_APP_SECRET') %>") do |config|
+        first = config.resolved_secrets
+        assert_raises(FrozenError) { first << "injected" }
+        assert_equal %w[sekret-value-1], config.resolved_secrets
+        refute_same first, config.resolved_secrets
+      end
+    end
+  end
+
   # --- console block (Story 2.2, AC6/AC8) ---------------------------------
 
   # A minimal VALID console block. Callers mutate the returned hash (or drop

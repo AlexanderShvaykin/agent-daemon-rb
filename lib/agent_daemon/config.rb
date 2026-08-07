@@ -48,6 +48,7 @@ module AgentDaemon
     def initialize(path)
       @config_path = File.expand_path(path)
       @config_dir  = File.dirname(@config_path)
+      @resolved_secrets = []
       raw = YAML.safe_load(render(File.read(path))) || {}
       @data = deep_merge(DEFAULTS, raw)
       @runners = build_runners(raw["runners"])
@@ -78,6 +79,15 @@ module AgentDaemon
       @runners
     end
 
+    # Every raw value `secret()` resolved while rendering this config, in call
+    # order and unfiltered — the supervisor's Redactor is what dedups, orders,
+    # and compiles them (AD-8). Returns a frozen copy: the live array must
+    # never escape, and these values must never be logged, inspected into a
+    # message, rendered, or serialized.
+    def resolved_secrets
+      (@resolved_secrets || []).dup.freeze
+    end
+
     private
 
     # Render the config file as an ERB template before YAML parsing. The
@@ -96,8 +106,14 @@ module AgentDaemon
     # Fails fast (ConfigError) when the variable is unset. `.to_json` produces
     # a double-quoted, escaped string so values containing YAML-significant
     # characters (#, :, ?, &, quotes) parse intact.
+    #
+    # The RAW value — not the quoted form — is recorded for #resolved_secrets:
+    # the raw string is what survives into @data, reaches the agent, and can be
+    # echoed back on stdout, so it is what the Redactor must match (DR1).
     def secret(key)
-      ENV.fetch(key).to_json
+      value = ENV.fetch(key)
+      (@resolved_secrets ||= []) << value
+      value.to_json
     rescue KeyError
       raise ConfigError, "secret #{key} is not set in environment"
     end

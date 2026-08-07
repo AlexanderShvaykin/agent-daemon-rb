@@ -15,8 +15,17 @@ module AgentDaemon
       def publish(entity_id, event); end
     end
 
+    # The output protocol is #append plus an optional run lifecycle: an
+    # adapter that buffers partial lines needs to know where a run starts and
+    # ends so it can flush the final newline-less line and scope a per-run
+    # sequence. Bundle calls the two lifecycle methods only when the injected
+    # sink responds to them, so a minimal one-method sink stays valid.
     class NullOutput
       def append(entity_id, stream, chunk); end
+
+      def begin_run(entity_id, run_id); end
+
+      def end_run(entity_id, run_id, reason); end
     end
 
     # The single injection object each core component receives. Carries the
@@ -46,6 +55,26 @@ module AgentDaemon
 
       def append_output(stream, chunk)
         guard { @output.append(@entity_id, stream, chunk) }
+      end
+
+      # The two run-lifecycle publishes are conditional on the sink actually
+      # implementing them: a one-method output sink is still a valid sink, and
+      # letting guard swallow a NoMethodError would turn every run into two
+      # spurious WARN lines.
+      def begin_output_run(run_id)
+        return unless @output.respond_to?(:begin_run)
+
+        guard { @output.begin_run(@entity_id, run_id) }
+      end
+
+      # `reason` is normally one of :ok/:failed/:timeout/:killed, but is nil
+      # when the backend's execute body raised before a terminal reason was
+      # assigned (the ensure still closes the run) — sinks must treat it as
+      # opaque and tolerate nil.
+      def end_output_run(run_id, reason)
+        return unless @output.respond_to?(:end_run)
+
+        guard { @output.end_run(@entity_id, run_id, reason) }
       end
 
       private
