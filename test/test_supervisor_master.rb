@@ -920,6 +920,122 @@ class TestSupervisorMaster < Minitest::Test
     end
   end
 
+  # --- Story 3.4 / DR10: OutputBuffers is wired into the Master ------------
+
+  # The guard DR10 asks for: this must fail if the Master's `subscribe`
+  # call into OutputBuffers is ever deleted.
+  def test_output_published_through_the_master_lands_in_output_buffers
+    with_config([{ name: "wf", runners: [tracker_runner("r")] }]) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      identity = master.instance_variable_get(:@entity_ids).fetch(:"runner:wf:r")
+
+      bundle = master.send(:read_model_sinks_factory, :"runner:wf:r").call(3)
+      bundle.begin_output_run(1)
+      bundle.append_output(:stdout, "hello\n")
+      bundle.end_output_run(1, :ok)
+
+      snap = master.output_buffers.snapshot(identity)
+      assert_equal :retained, snap.status
+      assert_equal 3, snap.generation
+      assert_equal 1, snap.run_id
+      assert_equal ["hello"], snap.records.map(&:text)
+      assert snap.finished
+      assert_equal :ok, snap.reason
+    end
+  end
+
+  # Both the store's capacity and the pipeline's max_line_bytes come from the
+  # same config value: construct a Master from a config with a non-default
+  # output_buffer_bytes and observe eviction happening at that size.
+  def test_output_buffer_bytes_from_config_bounds_both_the_store_and_the_pipeline
+    Dir.mktmpdir do |dir|
+      wf_dir = File.join(dir, "workflows")
+      FileUtils.mkdir_p(File.join(wf_dir, "prompts"))
+      File.write(File.join(wf_dir, "prompts", "default.txt"), "Prompt {{task_key}}")
+      File.write(File.join(wf_dir, "wf.yml"), {
+        "project_path" => File.join(dir, "proj-wf"),
+        "message_dir" => "to_message",
+        "tracker" => { "token" => "t", "org_id" => "o" },
+        "runners" => [tracker_runner("r")]
+      }.to_yaml)
+
+      path = File.join(dir, "supervisor.yml")
+      File.write(path, {
+        "workflows" => [{ "name" => "wf", "config" => "workflows/wf.yml" }],
+        "output_buffer_bytes" => 16_384
+      }.to_yaml)
+
+      config = AgentDaemon::Supervisor::Config.new(path)
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      identity = master.instance_variable_get(:@entity_ids).fetch(:"runner:wf:r")
+
+      bundle = master.send(:read_model_sinks_factory, :"runner:wf:r").call(1)
+      bundle.begin_output_run(1)
+      bundle.append_output(:stdout, "#{'a' * 10_000}\n")
+      bundle.append_output(:stdout, "#{'b' * 10_000}\n")
+
+      snap = master.output_buffers.snapshot(identity)
+      assert snap.truncated, "the small non-default capacity must already have evicted the first line"
+      assert_equal ["b" * 10_000], snap.records.map(&:text)
+
+      # The pipeline half of the wiring: a newline-free chunk over the
+      # configured 16_384 (but under the 262_144 default) must be
+      # force-emitted — this fails if master.rb stops passing max_line_bytes.
+      bundle.append_output(:stdout, "c" * 20_000)
+      snap = master.output_buffers.snapshot(identity)
+      forced = snap.records.map(&:text).select { |t| t.start_with?("c") }
+      refute_empty forced,
+                   "the configured max_line_bytes must force-emit a newline-free over-cap chunk"
+    end
+  end
+
+  # A known secret longer than the forced-cut hold-back cap
+  # (output_buffer_bytes / 2) can be split across forced records and leak;
+  # the Master must say so at boot. The value itself must never be logged.
+  def test_master_warns_at_boot_when_a_known_secret_exceeds_the_forced_cut_hold_back
+    secret = "s" * 9_000
+    with_env("WF_ONLY_SECRET" => secret) do
+      Dir.mktmpdir do |dir|
+        wf_dir = File.join(dir, "workflows")
+        FileUtils.mkdir_p(File.join(wf_dir, "prompts"))
+        File.write(File.join(wf_dir, "prompts", "default.txt"), "Prompt {{task_key}}")
+        File.write(File.join(wf_dir, "wf.yml"), <<~YAML)
+          project_path: #{File.join(dir, "proj-wf")}
+          message_dir: to_message
+          tracker:
+            token: <%= secret('WF_ONLY_SECRET') %>
+            org_id: o
+          runners:
+            - name: r
+              prompt_template: prompts/default.txt
+              trigger:
+                type: tracker
+                query: 'Queue: TI'
+        YAML
+
+        path = File.join(dir, "supervisor.yml")
+        File.write(path, {
+          "workflows" => [{ "name" => "wf", "config" => "workflows/wf.yml" }],
+          "output_buffer_bytes" => 16_384
+        }.to_yaml)
+
+        log_io = StringIO.new
+        prior = AgentDaemon::Log.instance_variable_get(:@logger)
+        AgentDaemon::Log.instance_variable_set(:@logger, ::Logger.new(log_io))
+        begin
+          AgentDaemon::Supervisor::Master.new(AgentDaemon::Supervisor::Config.new(path))
+        ensure
+          AgentDaemon::Log.instance_variable_set(:@logger, prior)
+        end
+
+        assert_includes log_io.string, "forced-cut hold-back"
+        refute_includes log_io.string, secret
+      end
+    end
+  end
+
   def test_output_with_no_known_secret_passes_through_the_masters_pipeline_unchanged
     with_env("WF_ONLY_SECRET" => "sekret-value-1") do
       with_erb_workflow_config do |config|

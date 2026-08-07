@@ -32,6 +32,11 @@ module AgentDaemon
         # an operator watching it climb needs a remedy other than editing a
         # constant and redeploying the fleet.
         "event_bus_capacity" => EventBus::DEFAULT_CAPACITY,
+        # Bytes retained per run by the master's OutputBuffers store (Story
+        # 3.4). Top-level, not under `console:` — the buffer exists whether or
+        # not a console is configured (Epic 5's history writer and Epic 6's
+        # counters both subscribe to the same pipeline).
+        "output_buffer_bytes" => 262_144,
         # Optional web console (AD-6). nil ⇒ disabled and never validated, so a
         # supervisor config written before the console existed keeps loading
         # unchanged (Story 2.2 AC8).
@@ -64,7 +69,13 @@ module AgentDaemon
       # console-less supervisor.
       PORT_RANGE = (1..65_535).freeze
 
-      attr_reader :config_path, :config_dir, :workflows, :event_bus_capacity, :console
+      # Bounds output_buffer_bytes: the floor keeps a run's window usefully
+      # small on a memory-constrained host, the ceiling caps the per-entity
+      # memory ceiling (capacity_bytes × rostered entities, NFR7) an operator
+      # can reach with a single typo.
+      OUTPUT_BUFFER_BYTES_RANGE = (16_384..4_194_304).freeze
+
+      attr_reader :config_path, :config_dir, :workflows, :event_bus_capacity, :output_buffer_bytes, :console
 
       def initialize(path)
         @config_path = File.expand_path(path)
@@ -74,6 +85,7 @@ module AgentDaemon
         @data = deep_merge(DEFAULTS, raw)
         @workflows = build_workflows(@data["workflows"])
         @event_bus_capacity = @data["event_bus_capacity"]
+        @output_buffer_bytes = @data["output_buffer_bytes"]
         @console = build_console(@data["console"])
         validate!
       end
@@ -209,6 +221,11 @@ module AgentDaemon
 
         unless @event_bus_capacity.is_a?(Integer) && @event_bus_capacity.positive?
           errors << "event_bus_capacity must be a positive integer (got #{@event_bus_capacity.inspect}) in #{@config_path}"
+        end
+
+        unless positive_integer?(@output_buffer_bytes) && OUTPUT_BUFFER_BYTES_RANGE.cover?(@output_buffer_bytes)
+          errors << "output_buffer_bytes must be an integer in #{OUTPUT_BUFFER_BYTES_RANGE} " \
+                     "(got #{@output_buffer_bytes.inspect}) in #{@config_path}"
         end
 
         errors.concat(validate_console)

@@ -38,6 +38,51 @@ class RaisingObserver
   end
 end
 
+# A distinct fixture from RecordingObserver (which implements #call only, and
+# must stay that way — it is the regression guard for DR3's respond_to? guard).
+class LifecycleObserver
+  attr_reader :records, :started, :finished
+
+  def initialize
+    @records = []
+    @started = []
+    @finished = []
+  end
+
+  def call(record)
+    @records << record
+  end
+
+  def run_started(entity_id, run_id, generation)
+    @started << [entity_id, run_id, generation]
+  end
+
+  def run_finished(entity_id, run_id, reason, generation)
+    @finished << [entity_id, run_id, reason, generation]
+  end
+end
+
+class RaisingLifecycleObserver
+  attr_reader :started_calls, :finished_calls
+
+  def initialize
+    @started_calls = 0
+    @finished_calls = 0
+  end
+
+  def call(_record); end
+
+  def run_started(*)
+    @started_calls += 1
+    raise "run_started boom"
+  end
+
+  def run_finished(*)
+    @finished_calls += 1
+    raise "run_finished boom"
+  end
+end
+
 class TestOutputPipeline < Minitest::Test
   ISO8601_UTC_RE = /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/
 
@@ -440,5 +485,250 @@ class TestOutputPipeline < Minitest::Test
     held = pipeline.instance_variables.map { |ivar| pipeline.instance_variable_get(ivar) }
     refute(held.any? { |v| v.is_a?(AgentDaemon::Supervisor::EventBus) })
     refute_respond_to pipeline, :publish
+  end
+
+  # --- lifecycle fanout (Story 3.4 DR3) --------------------------------------
+
+  def test_run_started_is_notified_on_begin_run_with_entity_run_and_generation
+    pipeline, = build
+    observer = LifecycleObserver.new
+    pipeline.subscribe(observer)
+
+    pipeline.ingress(7).begin_run("ent", 3)
+
+    assert_equal [["ent", 3, 7]], observer.started
+  end
+
+  def test_run_finished_is_notified_on_end_run_with_reason_and_generation
+    pipeline, = build
+    observer = LifecycleObserver.new
+    pipeline.subscribe(observer)
+
+    ingress = pipeline.ingress(7)
+    ingress.begin_run("ent", 3)
+    ingress.end_run("ent", 3, :ok)
+
+    assert_equal [["ent", 3, :ok, 7]], observer.finished
+  end
+
+  def test_run_finished_carries_a_nil_reason_when_the_backend_aborted
+    pipeline, = build
+    observer = LifecycleObserver.new
+    pipeline.subscribe(observer)
+
+    ingress = pipeline.ingress(1)
+    ingress.begin_run("ent", 1)
+    ingress.end_run("ent", 1, nil)
+
+    assert_equal [["ent", 1, nil, 1]], observer.finished
+  end
+
+  # The existing #call-only fixture must keep working unedited — that is the
+  # regression guard for the respond_to? guard this story adds.
+  def test_a_call_only_observer_is_unaffected_by_lifecycle_notifications
+    pipeline, observer = build
+
+    pipeline.begin_run("ent", 1)
+    pipeline.append("ent", :stdout, "line\n")
+    pipeline.end_run("ent", 1, :ok)
+
+    assert_equal ["line"], observer.records.map(&:text)
+  end
+
+  # A residual newline-less line must be inside the buffer before the run is
+  # marked terminal (DR3's ordering contract), or the last line of a crashed
+  # agent is lost to the very consumer that exists to show it.
+  def test_a_residual_line_record_arrives_before_run_finished
+    pipeline, = build
+    observer = LifecycleObserver.new
+    pipeline.subscribe(observer)
+    order = []
+    observer.define_singleton_method(:call) { |record| order << [:call, record.text] }
+    observer.define_singleton_method(:run_finished) { |*args| order << [:run_finished, args] }
+
+    pipeline.begin_run("ent", 1)
+    pipeline.append("ent", :stdout, "tail-no-newline")
+    pipeline.end_run("ent", 1, :failed)
+
+    assert_equal :call, order.first.first
+    assert_equal "tail-no-newline", order.first.last
+    assert_equal :run_finished, order.last.first
+  end
+
+  def test_a_raising_run_started_is_logged_isolated_and_does_not_reach_the_caller
+    log_io = StringIO.new
+    AgentDaemon::Log.instance_variable_set(:@logger, ::Logger.new(log_io))
+    pipeline, = build
+    observer = RaisingLifecycleObserver.new
+
+    pipeline.subscribe(observer)
+    pipeline.begin_run("ent", 1)
+
+    assert_equal 1, observer.started_calls
+    assert_includes log_io.string, "run_started boom"
+  end
+
+  def test_a_raising_run_finished_is_logged_isolated_and_does_not_starve_other_observers
+    log_io = StringIO.new
+    AgentDaemon::Log.instance_variable_set(:@logger, ::Logger.new(log_io))
+    pipeline, = build
+    raiser = RaisingLifecycleObserver.new
+    healthy = LifecycleObserver.new
+    pipeline.subscribe(raiser)
+    pipeline.subscribe(healthy)
+
+    pipeline.begin_run("ent", 1)
+    pipeline.end_run("ent", 1, :ok)
+
+    assert_equal 1, raiser.finished_calls
+    assert_includes log_io.string, "run_finished boom"
+    assert_equal [["ent", 1, :ok, nil]], healthy.finished
+  end
+
+  # --- bounded partial-line cap (Story 3.4 DR9) ------------------------------
+
+  def test_a_newline_free_chunk_past_max_line_bytes_is_force_emitted_before_end_run
+    pipeline = AgentDaemon::Supervisor::OutputPipeline.new(
+      redactor: AgentDaemon::Supervisor::Redactor.new([]), max_line_bytes: 16
+    )
+    observer = RecordingObserver.new
+    pipeline.subscribe(observer)
+
+    pipeline.begin_run("ent", 1)
+    pipeline.append("ent", :stdout, "a" * 20)
+
+    refute_empty observer.records, "a record must be force-emitted before end_run"
+  end
+
+  def test_the_retained_buffer_plus_the_forced_record_account_for_every_byte
+    pipeline = AgentDaemon::Supervisor::OutputPipeline.new(
+      redactor: AgentDaemon::Supervisor::Redactor.new([]), max_line_bytes: 16
+    )
+    observer = RecordingObserver.new
+    pipeline.subscribe(observer)
+
+    payload = ("a".."z").to_a.join * 3 # 78 newline-free bytes
+    pipeline.begin_run("ent", 1)
+    pipeline.append("ent", :stdout, payload)
+    pipeline.end_run("ent", 1, :ok)
+
+    reconstructed = observer.records.map(&:text).join
+    assert_equal payload, reconstructed
+  end
+
+  def test_a_secret_placed_exactly_across_the_forced_cut_boundary_is_still_redacted
+    secret = "sekret-value-1"
+    pipeline = AgentDaemon::Supervisor::OutputPipeline.new(
+      redactor: AgentDaemon::Supervisor::Redactor.new([secret]), max_line_bytes: 32
+    )
+    observer = RecordingObserver.new
+    pipeline.subscribe(observer)
+
+    filler = "x" * 30
+    pipeline.begin_run("ent", 1)
+    # The chunk crosses max_line_bytes right where `secret` sits at the tail,
+    # so a naive positional cut would split it and neither half would match
+    # on its own.
+    pipeline.append("ent", :stdout, filler + secret)
+    pipeline.end_run("ent", 1, :ok)
+
+    reconstructed = observer.records.map(&:text).join
+    refute_includes reconstructed, secret
+    assert_includes reconstructed, "[REDACTED]"
+  end
+
+  def test_max_line_bytes_defaults_so_existing_redactor_only_construction_still_compiles
+    pipeline = AgentDaemon::Supervisor::OutputPipeline.new(
+      redactor: AgentDaemon::Supervisor::Redactor.new([])
+    )
+
+    assert_instance_of AgentDaemon::Supervisor::OutputPipeline, pipeline
+  end
+
+  def test_a_forced_cut_landing_mid_multibyte_character_emits_valid_utf8_and_loses_no_bytes
+    # The secret makes hold_back 1, which lands the byte-offset cut inside
+    # one of the two-byte "é" characters unless the cut is boundary-aligned.
+    pipeline = AgentDaemon::Supervisor::OutputPipeline.new(
+      redactor: AgentDaemon::Supervisor::Redactor.new(["ab"]), max_line_bytes: 16
+    )
+    observer = RecordingObserver.new
+    pipeline.subscribe(observer)
+
+    payload = "é" * 12 # 24 bytes, newline-free
+    pipeline.begin_run("ent", 1)
+    pipeline.append("ent", :stdout, payload)
+    pipeline.end_run("ent", 1, :ok)
+
+    observer.records.each do |record|
+      assert_predicate record.text, :valid_encoding?,
+                       "forced record text must stay valid UTF-8"
+    end
+    assert_equal payload, observer.records.map(&:text).join
+  end
+
+  def test_a_multibyte_secret_torn_at_the_cap_boundary_is_still_redacted
+    secret = "café-sekret"
+    pipeline = AgentDaemon::Supervisor::OutputPipeline.new(
+      redactor: AgentDaemon::Supervisor::Redactor.new([secret]), max_line_bytes: 16
+    )
+    observer = RecordingObserver.new
+    pipeline.subscribe(observer)
+
+    secret_bytes = secret.b
+    pipeline.begin_run("ent", 1)
+    # The chunk boundary tears the two-byte "é" exactly when the cap trips;
+    # scrubbing the torn lead byte here would mangle the secret forever.
+    pipeline.append("ent", :stdout, ("x" * 15).b + secret_bytes.byteslice(0, 4))
+    pipeline.append("ent", :stdout, secret_bytes.byteslice(4, secret_bytes.bytesize - 4) + "\n")
+    pipeline.end_run("ent", 1, :ok)
+
+    reconstructed = observer.records.map(&:text).join
+    refute_includes reconstructed, "sekret"
+    assert_includes reconstructed, "[REDACTED]"
+  end
+
+  def test_an_incomplete_secret_at_the_forced_cut_is_completed_and_redacted_later
+    secret = "sekret-value-1"
+    pipeline = AgentDaemon::Supervisor::OutputPipeline.new(
+      redactor: AgentDaemon::Supervisor::Redactor.new([secret]), max_line_bytes: 32
+    )
+    observer = RecordingObserver.new
+    pipeline.subscribe(observer)
+
+    pipeline.begin_run("ent", 1)
+    # The cap trips while only a prefix of the secret has arrived — the
+    # hold-back must keep that prefix in the buffer so the completed value
+    # matches on the next emission.
+    pipeline.append("ent", :stdout, "x" * 25 + "sekret-v")
+    pipeline.append("ent", :stdout, "alue-1\n")
+    pipeline.end_run("ent", 1, :ok)
+
+    reconstructed = observer.records.map(&:text).join
+    refute_includes reconstructed, secret
+    assert_includes reconstructed, "[REDACTED]"
+  end
+
+  def test_an_over_cap_buffer_that_redacts_below_the_hold_back_is_still_shrunk
+    secret = "s" * 40
+    pipeline = AgentDaemon::Supervisor::OutputPipeline.new(
+      redactor: AgentDaemon::Supervisor::Redactor.new([secret]), max_line_bytes: 32
+    )
+    observer = RecordingObserver.new
+    pipeline.subscribe(observer)
+
+    pipeline.begin_run("ent", 1)
+    # 40 raw bytes collapse to a 10-byte "[REDACTED]" — below the 16-byte
+    # hold-back, so nothing can be emitted. The buffer must still be replaced
+    # with the redacted form or it grows raw forever, re-redacted per append.
+    pipeline.append("ent", :stdout, secret)
+
+    buffer = pipeline.instance_variable_get(:@entities).dig("ent", :buffers, :stdout)
+    assert_operator buffer.bytesize, :<=, 32,
+                    "the partial-line buffer must not stay over max_line_bytes"
+
+    pipeline.end_run("ent", 1, :ok)
+    reconstructed = observer.records.map(&:text).join
+    refute_includes reconstructed, secret
+    assert_includes reconstructed, "[REDACTED]"
   end
 end

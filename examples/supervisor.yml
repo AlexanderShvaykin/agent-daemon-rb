@@ -22,6 +22,13 @@ workflows:
   - name: reviewer
     config: workflows/reviewer.yml
 
+# Bytes of output retained per run, per runner, by the master's in-memory
+# output buffer. Default 262144 (256 KiB); accepted range 16384-4194304
+# (16 KiB-4 MiB). Applies whether or not a console is configured.
+# The same value also caps a single line's size: a newline-free line longer
+# than this is force-split into multiple records at this boundary.
+# output_buffer_bytes: 262144
+
 # Optional web console. OMIT THIS WHOLE BLOCK and no server is started and
 # nothing below is validated — a supervisor config without it behaves exactly
 # as it did before the console existed.

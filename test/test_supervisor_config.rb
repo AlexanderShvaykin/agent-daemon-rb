@@ -465,6 +465,72 @@ class TestSupervisorConfig < Minitest::Test
     end
   end
 
+  # --- output_buffer_bytes (Story 3.4 DR1) ---------------------------------
+
+  def with_output_buffer_bytes(value)
+    specs = [{ name: "a", file: "a", data: sandboxed_workflow_data }]
+    with_supervisor(specs) do |_dir, path|
+      data = YAML.safe_load(File.read(path))
+      data["output_buffer_bytes"] = value unless value == :omitted
+      File.write(path, data.to_yaml)
+      yield path
+    end
+  end
+
+  def test_output_buffer_bytes_defaults_to_262144_when_absent
+    with_output_buffer_bytes(:omitted) do |path|
+      config = AgentDaemon::Supervisor::Config.new(path)
+      assert_equal 262_144, config.output_buffer_bytes
+    end
+  end
+
+  def test_output_buffer_bytes_accepts_an_in_range_override
+    with_output_buffer_bytes(100_000) do |path|
+      assert_equal 100_000, AgentDaemon::Supervisor::Config.new(path).output_buffer_bytes
+    end
+  end
+
+  def test_output_buffer_bytes_accepts_the_inclusive_boundaries
+    [16_384, 4_194_304].each do |boundary|
+      with_output_buffer_bytes(boundary) do |path|
+        assert_equal boundary, AgentDaemon::Supervisor::Config.new(path).output_buffer_bytes
+      end
+    end
+  end
+
+  def test_output_buffer_bytes_rejects_values_just_outside_the_boundaries
+    [16_383, 4_194_305].each do |bad|
+      with_output_buffer_bytes(bad) do |path|
+        err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Supervisor::Config.new(path) }
+        assert_match(/output_buffer_bytes must be an integer in 16384\.\.4194304/, err.message)
+        assert_match(/got #{bad}/, err.message)
+      end
+    end
+  end
+
+  def test_output_buffer_bytes_rejects_non_integer_types
+    ["262144", 262_144.0, nil, true].each do |bad|
+      with_output_buffer_bytes(bad) do |path|
+        err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Supervisor::Config.new(path) }
+        assert_match(/output_buffer_bytes must be an integer in/, err.message)
+      end
+    end
+  end
+
+  def test_output_buffer_bytes_problem_collects_alongside_another_problem
+    specs = [{ name: "a", file: "a", data: sandboxed_workflow_data }]
+    with_supervisor(specs) do |_dir, path|
+      data = YAML.safe_load(File.read(path))
+      data["output_buffer_bytes"] = 100
+      data["event_bus_capacity"] = -5
+      File.write(path, data.to_yaml)
+
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Supervisor::Config.new(path) }
+      assert_match(/event_bus_capacity must be a positive integer/, err.message)
+      assert_match(/output_buffer_bytes must be an integer in/, err.message)
+    end
+  end
+
   # --- Story 3.3 / DR1: resolved secrets are recorded ----------------------
 
   def with_env(vars)

@@ -9,6 +9,7 @@ require_relative "fleet"
 require_relative "activity_log"
 require_relative "redactor"
 require_relative "output_pipeline"
+require_relative "output_buffers"
 require_relative "console/server"
 
 module AgentDaemon
@@ -47,7 +48,7 @@ module AgentDaemon
         )
       end
 
-      attr_reader :state_registry, :event_bus, :output_pipeline
+      attr_reader :state_registry, :event_bus, :output_pipeline, :output_buffers
 
       def initialize(supervisor_config, join_timeout: JOIN_TIMEOUT, console_factory: CONSOLE_FACTORY)
         @config = supervisor_config
@@ -63,7 +64,14 @@ module AgentDaemon
         @console_dead = false
         @state_registry = StateRegistry.new
         @event_bus = EventBus.new(capacity: supervisor_config.event_bus_capacity)
-        @output_pipeline = OutputPipeline.new(redactor: Redactor.new(known_secrets(supervisor_config)))
+        redactor = Redactor.new(known_secrets(supervisor_config))
+        @output_pipeline = OutputPipeline.new(
+          redactor: redactor,
+          max_line_bytes: supervisor_config.output_buffer_bytes
+        )
+        @output_buffers = OutputBuffers.new(capacity_bytes: supervisor_config.output_buffer_bytes)
+        @output_pipeline.subscribe(@output_buffers)
+        warn_if_secret_exceeds_forced_cut_hold_back(redactor, supervisor_config)
       end
 
       def start
@@ -99,6 +107,23 @@ module AgentDaemon
       def known_secrets(supervisor_config)
         supervisor_config.resolved_secrets +
           supervisor_config.workflows.filter_map { |w| w[:config] }.flat_map(&:resolved_secrets)
+      end
+
+      # The pipeline's forced cut holds back at most output_buffer_bytes / 2
+      # unemitted bytes, so a still-arriving single-line secret longer than
+      # that can be split across two forced records and leak unredacted. The
+      # operator can close the window by raising output_buffer_bytes; the log
+      # line names the lengths only, never a value.
+      def warn_if_secret_exceeds_forced_cut_hold_back(redactor, supervisor_config)
+        hold_back_cap = supervisor_config.output_buffer_bytes / 2
+        return if redactor.max_value_length <= hold_back_cap
+
+        Log.warn(
+          "A known secret is #{redactor.max_value_length} bytes, larger than the " \
+          "#{hold_back_cap}-byte forced-cut hold-back (output_buffer_bytes / 2); " \
+          "if it arrives on one line without a newline for #{supervisor_config.output_buffer_bytes} bytes " \
+          "it may be split across records and escape redaction. Raise output_buffer_bytes to cover it."
+        )
       end
 
       def setup_signal_handlers

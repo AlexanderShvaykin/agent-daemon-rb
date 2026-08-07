@@ -159,4 +159,23 @@ class TestRedactor < Minitest::Test
 
     assert_equal "x #{MARKER} y", r.redact("x café-sekret y")
   end
+
+  # --- max_value_length (Story 3.4 DR9) -------------------------------------
+
+  def test_max_value_length_is_zero_for_an_empty_set
+    assert_equal 0, redactor.max_value_length
+  end
+
+  def test_max_value_length_is_the_longest_values_bytesize
+    r = redactor("short", "a-much-longer-sekret-value")
+
+    assert_equal "a-much-longer-sekret-value".bytesize, r.max_value_length
+  end
+
+  def test_max_value_length_uses_bytesize_not_character_length_for_multibyte_values
+    r = redactor("café-sekret")
+
+    assert_equal "café-sekret".bytesize, r.max_value_length
+    refute_equal "café-sekret".length, r.max_value_length
+  end
 end

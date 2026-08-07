@@ -34,7 +34,13 @@ module AgentDaemon
         # that matches nothing useful, and an empty alternation branch would
         # match at every position (exactly the AC5 failure).
         @pattern = candidates.empty? ? nil : Regexp.union(candidates)
+        # The pipeline's forced-cut (DR9) needs the longest known value's
+        # BYTE length: any occurrence that would straddle a cut necessarily
+        # starts within the last (max_value_length - 1) bytes of the buffer.
+        @max_value_length = candidates.map(&:bytesize).max || 0
       end
+
+      attr_reader :max_value_length
 
       # Takes and returns a String. Knows nothing about lines, streams, runs,
       # or entities — the pipeline feeds it one complete line at a time.
