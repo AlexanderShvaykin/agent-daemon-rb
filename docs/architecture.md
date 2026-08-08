@@ -428,21 +428,43 @@ CLI) keeps its already-issued session until `session_ttl` expires or it is
 destroyed. Shortening that window is a session-TTL decision, not a rendering
 one.
 
-`GET /events` uses Rack partial hijack and emits only fixed SSE invalidations:
-an initial `refresh`, one coalesced `refresh` when the registry revision, event
-cursor, or cursor-loss count changes, an approximately 15-second comment
-heartbeat, and `authorization_lost` before a detected revocation closes the
-stream. The poll interval is 250 ms. Every terminal path closes the IO and
-unsubscribes the tail cursor; server shutdown first stops these loops, then
-stops Puma. Each live stream occupies one Puma request thread, so `max_threads`
-must stay above peak concurrent viewers with headroom for HTML, OAuth, health,
-and reconnect requests.
+`GET /events` uses Rack partial hijack. Its fixed invalidations are an initial
+`refresh`, one coalesced `refresh` when the registry revision, event cursor, or
+cursor-loss count changes, an approximately 15-second comment heartbeat, and
+`authorization_lost` before a detected revocation closes the stream. The poll
+interval is 250 ms. Every terminal path closes the IO and unsubscribes the tail
+cursor; server shutdown first stops these loops, then stops Puma. Each live
+stream occupies one Puma request thread, so `max_threads` must stay above peak
+concurrent viewers with headroom for HTML, OAuth, health, and reconnect
+requests.
+
+When the request carries an `id` naming a runner, the same connection also
+multiplexes that runner's terminal output — the only payload-bearing frames in
+the system. `output`, `output_run`, and `output_lagged` carry a JSON window of
+`{seq, stream, text}` records plus an SSE `id:` line of
+`generation:run_id:seq`; `output_state` carries `{finished, reason, truncated}`.
+Output never travels the `EventBus`: the stream copy-on-read polls
+`OutputBuffers#snapshot` once per existing tick, because pipeline fanout runs on
+the producer thread and must never touch socket IO. Multiplexing rather than
+opening a second endpoint is what keeps one viewer to one Puma thread.
+
+The output cursor is the triple `(generation, run_id, seq)`, never `(run_id,
+seq)`: each respawn builds a fresh `Backend` whose run counter restarts at 1, so
+a generation change is a run change even when the run id is unchanged. A
+malformed, unknown, or non-runner `id`, and any cursor half that is not a
+non-negative base-10 integer, are rejected before the hijack — the id with the
+fixed non-disclosing 404, the cursor by degrading to a full window.
 
 The browser owns one `EventSource` per page. On open/reconnect and every
 `refresh`, it fetches the current authenticated URL and replaces only
 `<main id="console-content">`; a trailing dirty flag coalesces notifications
-that arrive during a fetch. Server-rendered escaping remains the only HTML
-formatting contract, and a successful reconnect fetch repairs gaps by re-reading
+that arrive during a fetch. Server-rendered escaping is the HTML formatting
+contract for every page render; the terminal panel is the one region the client
+also builds itself, and it does so exclusively with `createElement` and
+`textContent` — record text is never parsed as markup on either side. The client
+seeds its window from the server-rendered lines, then appends, so a replacement
+of `#console-content` repaints from the client's own cursor without losing,
+duplicating, or restarting it. A successful reconnect fetch repairs gaps by re-reading
 current registry state plus the retained activity ring rather than promising
 durable replay; a fetch that fails leaves the previous DOM in place until the
 next notification. A stream the browser closes as fatal — which is how an

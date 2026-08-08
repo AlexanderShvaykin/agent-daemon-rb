@@ -353,4 +353,42 @@ class TestConsoleServer < Minitest::Test
     assert_equal "200", response.code
     assert_includes response.body, "wired-through-marker"
   end
+
+  # The two tests above prove output_buffers reaches the PAGE RENDER. The
+  # stream is a separate hop — Server -> LiveUpdates.new(output_buffers:) —
+  # and a fresh empty store would satisfy a naive "the console got an
+  # output_buffers" assertion either way (3.5's wiring-guard hazard). This
+  # drives the real socket and requires the Master's own instance, holding
+  # the marker, to surface in an SSE output frame.
+  def test_the_server_forwards_its_own_output_buffers_into_the_live_stream
+    server = runner_console(-> { build_server(CONSOLE_CONFIG) })
+    session = authenticated_session(server)
+
+    frames = read_entity_stream(server, session, "/events?id=runner%3Awf%3Aalpha")
+
+    assert_includes frames, "event: output_run\n"
+    assert_includes frames, "wired-through-marker"
+  end
+
+  def read_entity_stream(server, session, path)
+    socket = TCPSocket.new("127.0.0.1", server.port)
+    socket.write(
+      "GET #{path} HTTP/1.1\r\n" \
+      "Host: 127.0.0.1\r\n" \
+      "Cookie: #{AgentDaemon::Supervisor::Console::Auth::COOKIE_NAME}=#{session.id}\r\n" \
+      "Connection: close\r\n\r\n"
+    )
+    response = +""
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
+    until response.include?("event: output_run\n")
+      raise "timed out waiting for an output frame: #{response.inspect}" if
+        Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+      chunk = socket.read_nonblock(4096, exception: false)
+      response << chunk if chunk.is_a?(String)
+    end
+    response
+  ensure
+    socket&.close
+  end
 end

@@ -51,7 +51,8 @@ module AgentDaemon
           @fleet = fleet
           @activity_log = activity_log
           @output_buffers = output_buffers
-          @live_updates = LiveUpdates.new(event_bus: event_bus, state_registry: state_registry)
+          @live_updates = LiveUpdates.new(event_bus: event_bus, state_registry: state_registry,
+                                           output_buffers: output_buffers)
           @log_writer = log_writer
         end
 

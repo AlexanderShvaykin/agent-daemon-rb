@@ -67,6 +67,20 @@ class TestConsoleApp < Minitest::Test
                                                   output_buffers: output_buffers)))
   end
 
+  # The bare App, unwrapped — /events tests drive `#call` directly with a
+  # hand-built hijack env (Auth::AUTHORIZATION_ENV_KEY, rack.hijack?,
+  # HTTP_LAST_EVENT_ID), matching test_events_uses_partial_hijack_with_exact_
+  # headers_and_fixed_frames's existing pattern; Rack::MockRequest cannot
+  # express a hijack request.
+  def build_raw_app(fleet, output_buffers: OutputBuffers.new(capacity_bytes: OutputPipeline::DEFAULT_MAX_LINE_BYTES))
+    bus = EventBus.new
+    registry = StateRegistry.new
+    live_updates = LiveUpdates.new(event_bus: bus, state_registry: registry, output_buffers: output_buffers,
+                                    wait: ->(_seconds) {})
+    App.new(fleet: fleet, activity_log: ActivityLog.new(event_bus: bus), live_updates: live_updates,
+            output_buffers: output_buffers)
+  end
+
   # A real, freshly promoted session — the same object the middleware puts in
   # env, not a hand-rolled stand-in (AI-1).
   def session_for(username)
@@ -205,7 +219,11 @@ class TestConsoleApp < Minitest::Test
     body = get("/").body
 
     assert_equal 1, body.scan('<main id="console-content">').size
-    assert_equal 1, body.scan('new EventSource("/events")').size
+    # Story 3.6: the fleet page has no terminal panel, so buildEventsUrl()
+    # falls through to the bare "/events" string at runtime — the literal
+    # `new EventSource(...)` call site is static text, built once.
+    assert_equal 1, body.scan("new EventSource(buildEventsUrl())").size
+    assert_includes body, 'return "/events";'
     assert_includes body, 'source.addEventListener("open", refreshContent)'
     assert_includes body, 'source.addEventListener("refresh", refreshContent)'
     assert_includes body, 'source.addEventListener("authorization_lost"'
@@ -330,6 +348,198 @@ class TestConsoleApp < Minitest::Test
     headers["rack.hijack"].call(io)
     assert_includes io.string, "event: refresh\n"
     assert_includes io.string, "event: authorization_lost\n"
+  end
+
+  # Story 3.6 AC1/AC2: a valid runner id resolves to that entity's raw
+  # entity_id and hijacks normally; with no bootstrap cursor the first tick
+  # is a run change (AC8's own mechanism, not a special case).
+  def test_events_with_a_valid_runner_id_hijacks_and_streams_that_entitys_output
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    output_buffers = OutputBuffers.new(capacity_bytes: OutputPipeline::DEFAULT_MAX_LINE_BYTES)
+    pipeline = OutputPipeline.new(redactor: Redactor.new([]))
+    pipeline.subscribe(output_buffers)
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "hello\n")
+
+    app = build_raw_app(Fleet.new(roster: roster, state_registry: StateRegistry.new), output_buffers: output_buffers)
+    checks = 0
+    env = Rack::MockRequest.env_for(
+      "/events?id=runner%3Awf%3Aalpha",
+      "rack.hijack?" => true,
+      Auth::AUTHORIZATION_ENV_KEY => -> { checks += 1; checks < 2 }
+    )
+
+    status, headers, body = app.call(env)
+
+    assert_equal 200, status
+    assert_empty body
+
+    io = StringIO.new
+    headers["rack.hijack"].call(io)
+    assert_includes io.string, "event: output_run\n"
+    assert_includes io.string, %("text":"hello")
+  end
+
+  # AC14: malformed, unknown, and known-but-non-runner ids all return the
+  # existing fixed non-disclosing 404, and never reach the authorized
+  # callback — proof the hijack never happens.
+  def test_events_with_a_malformed_unknown_or_non_runner_id_is_not_found_and_does_not_hijack
+    alpha = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: alpha),
+              Fleet::Rostered.new(kind: :messenger, workflow: "wf", name: "messenger", entity_id: "messenger:wf")]
+    app = build_raw_app(Fleet.new(roster: roster, state_registry: StateRegistry.new))
+
+    ["id=%3Cscript%3E", "id=runner%3Awf%3Aghost", "id=messenger%3Awf"].each do |query|
+      env = Rack::MockRequest.env_for(
+        "/events?#{query}",
+        "rack.hijack?" => true,
+        Auth::AUTHORIZATION_ENV_KEY => -> { flunk("a 404 id must never reach the authorized callback") }
+      )
+
+      status, _headers, body = app.call(env)
+
+      assert_equal 404, status
+      assert_equal ["not found"], body
+    end
+  end
+
+  # AC14 names FOUR rejects and only "missing" may fall through to the
+  # fleet-wide stream. A query string Rack refuses to parse is malformed, not
+  # missing — /entity already 404s it, and /events used to answer 200 with a
+  # cursor-less stream that could never emit output.
+  def test_events_with_an_unparseable_query_string_is_not_found_rather_than_a_fleet_stream
+    alpha = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app = build_raw_app(Fleet.new(roster: runner_roster(alpha), state_registry: StateRegistry.new))
+
+    # Positive control: an id-less /events IS a legitimate fleet stream, so
+    # the 404 below is about malformedness, not about the absence of an id.
+    bare = Rack::MockRequest.env_for("/events", "rack.hijack?" => true,
+                                                Auth::AUTHORIZATION_ENV_KEY => -> { true })
+    bare_status, = app.call(bare)
+
+    assert_equal 200, bare_status
+
+    env = Rack::MockRequest.env_for(
+      "/events?id=1&id[]=2", "rack.hijack?" => true,
+      Auth::AUTHORIZATION_ENV_KEY => -> { flunk("a malformed query must never reach the authorized callback") }
+    )
+    status, _headers, body = app.call(env)
+
+    assert_equal 404, status
+    assert_equal ["not found"], body
+  end
+
+  # Integer() accepts a leading sign, 0x/0 radix prefixes and _ separators.
+  # `seq=-1` is the one that bites: OutputBuffers reads any seq below
+  # head_seq - 1 as a lagged cursor, making a full-window replay available on
+  # demand to any authenticated client. Every hostile cursor must degrade to
+  # "no cursor", which is itself a full window — so the assertion is that the
+  # stream stays UP and non-500, and the negative case is proven by the
+  # matching-cursor control that emits nothing.
+  def test_hostile_cursor_values_degrade_to_no_cursor_without_raising
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    output_buffers = OutputBuffers.new(capacity_bytes: OutputPipeline::DEFAULT_MAX_LINE_BYTES)
+    pipeline = OutputPipeline.new(redactor: Redactor.new([]))
+    pipeline.subscribe(output_buffers)
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "one\n")
+
+    app = build_raw_app(Fleet.new(roster: runner_roster(id), state_registry: StateRegistry.new),
+                        output_buffers: output_buffers)
+
+    # Control: an exact, well-formed cursor resumes silently.
+    assert_empty stream_events(app, "gen=1&run=1&seq=1"), "a matching cursor must emit no output frame"
+
+    ["gen=1&run=1&seq=-1", "gen=1&run=1&seq=0x1f", "gen=1&run=1&seq=#{'9' * 40}",
+     "gen=1&run=1", "gen=1&run=1&seq=", "gen=1&run=1&seq=abc"].each do |query|
+      assert_includes stream_events(app, query), "event: output_run\n",
+                      "#{query} must degrade to a cursor-less full window"
+    end
+  end
+
+  def stream_events(app, query)
+    checks = 0
+    env = Rack::MockRequest.env_for(
+      "/events?id=runner%3Awf%3Aalpha&#{query}", "rack.hijack?" => true,
+      Auth::AUTHORIZATION_ENV_KEY => -> { checks += 1; checks < 2 }
+    )
+    status, headers, = app.call(env)
+
+    assert_equal 200, status
+    io = StringIO.new
+    headers["rack.hijack"].call(io)
+    io.string.scan(/event: output(?:_run|_lagged)?\n/).join
+  end
+
+  # AC10: a reconnect's Last-Event-ID wins over query params and resumes
+  # exactly (no output frame when nothing is new); a malformed one degrades
+  # to no cursor rather than a 500 from OutputBuffers' ArgumentError.
+  def test_last_event_id_resumes_the_cursor_and_a_malformed_one_degrades_to_the_full_window
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    output_buffers = OutputBuffers.new(capacity_bytes: OutputPipeline::DEFAULT_MAX_LINE_BYTES)
+    pipeline = OutputPipeline.new(redactor: Redactor.new([]))
+    pipeline.subscribe(output_buffers)
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "one\n")
+
+    app = build_raw_app(Fleet.new(roster: runner_roster(id), state_registry: StateRegistry.new),
+                         output_buffers: output_buffers)
+
+    # Positive control for the assertions below: with NO cursor at all this
+    # same request does emit a full window, so a later "no output frame" is
+    # evidence the cursor was honoured, not evidence that nothing streams.
+    bare_checks = 0
+    bare_env = Rack::MockRequest.env_for(
+      "/events?id=runner%3Awf%3Aalpha", "rack.hijack?" => true,
+      Auth::AUTHORIZATION_ENV_KEY => -> { bare_checks += 1; bare_checks < 2 }
+    )
+    _bare_status, bare_headers, = app.call(bare_env)
+    bare_io = StringIO.new
+    bare_headers["rack.hijack"].call(bare_io)
+    assert_includes bare_io.string, "event: output_run\n"
+
+    # The header carries the up-to-date cursor and the query params carry a
+    # stale one that WOULD look like a run change. The header must win, so
+    # the stream resumes silently instead of replaying a window.
+    resumed_checks = 0
+    resumed_env = Rack::MockRequest.env_for(
+      "/events?id=runner%3Awf%3Aalpha&gen=1&run=9&seq=0", "rack.hijack?" => true,
+      "HTTP_LAST_EVENT_ID" => "1:1:1",
+      Auth::AUTHORIZATION_ENV_KEY => -> { resumed_checks += 1; resumed_checks < 2 }
+    )
+    _status, resumed_headers, = app.call(resumed_env)
+    resumed_io = StringIO.new
+    resumed_headers["rack.hijack"].call(resumed_io)
+    refute_includes resumed_io.string, "event: output\n"
+    refute_includes resumed_io.string, "event: output_run\n"
+
+    # A pre-3.6-shaped two-field id has no generation; it must degrade to no
+    # cursor rather than raise ArgumentError on the Puma thread.
+    short_checks = 0
+    short_env = Rack::MockRequest.env_for(
+      "/events?id=runner%3Awf%3Aalpha", "rack.hijack?" => true,
+      "HTTP_LAST_EVENT_ID" => "1:1",
+      Auth::AUTHORIZATION_ENV_KEY => -> { short_checks += 1; short_checks < 2 }
+    )
+    _short_status, short_headers, = app.call(short_env)
+    short_io = StringIO.new
+    short_headers["rack.hijack"].call(short_io)
+    assert_includes short_io.string, "event: output_run\n"
+
+    malformed_checks = 0
+    malformed_env = Rack::MockRequest.env_for(
+      "/events?id=runner%3Awf%3Aalpha", "rack.hijack?" => true,
+      "HTTP_LAST_EVENT_ID" => "garbage",
+      Auth::AUTHORIZATION_ENV_KEY => -> { malformed_checks += 1; malformed_checks < 2 }
+    )
+    _status2, malformed_headers, = app.call(malformed_env)
+    malformed_io = StringIO.new
+    malformed_headers["rack.hijack"].call(malformed_io)
+    assert_includes malformed_io.string, "event: output_run\n"
   end
 
   def test_events_fails_closed_without_partial_hijack_and_rejects_other_verbs
@@ -1359,7 +1569,7 @@ class TestConsoleApp < Minitest::Test
 
     assert_includes section, '<h2 id="terminal-heading">Run output</h2>'
     assert_match(
-      /<div class="terminal-panel" tabindex="0" role="region" aria-labelledby="terminal-heading">/,
+      /<div class="terminal-panel" id="terminal-panel" tabindex="0" role="region" aria-labelledby="terminal-heading"\n */,
       section
     )
     # Exactly ONE thing may carry the "Run output" accessible name. A <section>
@@ -1506,7 +1716,16 @@ class TestConsoleApp < Minitest::Test
     section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
     # The literal, not the constant — see the no-recorded-reason test above.
-    assert_includes section, "<p>No run output captured.</p>"
+    # The class is load-bearing: it is how the client retracts this note once
+    # a run actually starts streaming.
+    assert_includes section, '<p class="terminal-empty">No run output captured.</p>'
+    # A scroll region with nothing to scroll must not collect a tab stop or
+    # announce itself as "Run output" (Story 3.5 rendered no panel at all).
+    refute_includes section, 'tabindex="0"'
+    refute_includes section, 'role="region"'
+    # ...but the element itself must survive, because it is the only carrier
+    # of data-entity-id for a page that loads before the first run.
+    assert_includes section, 'data-entity-id="runner:wf:alpha"'
   end
 
   # DR4: :retained + records: [] is Running with distinct no-output-yet
@@ -1524,6 +1743,90 @@ class TestConsoleApp < Minitest::Test
     # Literals, so the two states cannot be silently rewritten into each other.
     assert_includes section, "(no output yet)"
     refute_includes section, "<p>No run output captured.</p>"
+  end
+
+  # Story 3.6 Task 3: the only bridge between this server-rendered snapshot
+  # and the client's live cursor.
+  def test_the_terminal_panel_carries_escaped_cursor_and_entity_id_attributes
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "hi\n")
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, 'data-entity-id="runner:wf:alpha"'
+    assert_includes section, 'data-run="1"'
+    assert_includes section, 'data-seq="1"'
+  end
+
+  # A started run with zero output has no tail_seq — the placeholder "0"
+  # keeps the cursor a valid Integer pair rather than omitting one half.
+  def test_a_started_run_with_no_output_yet_gets_a_zero_seq_cursor
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, pipeline = build_terminal_app(roster: runner_roster(id))
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, 'data-run="1"'
+    assert_includes section, 'data-seq="0"'
+  end
+
+  # Task 3: an entity with no run at all omits the cursor attributes
+  # entirely (the client starts cursor-less) but still carries the id the
+  # EventSource URL needs to connect at all.
+  def test_a_runner_with_no_runs_omits_cursor_attributes_but_keeps_the_entity_id
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    app, _pipeline = build_terminal_app(roster: runner_roster(id))
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, 'data-entity-id="runner:wf:alpha"'
+    refute_includes section, "data-run="
+    refute_includes section, "data-seq="
+  end
+
+  # Story 3.3 review deferred item, folded into 3.6 Task 6: a dead entity
+  # whose runner thread never reached the backend's ensure must not render a
+  # bare "Running" three rows below a "Liveness: dead" the operator just read.
+  def test_a_dead_entity_with_an_unfinished_run_does_not_render_a_bare_running_state
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :exited })
+    app, pipeline = build_terminal_app(roster: runner_roster(id), state_registry: registry)
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "still going?\n")
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    refute_includes section, '<p class="terminal-state">Running</p>'
+    assert_includes section, "Not running"
+    # The client re-renders this line on the first output_state frame and has
+    # no liveness input of its own, so the reconciled wording has to travel to
+    # it as data. Without this the panel reverts to a bare "Running" one
+    # 250 ms tick after load and the fix above is invisible in a browser.
+    assert_includes section, 'data-running-label="Not running'
+  end
+
+  # The control for the above: a live entity's label stays "Running", so the
+  # attribute is carrying the reconciliation rather than a constant.
+  def test_a_live_entity_with_an_unfinished_run_carries_the_running_label
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :running })
+    app, pipeline = build_terminal_app(roster: runner_roster(id), state_registry: registry)
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: id, output: pipeline.ingress(1))
+    bundle.begin_output_run(1)
+    bundle.append_output(:stdout, "going\n")
+
+    section = terminal_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section, '<p class="terminal-state">Running</p>'
+    assert_includes section, 'data-running-label="Running"'
   end
 
   # AC5: eviction is stated, not hidden.

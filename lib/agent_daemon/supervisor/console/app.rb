@@ -60,12 +60,25 @@ module AgentDaemon
                          "does not survive a supervisor restart.</p>"
 
         # Story 3.5 DR4/AC4: no run has been selected for this entity at all.
-        TERMINAL_EMPTY_NOTE = "<p>No run output captured.</p>"
+        # Carries a class so the client can retract it the moment a run does
+        # start streaming — without one, the page reads "No run output
+        # captured." above a live, filling terminal until the next full load.
+        TERMINAL_EMPTY_NOTE = '<p class="terminal-empty">No run output captured.</p>'
 
         # DR4: a selected run that has not printed anything yet — distinct
         # wording from TERMINAL_EMPTY_NOTE so an operator can tell "no run
         # selected" from "run running silently".
         TERMINAL_NO_OUTPUT_YET = "(no output yet)"
+
+        # Story 3.6 Task 6: a dead entity whose runner thread never reached the
+        # backend's ensure leaves `finished: false` forever, so the page would
+        # otherwise read `Liveness: dead` and `Running` at once.
+        TERMINAL_DEAD_LABEL = "Not running — the entity is dead with no recorded run outcome"
+
+        # The client trims its own record window well below what the server
+        # retains, so it needs wording of its own — TERMINAL_TRUNCATED_NOTE
+        # blames the server buffer, which is not what happened here.
+        TERMINAL_CLIENT_TRUNCATED_NOTE = "Earlier output is not shown — this page keeps the most recent lines only."
 
         # DR4's fourth row: the backend aborted before Sinks::Bundle#end_output_run
         # was ever given a reason (lib/agent_daemon/sinks.rb:71-73). reason.nil?
@@ -74,8 +87,10 @@ module AgentDaemon
 
         # DR4: truncation is sticky for the run's lifetime and rendered
         # whenever it is true, independent of the finished/running state.
-        TERMINAL_TRUNCATED_NOTE = '<p class="terminal-note">Earlier output was discarded — the per-run ' \
-                                   "output buffer is bounded.</p>"
+        # The text is its own constant because LIVE_SCRIPT renders the same
+        # note client-side; two hand-kept copies of one sentence drift.
+        TERMINAL_TRUNCATED_TEXT = "Earlier output was discarded — the per-run output buffer is bounded."
+        TERMINAL_TRUNCATED_NOTE = %(<p class="terminal-note">#{TERMINAL_TRUNCATED_TEXT}</p>)
 
         STYLESHEET = <<~CSS.freeze
           :root {
@@ -295,7 +310,8 @@ module AgentDaemon
           .activity-note { color: #425466; }
 
           .terminal-state { margin: 0 0 0.75rem; }
-          .terminal-note { margin: 0 0 0.75rem; color: #425466; }
+          .terminal-note,
+          .terminal-client-note { margin: 0 0 0.75rem; color: #425466; }
 
           /* Story 3.5: the first dark element in the console (DR6). Both
              background and color are set explicitly since :root only
@@ -340,6 +356,19 @@ module AgentDaemon
           .terminal-stream-stdout { color: #7ee787; }
           .terminal-stream-stderr { color: #ff7b72; }
 
+          /* Story 3.6 Task 6 (deferred-work: wrapped-line gutter): a hanging
+             indent so a wrapped continuation line lands under the text, not
+             under the out/err label, at the 390 px width AC8 targets. */
+          .terminal-line {
+            padding-left: 2.7rem;
+            text-indent: -2.7rem;
+          }
+
+          /* AC6: visible text, not colour alone — announced via aria-live so
+             a screen-reader user learns new output arrived while scrolled
+             up inspecting earlier lines. */
+          .terminal-new-output { margin: 0 0 0.75rem; }
+
           @media (max-width: 40rem) {
             .console-header,
             .console-session { align-items: stretch; flex-direction: column; }
@@ -356,12 +385,355 @@ module AgentDaemon
           }
         CSS
 
+        # Story 3.6: this story owns LIVE_SCRIPT — pinned since 2.6, frozen
+        # again by 3.5 DR8, unfrozen here. Still one IIFE inside the page's
+        # one <script> element (inert_body asserts exactly one `<script`).
+        #
+        # Client-side output state lives in JS variables, never the DOM
+        # (Dev Notes Task 4): `terminalState` is null on any page without a
+        # `.terminal-panel[data-entity-id]` (messenger/reactor pages, the
+        # fleet page) and every output handler below no-ops against null.
+        # Once the FIRST output/output_run/output_lagged/output_state event
+        # is applied, `terminalState.hasApplied` flips true and the client
+        # becomes the panel's sole source of truth (AC11) — a later
+        # #console-content refresh re-paints the fresh `<pre>` from
+        # `terminalState.records` rather than trusting whatever that fetch's
+        # server render happened to show.
         LIVE_SCRIPT = <<~HTML.freeze
           <script>
           (() => {
             let source = null;
             let refreshing = false;
             let dirty = false;
+            let terminalState = null;
+
+            const TERMINAL_MAX_CLIENT_RECORDS = 2000;
+            const OUTCOMES = ["ok", "failed", "timeout", "killed"];
+
+            function terminalPanel() {
+              return document.querySelector(".terminal-panel[data-entity-id]");
+            }
+
+            function terminalSection() {
+              const heading = document.getElementById("terminal-heading");
+              return heading ? heading.closest("section") : null;
+            }
+
+            function isPanelAtBottom(panel) {
+              return panel.scrollHeight - panel.scrollTop - panel.clientHeight < 4;
+            }
+
+            function scrollToBottom(panel) {
+              panel.scrollTop = panel.scrollHeight;
+            }
+
+            // AC6's accessible indication. A live region only announces when
+            // its CONTENTS mutate: registering aria-live on the button itself
+            // and then toggling `hidden` — the element already present, its
+            // text never changing — is the one arrangement assistive tech
+            // reliably stays silent for. So the region is a permanent, empty
+            // container and the button is inserted into and removed from it.
+            function announceRegion() {
+              const section = terminalSection();
+              if (!section) return null;
+              let region = section.querySelector(".terminal-announce");
+              if (!region) {
+                region = document.createElement("div");
+                region.className = "terminal-announce";
+                region.setAttribute("aria-live", "polite");
+                section.insertBefore(region, terminalPanel());
+              }
+              return region;
+            }
+
+            function showNewOutputIndicator(panel) {
+              const region = announceRegion();
+              if (!region || region.firstChild) return;
+              const button = document.createElement("button");
+              button.type = "button";
+              button.className = "terminal-new-output";
+              button.textContent = "Newer output below";
+              button.addEventListener("click", () => {
+                scrollToBottom(panel);
+                hideNewOutputIndicator();
+              });
+              region.appendChild(button);
+            }
+
+            function hideNewOutputIndicator() {
+              const region = announceRegion();
+              if (region) region.textContent = "";
+            }
+
+            // `data-*` values are always Strings; every cursor half on the
+            // wire is a JSON number. Comparing the two with !== made the
+            // first live frame of every page look like a run change, which
+            // cleared the panel and reset the dedupe. Normalise on the way in
+            // so both halves of every later comparison are Numbers.
+            function cursorNumber(value) {
+              if (value === undefined || value === null || value === "") return null;
+              const parsed = Number(value);
+              return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+            }
+
+            // The server already rendered this run's retained window as
+            // .terminal-line nodes. Reading them back is what lets the client
+            // become authoritative WITHOUT throwing that output away: it
+            // starts holding exactly what is on screen, then appends. Seeded
+            // rows carry no seq — the cursor is `data-seq`, and dedupe only
+            // ever applies to records that arrived over the stream.
+            function seedRecordsFromDom(panel) {
+              return Array.prototype.map.call(panel.querySelectorAll(".terminal-line"), (line) => {
+                const label = line.querySelector(".terminal-stream");
+                const labelText = label ? label.textContent : "";
+                return {
+                  stream: labelText === "err" ? "stderr" : "stdout",
+                  text: line.textContent.slice(labelText.length)
+                };
+              });
+            }
+
+            // Bridges the server-rendered snapshot into a fresh client
+            // cursor AND a fresh client record window (AC2). Only called
+            // before the client has gone authoritative — see #fetchAndReplace.
+            function initTerminalState() {
+              const panel = terminalPanel();
+              if (!panel) {
+                terminalState = null;
+                return;
+              }
+              const section = terminalSection();
+              const records = seedRecordsFromDom(panel);
+              terminalState = {
+                entityId: panel.dataset.entityId,
+                generation: cursorNumber(panel.dataset.generation),
+                run: cursorNumber(panel.dataset.run),
+                lastSeq: cursorNumber(panel.dataset.seq),
+                records: records,
+                rendered: records.length,
+                finished: false,
+                reason: null,
+                truncated: !!(section && section.querySelector(".terminal-note")),
+                clientTruncated: false,
+                // The server reconciles "Running" against the entity's
+                // liveness; the client has no liveness input, so it reuses
+                // that decision instead of hardcoding "Running" (AC7).
+                runningLabel: panel.dataset.runningLabel || "Running",
+                hasApplied: false
+              };
+            }
+
+            function boundRecords() {
+              const overflow = terminalState.records.length - TERMINAL_MAX_CLIENT_RECORDS;
+              if (overflow > 0) {
+                terminalState.records.splice(0, overflow);
+                terminalState.rendered = Math.max(0, terminalState.rendered - overflow);
+                terminalState.clientTruncated = true;
+              }
+            }
+
+            // AC2/AC10: drops anything at or below the last applied seq —
+            // the dedupe that makes a bootstrap-matching first tick, and a
+            // resumed reconnect, both no-ops rather than duplicates.
+            function applyRecords(generation, run, records) {
+              if (!terminalState) return;
+              if (terminalState.run !== run || terminalState.generation !== generation) {
+                resetRecords(generation, run);
+              }
+              records.forEach((record) => {
+                if (terminalState.lastSeq !== null && record.seq <= terminalState.lastSeq) return;
+                terminalState.records.push({ stream: record.stream, text: record.text });
+                terminalState.lastSeq = record.seq;
+              });
+              boundRecords();
+              terminalState.hasApplied = true;
+            }
+
+            function resetRecords(generation, run) {
+              terminalState.generation = generation;
+              terminalState.run = run;
+              terminalState.records = [];
+              terminalState.rendered = 0;
+              terminalState.lastSeq = 0;
+              terminalState.clientTruncated = false;
+            }
+
+            // AC8/AC9: output_run and output_lagged both replace wholesale
+            // rather than append. `rendered = 0` is what forces the next
+            // render to repaint instead of appending.
+            function replaceRecords(generation, run, records) {
+              if (!terminalState) return;
+              resetRecords(generation, run);
+              const kept = records.slice(-TERMINAL_MAX_CLIENT_RECORDS);
+              terminalState.clientTruncated = kept.length < records.length;
+              terminalState.records = kept.map((record) => ({ stream: record.stream, text: record.text }));
+              terminalState.lastSeq = records.length ? records[records.length - 1].seq : 0;
+              terminalState.hasApplied = true;
+            }
+
+            function applyState(payload) {
+              if (!terminalState) return;
+              terminalState.finished = payload.finished;
+              terminalState.reason = payload.reason;
+              terminalState.truncated = payload.truncated;
+              terminalState.hasApplied = true;
+            }
+
+            // AC4: built with createElement/textContent, no markup parsing —
+            // the stream identity stays a visible text label ("out"/"err"),
+            // not colour alone.
+            function renderTerminalLine(record) {
+              const div = document.createElement("div");
+              div.className = "terminal-line";
+              const span = document.createElement("span");
+              const stderr = record.stream === "stderr";
+              span.className = "terminal-stream " + (stderr ? "terminal-stream-stderr" : "terminal-stream-stdout");
+              span.textContent = stderr ? "err" : "out";
+              div.appendChild(span);
+              div.appendChild(document.createTextNode(record.text));
+              return div;
+            }
+
+            function renderNote(section, before, className, wanted, text) {
+              let noteEl = section.querySelector("." + className);
+              if (wanted) {
+                if (!noteEl) {
+                  noteEl = document.createElement("p");
+                  noteEl.className = className;
+                  section.insertBefore(noteEl, before);
+                }
+                noteEl.textContent = text;
+              } else if (noteEl) {
+                noteEl.remove();
+              }
+            }
+
+            function renderTerminalState(panel) {
+              const section = terminalSection();
+              if (!section) return;
+
+              // The page may have loaded before this entity had ever run, in
+              // which case the server rendered "No run output captured." A
+              // run is streaming now, so that note is simply false; without
+              // removing it the page states both at once until a full reload.
+              const emptyNote = section.querySelector(".terminal-empty");
+              if (emptyNote) emptyNote.remove();
+
+              let stateEl = section.querySelector(".terminal-state");
+              if (!stateEl) {
+                stateEl = document.createElement("p");
+                stateEl.className = "terminal-state";
+                section.insertBefore(stateEl, panel);
+              }
+              stateEl.textContent = "";
+              if (!terminalState.finished) {
+                // The server's liveness-reconciled wording, not a hardcoded
+                // "Running" — see data-running-label.
+                stateEl.textContent = terminalState.runningLabel;
+              } else if (!terminalState.reason) {
+                stateEl.textContent = "#{TERMINAL_NO_REASON_LABEL}";
+              } else {
+                stateEl.appendChild(document.createTextNode("Finished — "));
+                const span = document.createElement("span");
+                const outcome = OUTCOMES.includes(terminalState.reason) ? terminalState.reason : "unknown";
+                span.className = "outcome outcome-" + outcome;
+                span.textContent = terminalState.reason;
+                stateEl.appendChild(span);
+              }
+
+              renderNote(section, stateEl, "terminal-note", terminalState.truncated,
+                         "#{TERMINAL_TRUNCATED_TEXT}");
+              // Distinct from the server note above: this one is about what
+              // THIS PAGE dropped, and the two can be true independently.
+              renderNote(section, stateEl, "terminal-client-note", terminalState.clientTruncated,
+                         "#{TERMINAL_CLIENT_TRUNCATED_NOTE}");
+            }
+
+            // AC5/AC6: autoscroll only when already at the bottom; otherwise
+            // leave the scroll position alone and surface the indicator.
+            // `stickToBottom`, when given, overrides the live scroll-position
+            // read — #fetchAndReplace uses this since the freshly replaced
+            // panel always starts at scrollTop 0, which is not "at bottom"
+            // for any prior scroll state.
+            function renderTerminalPanel(stickToBottom) {
+              const panel = terminalPanel();
+              if (!panel || !terminalState || !terminalState.hasApplied) return;
+              const pre = panel.querySelector("pre");
+              if (!pre) return;
+
+              const atBottom = typeof stickToBottom === "boolean" ? stickToBottom : isPanelAtBottom(panel);
+
+              // Append-only in the steady state. The previous full teardown
+              // (`pre.textContent = ""` then re-create every node) had two
+              // costs: it destroyed any text the operator had selected, four
+              // times a second, and it rebuilt up to TERMINAL_MAX_CLIENT_RECORDS
+              // nodes per frame. `rendered` counts what is already in the DOM
+              // and is reset to 0 only by the paths that genuinely replace
+              // the window — run change, lag, and #console-content refresh.
+              if (terminalState.rendered === 0) pre.textContent = "";
+
+              if (terminalState.records.length === 0) {
+                pre.textContent = "#{TERMINAL_NO_OUTPUT_YET}";
+              } else {
+                const fragment = document.createDocumentFragment();
+                terminalState.records.slice(terminalState.rendered).forEach((record) => {
+                  fragment.appendChild(renderTerminalLine(record));
+                });
+                pre.appendChild(fragment);
+              }
+              terminalState.rendered = terminalState.records.length;
+
+              renderTerminalState(panel);
+              panel.dataset.generation = String(terminalState.generation);
+              panel.dataset.run = String(terminalState.run);
+              panel.dataset.seq = String(terminalState.lastSeq);
+
+              if (atBottom) {
+                scrollToBottom(panel);
+                hideNewOutputIndicator();
+              } else {
+                showNewOutputIndicator(panel);
+              }
+            }
+
+            // One malformed or truncated frame must not take the panel down
+            // for the life of the connection: an uncaught throw inside an
+            // EventSource listener kills only that dispatch, silently, and
+            // the operator is left watching a frozen panel that still looks
+            // live. Skip the bad frame; the next tick re-synchronises.
+            function onFrame(es, name, handler) {
+              es.addEventListener(name, (event) => {
+                let data;
+                try {
+                  data = JSON.parse(event.data);
+                } catch (_) {
+                  return;
+                }
+                if (!data || typeof data !== "object") return;
+                handler(data);
+                renderTerminalPanel();
+              });
+            }
+
+            function attachOutputListeners(es) {
+              onFrame(es, "output", (data) => {
+                applyRecords(data.generation, data.run, data.records || []);
+              });
+              onFrame(es, "output_run", (data) => {
+                replaceRecords(data.generation, data.run, data.records || []);
+              });
+              onFrame(es, "output_lagged", (data) => {
+                replaceRecords(data.generation, data.run, data.records || []);
+                // AC9: the window jumped forward. The server's own truncation
+                // flag rides a separate output_state frame that is not sent
+                // when the flag did not change, so without this the gap can
+                // be entirely invisible.
+                if (terminalState) terminalState.truncated = true;
+              });
+              onFrame(es, "output_state", (data) => {
+                applyState(data);
+              });
+            }
 
             async function fetchAndReplace() {
               const response = await fetch(window.location.href, { credentials: "same-origin" });
@@ -371,7 +743,46 @@ module AgentDaemon
               const parsed = new DOMParser().parseFromString(await response.text(), "text/html");
               const replacement = parsed.querySelector("#console-content");
               const current = document.querySelector("#console-content");
-              if (replacement && current) current.replaceWith(replacement);
+              if (!replacement || !current) return;
+
+              // Deferred-work fold-in (3.6 Task 4): replaceWith detaches the
+              // focused node and resets scroll on any replaced element, so
+              // both are captured here and restored below.
+              const focusedId = document.activeElement && document.activeElement.id
+                ? document.activeElement.id
+                : null;
+              const oldPanel = terminalPanel();
+              const priorScrollTop = oldPanel ? oldPanel.scrollTop : null;
+              const wasAtBottom = oldPanel ? isPanelAtBottom(oldPanel) : true;
+
+              current.replaceWith(replacement);
+
+              if (focusedId) {
+                const toFocus = document.getElementById(focusedId);
+                if (toFocus) toFocus.focus();
+              }
+
+              if (terminalState && terminalState.hasApplied) {
+                // AC11: the stream is untouched by this replace; only the
+                // panel's markup is repainted from the client's own window,
+                // which by now may be ahead of whatever this fetch rendered.
+                // `rendered = 0` is what turns the next render into a full
+                // repaint instead of an append onto the server's markup.
+                terminalState.rendered = 0;
+                terminalState.runningLabel =
+                  (terminalPanel() && terminalPanel().dataset.runningLabel) || terminalState.runningLabel;
+                renderTerminalPanel(wasAtBottom);
+                if (!wasAtBottom) {
+                  const panel = terminalPanel();
+                  if (panel && priorScrollTop !== null) panel.scrollTop = priorScrollTop;
+                }
+              } else {
+                initTerminalState();
+                const panel = terminalPanel();
+                if (panel && priorScrollTop !== null) {
+                  panel.scrollTop = wasAtBottom ? panel.scrollHeight : priorScrollTop;
+                }
+              }
             }
 
             async function refreshContent() {
@@ -400,9 +811,32 @@ module AgentDaemon
               window.location.assign(login.pathname + login.search);
             }
 
+            // The bootstrap cursor comes from the current panel's data
+            // attributes unless the client has already gone authoritative
+            // (a bfcache-restore reconnect, Story 3.6 AC16), in which case
+            // its own tracked cursor is more current than the frozen DOM.
+            function buildEventsUrl() {
+              const panel = terminalPanel();
+              if (!panel) return "/events";
+
+              const params = new URLSearchParams();
+              params.set("id", panel.dataset.entityId);
+              // All three or none — the server discards a partial cursor.
+              if (terminalState && terminalState.hasApplied && terminalState.generation !== null) {
+                params.set("gen", String(terminalState.generation));
+                params.set("run", String(terminalState.run));
+                params.set("seq", String(terminalState.lastSeq));
+              } else if (panel.dataset.generation !== undefined && panel.dataset.run !== undefined) {
+                params.set("gen", panel.dataset.generation);
+                params.set("run", panel.dataset.run);
+                params.set("seq", panel.dataset.seq || "0");
+              }
+              return "/events?" + params.toString();
+            }
+
             function connect() {
               if (source) return;
-              source = new EventSource("/events");
+              source = new EventSource(buildEventsUrl());
               source.addEventListener("open", refreshContent);
               source.addEventListener("refresh", refreshContent);
               source.addEventListener("authorization_lost", toLogin);
@@ -414,8 +848,19 @@ module AgentDaemon
               source.addEventListener("error", () => {
                 if (source && source.readyState === EventSource.CLOSED) toLogin();
               });
+              attachOutputListeners(source);
             }
 
+            initTerminalState();
+            // AC5: a terminal opens at its newest line. Without this a panel
+            // taller than its max-height loads at scrollTop 0, which reads as
+            // "the operator scrolled up" — so autoscroll never engages and
+            // the "newer output below" indicator appears immediately on a
+            // page the operator has not touched.
+            (() => {
+              const panel = terminalPanel();
+              if (panel) scrollToBottom(panel);
+            })();
             connect();
             // pagehide also fires when the page enters the back/forward cache,
             // so the listener must stay registered and pageshow must re-open —
@@ -439,6 +884,14 @@ module AgentDaemon
         # a 500. Rack::BadRequest is the shared ancestor of the whole family;
         # enumerating the leaf classes is what let ParameterTypeError through.
         PARAM_ERRORS = [Rack::BadRequest].freeze
+
+        # Distinguishes "Rack could not parse this query string" from "no id
+        # was supplied" — /events needs to answer 404 to the first and a
+        # fleet-wide stream to the second (AC14).
+        MALFORMED_PARAM = :malformed_param
+
+        NO_CURSOR = [nil, nil, nil].freeze
+        CURSOR_MAX_DIGITS = 19
 
         def initialize(fleet:, activity_log:, live_updates:, output_buffers:)
           @fleet = fleet
@@ -494,7 +947,8 @@ module AgentDaemon
         # fixed body, no echo of the attacker-controlled id (AC11).
         def entity_detail(request, session)
           id = entity_id_param(request)
-          return not_found unless id
+          # Missing and malformed are both 404 here; only /events distinguishes them.
+          return not_found unless id.is_a?(String)
 
           entry = @fleet.find(id)
           return not_found unless entry
@@ -512,6 +966,13 @@ module AgentDaemon
 
         # SSE is GET-only, so every other verb is a 405 — bodiless for HEAD,
         # which must carry no body per RFC 9110 exactly as / and /entity do.
+        # Story 3.6 AC1/AC2/AC14: `id` is optional (the fleet page's stream
+        # carries none, unchanged behavior). When present it must resolve to
+        # a runner — a messenger/reactor has no output buffer — or this
+        # returns the same fixed non-disclosing 404 /entity uses, BEFORE the
+        # hijack, so a malformed/unknown/non-runner id never reaches
+        # LiveUpdates. `run`/`seq` bootstrap the output cursor (AC2); a
+        # reconnect's `Last-Event-ID` header takes priority (AC10).
         def events(request, env)
           return [405, TEXT_HEADERS.dup, request.head? ? [] : ["method not allowed"]] unless request.get?
 
@@ -520,24 +981,97 @@ module AgentDaemon
             return [503, TEXT_HEADERS.dup, ["streaming unavailable"]]
           end
 
+          id = entity_id_param(request)
+          # AC14 names FOUR rejects — malformed, missing, unknown, non-runner
+          # — but only "missing" may fall through to the fleet-wide stream. A
+          # query string Rack refuses to parse (`?id=1&id[]=2`) is malformed,
+          # not missing, so it must 404 exactly as /entity does rather than
+          # silently serving a cursor-less stream that never emits output.
+          return not_found if id == MALFORMED_PARAM
+
+          entity_id = nil
+          if id
+            entry = @fleet.find(id)
+            return not_found unless entry && entry.kind == :runner && entry.entity_id
+
+            entity_id = entry.entity_id
+          end
+
+          after_generation, after_run_id, after_seq = output_cursor(request, env)
+
           headers = {
             "content-type" => "text/event-stream; charset=utf-8",
             "cache-control" => "no-cache, no-store",
             "x-accel-buffering" => "no",
-            "rack.hijack" => ->(io) { @live_updates.stream(io, authorized: authorized) }
+            "rack.hijack" => lambda { |io|
+              @live_updates.stream(io, authorized: authorized, entity_id: entity_id,
+                                    after_generation: after_generation,
+                                    after_run_id: after_run_id, after_seq: after_seq)
+            }
           }
           [200, headers, []]
+        end
+
+        # `Last-Event-ID` (reconnect, AC10) wins over the `gen`/`run`/`seq`
+        # query params rendered into the page at load (AC2); either missing,
+        # or malformed, degrades to no cursor (full window on first tick) —
+        # never a 500 on the Puma thread from OutputBuffers' ArgumentError.
+        # Every half is coerced to Integer, matching the type every in-tree
+        # producer stamps (Backend::Base's `@run_seq += 1`): a String left
+        # over from an un-coerced query param would never `==` that Integer,
+        # so every reconnect would misread as a run change.
+        def output_cursor(request, env)
+          header = env["HTTP_LAST_EVENT_ID"]
+          if header.is_a?(String) && !header.empty?
+            # Splat-free: a header with fewer than three fields ("1:1", "7")
+            # must degrade to no cursor, not raise ArgumentError out of the
+            # Puma thread on a value a client controls entirely.
+            parts = header.split(":", 3)
+            return parse_cursor(parts[0], parts[1], parts[2])
+          end
+
+          get = request.GET
+          parse_cursor(get["gen"], get["run"], get["seq"])
+        rescue *PARAM_ERRORS
+          NO_CURSOR
+        end
+
+        # All three or none: OutputBuffers raises ArgumentError on a partial
+        # cursor, and #emit_output treats a nil generation as "do not check
+        # for a respawn", so a half-parsed triple must degrade to no cursor
+        # rather than to a plausible-looking one.
+        def parse_cursor(generation, run, seq)
+          values = [generation, run, seq].map { |value| cursor_integer(value) }
+          values.any?(&:nil?) ? NO_CURSOR : values
+        end
+
+        # Integer() is deliberately lenient: it accepts a leading sign, `0x`
+        # and `0` radix prefixes, and `_` separators. `seq=-1` is the one that
+        # bites — OutputBuffers reads any seq below `head_seq - 1` as a lagged
+        # cursor, so a negative seq is an on-demand full-window replay for any
+        # authenticated client. Base 10, non-negative, and length-bounded so a
+        # header-sized digit string cannot make a Bignum on the Puma thread.
+        def cursor_integer(value)
+          return nil unless value.is_a?(String)
+          return nil if value.empty? || value.length > CURSOR_MAX_DIGITS
+
+          parsed = Integer(value, 10)
+          parsed.negative? ? nil : parsed
+        rescue ArgumentError, TypeError
+          nil
         end
 
         # #GET, not #params: the Routing contract is one exact path and one
         # decoded query parameter, and #params would also merge a form-encoded
         # request body — so a GET whose visible URL says one id could render
-        # another.
+        # another. A query string Rack refuses outright is reported as
+        # MALFORMED_PARAM rather than nil, because /events (unlike /entity)
+        # gives nil a legitimate meaning: the fleet page's id-less stream.
         def entity_id_param(request)
           id = request.GET["id"]
           id.nil? || id.empty? ? nil : id
         rescue *PARAM_ERRORS
-          nil
+          MALFORMED_PARAM
         end
 
         def not_found
@@ -892,38 +1426,92 @@ module AgentDaemon
         # accessible name IS a region landmark, so naming both it and DR6's
         # inner role="region" produced two nested landmarks called "Run
         # output". DR6's tab stop needs the name; the wrapper does not.
+        # `data-entity-id` (entry.id — the same URL-safe display key
+        # /entity?id=… and now /events?id=… both key on, NOT the raw
+        # entity_id struct), `data-run`/`data-seq` (the bootstrap cursor,
+        # Story 3.6 AC2/Task 3) are the only bridge between this
+        # server-rendered snapshot and the client's live cursor. Both cursor
+        # attributes are present together or not at all — a started run
+        # with zero output (tail_seq nil) still renders `data-seq="0"`, the
+        # same placeholder #emit_output uses server-side, so the client never
+        # has to special-case "run known, no seq yet".
         def terminal_section(entry)
           return "" unless entry.kind == :runner
 
           snapshot = @output_buffers.snapshot(entry.entity_id)
-          return empty_terminal_section if snapshot.status == :empty
 
           <<~HTML
             <section>
             <h2 id="terminal-heading">Run output</h2>
-            #{snapshot.truncated ? TERMINAL_TRUNCATED_NOTE : ""}#{terminal_state_line(snapshot)}
-            <div class="terminal-panel" tabindex="0" role="region" aria-labelledby="terminal-heading">
-            <pre>#{terminal_lines(snapshot.records)}</pre>
+            #{terminal_notes(snapshot, entry.liveness)}
+            <div class="terminal-panel" id="terminal-panel"#{panel_scroll_attrs(snapshot)}
+                 data-entity-id="#{esc(entry.id)}"
+                 data-running-label="#{esc(terminal_running_label(snapshot, entry.liveness))}"#{cursor_attrs(snapshot)}>
+            <pre>#{terminal_body(snapshot)}</pre>
             </div>
             </section>
           HTML
         end
 
-        def empty_terminal_section
-          <<~HTML
-            <section>
-            <h2 id="terminal-heading">Run output</h2>
-            #{TERMINAL_EMPTY_NOTE}
-            </section>
-          HTML
+        # The panel keeps its `id` unconditionally — it is what
+        # #fetchAndReplace's focus restoration keys on, and it is also the
+        # only element the client needs to find once a run starts on a page
+        # that loaded empty.
+        #
+        # A scroll region with nothing to scroll is not a region: for an
+        # :empty snapshot the panel renders no tabindex and no role, so a
+        # keyboard user does not collect a tab stop onto an empty box
+        # announced as "Run output" (Story 3.5 rendered no panel at all here;
+        # 3.6 needs the element for its data attributes, not its semantics).
+        def panel_scroll_attrs(snapshot)
+          return "" if snapshot.status == :empty
+
+          %( tabindex="0" role="region" aria-labelledby="terminal-heading")
+        end
+
+        def terminal_notes(snapshot, liveness)
+          return TERMINAL_EMPTY_NOTE if snapshot.status == :empty
+
+          "#{snapshot.truncated ? TERMINAL_TRUNCATED_NOTE : ''}#{terminal_state_line(snapshot, liveness)}"
+        end
+
+        def terminal_body(snapshot)
+          return "" if snapshot.status == :empty
+
+          terminal_lines(snapshot.records)
+        end
+
+        def cursor_attrs(snapshot)
+          return "" if snapshot.status == :empty
+
+          %( data-generation="#{esc(snapshot.generation)}" data-run="#{esc(snapshot.run_id)}") +
+            %( data-seq="#{esc(snapshot.tail_seq || 0)}")
         end
 
         # DR4's mapping table, exactly: finished: false -> Running; finished:
         # true with a reason -> the existing outcome vocabulary
         # (activity_detail_html's pattern); finished: true with reason: nil ->
         # the no-recorded-reason wording, never mistaken for "still running".
-        def terminal_state_line(snapshot)
-          return '<p class="terminal-state">Running</p>' unless snapshot.finished
+        #
+        # Story 3.3 review deferred item, folded in here (3.6 Task 6): a dead
+        # entity whose runner thread never reached the backend's ensure
+        # leaves `finished: false` forever, so this page would otherwise show
+        # `Liveness: dead` three rows up and `Running` here — a
+        # self-contradicting page on the one screen that diagnoses crashes.
+        # The not-finished label is computed once and also handed to the client
+        # as `data-running-label` (Story 3.6 review): the client has no
+        # liveness input of its own, so without this it would overwrite the
+        # reconciled text with a hardcoded "Running" on the first output_state
+        # frame — restoring the exact self-contradiction this reconciliation
+        # was added to remove, one tick after page load.
+        def terminal_running_label(snapshot, liveness)
+          return TERMINAL_DEAD_LABEL if !snapshot.finished && liveness == :dead
+
+          "Running"
+        end
+
+        def terminal_state_line(snapshot, liveness)
+          return %(<p class="terminal-state">#{terminal_running_label(snapshot, liveness)}</p>) unless snapshot.finished
           return %(<p class="terminal-state">#{TERMINAL_NO_REASON_LABEL}</p>) unless snapshot.reason
 
           outcome = %i[ok failed timeout killed].include?(snapshot.reason) ? snapshot.reason : :unknown
@@ -937,7 +1525,7 @@ module AgentDaemon
         def terminal_lines(records)
           return TERMINAL_NO_OUTPUT_YET if records.empty?
 
-          records.map { |record| terminal_line(record) }.join("\n")
+          records.map { |record| terminal_line(record) }.join
         end
 
         # AC7: `esc` on every byte of record text, no exceptions — the
@@ -952,11 +1540,15 @@ module AgentDaemon
         # rather than left unlabelled — a deliberate trade: an impossible input
         # is not worth a third branch, and mislabelling beats raising on a Puma
         # thread. Add the unlabelled path only if `stream` ever widens.
+        # Story 3.6 Task 6 (deferred-work: wrapped-line gutter): each record
+        # is its own block so a hanging indent (.terminal-line in
+        # STYLESHEET) keeps a wrapped continuation line off column 0 —
+        # otherwise indistinguishable from a new, unlabelled record.
         def terminal_line(record)
           stderr = record.stream == :stderr
           css = stderr ? "terminal-stream-stderr" : "terminal-stream-stdout"
           label = stderr ? "err" : "out"
-          %(<span class="terminal-stream #{css}">#{label}</span>#{esc(record.text)})
+          %(<div class="terminal-line"><span class="terminal-stream #{css}">#{label}</span>#{esc(record.text)}</div>)
         end
 
         def esc(value)

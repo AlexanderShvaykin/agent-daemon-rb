@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.10.0] - 2026-08-08
+
+### Added
+- Epic 3 supervisor terminal: a single-ingress output pipeline with secret redaction, a bounded per-run output buffer with a sequence-cursor snapshot contract, and a server-rendered run-output panel on the entity page.
+- Authenticated live output streaming multiplexed onto the existing `GET /events` connection — `output`, `output_run`, `output_lagged`, and `output_state` frames, resumable through `Last-Event-ID`, with lagged-cursor recovery and run-change resets. A viewer still costs exactly one Puma thread.
+- Terminal panel autoscroll that follows new output only while the operator is at the bottom, plus an accessible "newer output below" control when they are not.
+
+### Security
+- Record text is attacker-influenceable and is treated as such end to end: JSON-encoded on the wire, inserted with `textContent` in the browser, escaped in every HTML attribute, and never interpolated into log messages. Redaction stays at the single pipeline ingress; the console opens no second path to raw backend bytes.
+- `/events` rejects malformed, unknown, and non-runner entity ids with the existing fixed non-disclosing 404 before the hijack, and reduces any cursor value that is not a non-negative base-10 integer to "no cursor" rather than trusting it.
+
+### Notes
+- Multi-line secrets (PEM keys, JSON service-account blobs) remain structurally unredactable, because redaction matches complete lines. Access control is the barrier.
+- The NFR1 output-to-DOM p95 acceptance protocol has **not** been executed for this release; it requires a production Puma deployment, ~20 runner entities, and 9 concurrent browser sessions. Treat the streaming latency budget as unverified.
+
 ## [0.9.1] - 2026-08-05
 
 ### Added
