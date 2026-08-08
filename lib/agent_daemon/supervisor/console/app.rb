@@ -351,6 +351,16 @@ module AgentDaemon
             min-width: 2.2rem;
             margin-right: 0.5rem;
             font-weight: 700;
+            /* text-indent INHERITS, and an inline-block applies it to its own
+               first line box — so .terminal-line's -2.7rem hanging indent was
+               shifting these glyphs 2.7rem left of this span, clean out of the
+               scroll container. The box stayed where it belonged (hit-testing
+               and getBoundingClientRect both looked correct); only the painted
+               label vanished, leaving stdout and stderr distinguishable by
+               colour alone. Reset it here, not by dropping the hanging indent
+               — that indent is what keeps wrapped continuation lines out of
+               the gutter column. */
+            text-indent: 0;
           }
 
           .terminal-stream-stdout { color: #7ee787; }

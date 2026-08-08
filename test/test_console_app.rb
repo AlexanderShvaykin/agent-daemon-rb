@@ -1830,6 +1830,29 @@ class TestConsoleApp < Minitest::Test
   end
 
   # AC5: eviction is stated, not hidden.
+  # Task 9 manual QA, 2026-08-08: the hanging indent that keeps wrapped
+  # continuation lines out of the gutter column is `text-indent: -2.7rem` on
+  # .terminal-line — and text-indent INHERITS, with an inline-block applying it
+  # to its own first line box. So the .terminal-stream span's "out"/"err"
+  # glyphs painted 2.7rem to the left of the span, clean outside the scroll
+  # container, while its box, hit-testing and getBoundingClientRect all stayed
+  # correct. Every DOM- and HTML-level assertion passed; only the pixels were
+  # wrong, leaving stdout and stderr distinguishable by colour alone (AC4,
+  # WCAG 1.4.1). A stylesheet assertion is a poor substitute for a rendering
+  # test, but it is what this suite can hold: it fails if the reset is dropped
+  # or the hanging indent is reintroduced without one.
+  def test_the_stream_label_resets_the_inherited_hanging_indent
+    stream_rule = App::STYLESHEET[/\.terminal-stream \{[^}]*\}/m]
+
+    refute_nil stream_rule, "the .terminal-stream rule must exist"
+    assert_includes stream_rule, "text-indent: 0",
+                    "the gutter label must reset .terminal-line's inherited negative text-indent"
+
+    line_rule = App::STYLESHEET[/\.terminal-line \{[^}]*\}/m]
+
+    assert_includes line_rule, "text-indent: -", "the wrapped-line hanging indent must still be present"
+  end
+
   def test_overflowing_the_buffer_states_that_earlier_output_was_discarded
     id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
     app, pipeline = build_terminal_app(roster: runner_roster(id), capacity_bytes: 16)

@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.10.1] - 2026-08-08
+
+### Fixed
+- The terminal panel's `out`/`err` stream labels are painted again. Story 3.6's hanging indent (`text-indent: -2.7rem` on `.terminal-line`, which keeps a wrapped continuation line out of the gutter column) inherits, and an `inline-block` applies it to its own first line box — so the label's glyphs rendered 2.7rem to the left of their span, outside the scroll container. The label's box, hit-testing, computed style and `textContent` all remained correct, so this was invisible to every DOM-level check; the user-visible effect was that stdout and stderr became distinguishable by colour alone at every viewport width (WCAG 1.4.1). Fixed by resetting `text-indent` on the label rather than dropping the hanging indent.
+
 ## [0.10.0] - 2026-08-08
 
 ### Added
