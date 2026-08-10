@@ -24,12 +24,29 @@ module AgentDaemon
     # argument. Do not add a second lock, and do not memoise the join (the
     # page must show current state).
     class Fleet
+      # Operator-authored prose about one entity or one workflow: what it is
+      # for, and what to do about it. Carried through the read model verbatim —
+      # it comes from the config, never from a snapshot, so it is constant for
+      # the life of the process and needs no registry read. `support` is the
+      # validated Hash from Config (keys in Config::SUPPORT_KEYS) or nil.
+      Doc = Struct.new(:description, :support, keyword_init: true) do
+        # nil rather than an empty Doc when the config says nothing: the console
+        # renders a Doc iff it exists, so absence is the one check it makes.
+        def self.build(description:, support:)
+          support = nil if support.nil? || support.empty?
+          return nil if description.nil? && support.nil?
+
+          new(description: description, support: support).freeze
+        end
+      end
+
       # One rostered supervised entity, as Master builds it at the same three
       # sites it already writes @entity_ids — the roster can never drift from
       # that set. entity_id must be the identical value @entity_ids holds
       # (the value Sinks::Bundle stamps on every publish and therefore what
-      # keys the registry), not a rebuilt copy.
-      Rostered = Struct.new(:kind, :workflow, :name, :entity_id, keyword_init: true)
+      # keys the registry), not a rebuilt copy. doc is the entity's own Doc, or
+      # nil — messenger and reactor rows never carry one.
+      Rostered = Struct.new(:kind, :workflow, :name, :entity_id, :doc, keyword_init: true)
 
       # A rostered entity joined with its current registry state (or none).
       # The first five members and :id, :generation, :work_item, :attempt,
@@ -43,6 +60,7 @@ module AgentDaemon
       Entry = Struct.new(:kind, :workflow, :name, :status, :liveness,
                           :id, :entity_id, :generation, :work_item, :attempt,
                           :observed_at, :seconds_since_published, :stuck_restarting,
+                          :doc,
                           keyword_init: true)
 
       # Maps a snapshot's raw published :status to a three-way liveness. A
@@ -86,11 +104,22 @@ module AgentDaemon
       # RunnerSupervisor. nil means the stuck-restart flag is unavailable,
       # never "flag everything". clock: injectable so tests advance time
       # instead of sleeping, matching SessionStore's own clock: kwarg.
-      def initialize(roster:, state_registry:, restart_delay: nil, clock: DEFAULT_CLOCK)
+      # workflow_docs: workflow name => Doc, for the workflow-level prose. Kept
+      # here rather than copied onto every Entry — it belongs to the group, not
+      # to the row, and the console renders it once per workflow heading.
+      def initialize(roster:, state_registry:, restart_delay: nil, clock: DEFAULT_CLOCK,
+                     workflow_docs: {})
         @roster = roster.dup.freeze
         @state_registry = state_registry
         @restart_delay = restart_delay
         @clock = clock
+        @workflow_docs = workflow_docs.dup.freeze
+      end
+
+      # The workflow's own Doc, or nil. nil for the fleet-wide reactor's
+      # workflow (there is none) and for any workflow whose config says nothing.
+      def workflow_doc(name)
+        @workflow_docs[name]
       end
 
       # Roster order, state joined. One registry read per call (#all, not N
@@ -152,7 +181,8 @@ module AgentDaemon
           attempt: snapshot && snapshot[:attempt],
           observed_at: snapshot && snapshot[:observed_at],
           seconds_since_published: since_published,
-          stuck_restarting: stuck_restarting?(liveness, since_published)
+          stuck_restarting: stuck_restarting?(liveness, since_published),
+          doc: rostered.doc
         )
       end
 

@@ -22,6 +22,23 @@ project_path: /home/deploy/my-project
 # When running multiple systemd instances, each MUST have a unique message_dir.
 # message_dir: to_message
 
+# OPTIONAL, for humans only — the daemon never reads these. The supervisor
+# console renders them so whoever is on support, and did not write this file,
+# can tell what the flow is for and who to ask. Both keys are also accepted on
+# an individual runner (see `triage` below), where they describe that one piece
+# of work; a runner without them falls back to nothing, and the console still
+# shows this workflow-level block on its page.
+#
+# description: |
+#   Triages new tracker tasks and reviews merge requests.
+#   Runs against the my-project checkout on deploy-01.
+# support:
+#   owner: "@alexander"          # who to ask
+#   runbook: https://wiki.example.com/flows/my-project   # http(s) only
+#   on_failure: |                # what support should try first
+#     Check that TRACKER_TOKEN is still valid, then press Restart
+#     in the console. Escalate if it crashes twice in a row.
+
 # Yandex Tracker API credentials (required only if you have tracker-type runners).
 tracker:
   token: <%= secret('TRACKER_TOKEN') %>   # or inline: "your-oauth-token"
@@ -38,6 +55,15 @@ runners:
   - name: triage
     backend: claude            # "claude" (default) or "opencode"
     agent: task-analyst        # --agent flag passed to the CLI
+    # Same optional, human-only pair as at the top of this file, scoped to this
+    # one runner. Shown in the console next to this runner's name; note that
+    # every runner key is also a prompt variable, so `{{description}}` works in
+    # the template too.
+    # description: Picks up open tracker tasks that have no analysis yet.
+    # support:
+    #   owner: "@alexander"
+    #   runbook: https://wiki.example.com/flows/my-project#triage
+    #   on_failure: Usually an expired TRACKER_TOKEN.
     # extra_flags: ""          # additional CLI flags
     # timeout: 1200            # single backend invocation timeout (seconds), default 20 min
     # max_attempts: 3          # max retries per work item before skipping

@@ -268,6 +268,21 @@ without it. `channels` may be empty
 only with a valid `direct_users` allowlist, which configures a direct-message-
 only runner. Otherwise, `channels` remains required for non-DM posts.
 
+### Operator descriptions (`description` / `support`)
+
+Both keys are optional and accepted at two levels: the top of a workflow config
+(describing the whole flow) and inside a single `runners` entry (describing that
+one piece of work). Nothing in the daemon reads them — they exist so the
+supervisor console can answer "what is this and who owns it" for someone who did
+not write the config. `support` is a closed vocabulary (`Config::SUPPORT_KEYS`:
+`owner`, `runbook`, `on_failure`); an unknown key is a load error rather than a
+silently ignored typo, and `runbook` must be an `http(s)` URL because the console
+renders it as an anchor.
+
+Runner-level keys are also prompt variables, so `{{description}}` is available in
+that runner's template. Descriptions are not passed through the Redactor — they
+are operator prose, not agent output, and must not contain secrets.
+
 ### Path Resolution
 
 | Path                                          | Resolved relative to |
@@ -294,6 +309,9 @@ Config loading fails immediately with descriptive errors when:
 - Trigger-specific required keys are missing (e.g. a `mattermost` trigger
   requires `base_url`, `token`, `team`, and a non-empty `channels` list).
 - A prompt template file does not exist on disk.
+- A `description` is present but blank or not a String, `support` is not a Hash,
+  it carries an unknown key, one of its values is blank, or `support.runbook` is
+  not an `http(s)` URL — at either the config or the runner level.
 
 ## Supervisor
 
@@ -405,6 +423,16 @@ cursor cleanup exception-safe without producer-thread callbacks.
 visible as unknown. `ActivityLog` projects the newest retained records for one
 entity from `EventBus`; this history is bounded, in-memory, and lost on process
 restart. Neither observer reads runners, threads, or `RunnerSupervisor`.
+
+`Fleet` also carries the config's operator descriptions: a `Fleet::Doc`
+(description + `support` hash, or nil when the config says nothing) per rostered
+runner, plus a workflow-name-keyed map read via `Fleet#workflow_doc`. These come
+from `Master#build_factories` at boot, never from a snapshot, so they are
+constant for the life of the process. The fleet page renders one clipped
+description line under each name; the entity page renders the full text and the
+support block, as two independent sections (the entity's own, then its
+workflow's). All of it is escaped and never parsed as markdown, and the console
+re-checks a runbook's scheme before emitting an `<a href>`.
 
 The optional console is one non-clustered Puma server in the master process.
 `Auth` is a default-deny Rack middleware: `/healthz` (GET/HEAD) is the only
