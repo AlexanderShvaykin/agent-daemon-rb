@@ -61,6 +61,7 @@ module AgentDaemon
         @log_levels = {}
         @supervisors = {}
         @roster = []
+        @workflow_docs = {}
         @console = nil
         @console_dead = false
         @state_registry = StateRegistry.new
@@ -180,7 +181,9 @@ module AgentDaemon
       # NoMethodError — several existing tests call start_console with no
       # build_factories first.
       def fleet
-        @fleet ||= Fleet.new(roster: @roster, state_registry: @state_registry, restart_delay: RunnerSupervisor::RESTART_DELAY)
+        @fleet ||= Fleet.new(roster: @roster, state_registry: @state_registry,
+                             restart_delay: RunnerSupervisor::RESTART_DELAY,
+                             workflow_docs: @workflow_docs)
       end
 
       def activity_log
@@ -297,11 +300,21 @@ module AgentDaemon
 
       def build_factories
         @config.workflows.each do |workflow|
+          record_workflow_doc(workflow)
           build_runner_factories(workflow)
           build_messenger_factory(workflow)
         end
 
         build_reactor_factory
+      end
+
+      # Config-time prose for the console (Fleet::Doc). Absent keys yield no
+      # entry at all, so a config written before descriptions existed simply
+      # renders as it did before.
+      def record_workflow_doc(workflow)
+        config = workflow[:config]
+        doc = Fleet::Doc.build(description: config.description, support: config.support)
+        @workflow_docs[workflow[:name]] = doc if doc
       end
 
       def build_runner_factories(workflow)
@@ -311,7 +324,10 @@ module AgentDaemon
           @entity_factories[key] = runner_factory_for(workflow[:config], runner_config)
           @entity_ids[key] = identity
           @log_levels[key] = log_level
-          @roster << Fleet::Rostered.new(kind: :runner, workflow: workflow[:name], name: runner_config["name"], entity_id: identity)
+          @roster << Fleet::Rostered.new(kind: :runner, workflow: workflow[:name], name: runner_config["name"],
+                                          entity_id: identity,
+                                          doc: Fleet::Doc.build(description: runner_config["description"],
+                                                                support: runner_config["support"]))
         end
       end
 

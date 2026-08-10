@@ -318,6 +318,49 @@ class TestFleet < Minitest::Test
     assert_equal "messenger:wf", entry.entity_id
   end
 
+  # --- Doc: operator-authored prose ----------------------------------------
+
+  def test_doc_build_returns_nil_when_the_config_says_nothing
+    assert_nil Fleet::Doc.build(description: nil, support: nil)
+    assert_nil Fleet::Doc.build(description: nil, support: {})
+  end
+
+  def test_doc_build_keeps_either_half_on_its_own
+    description_only = Fleet::Doc.build(description: "Reviews merge requests.", support: nil)
+    support_only = Fleet::Doc.build(description: nil, support: { "owner" => "@alexander" })
+
+    assert_equal "Reviews merge requests.", description_only.description
+    assert_nil description_only.support
+    assert_nil support_only.description
+    assert_equal({ "owner" => "@alexander" }, support_only.support)
+  end
+
+  def test_entry_carries_the_rostered_doc_verbatim
+    doc = Fleet::Doc.build(description: "Reviews merge requests.", support: { "owner" => "@alexander" })
+    roster = [Rostered.new(kind: :runner, workflow: "wf", name: "a", entity_id: runner_identity("wf", "a"), doc: doc)]
+    fleet = Fleet.new(roster: roster, state_registry: @registry)
+
+    assert_same doc, fleet.entries.first.doc
+  end
+
+  # A doc-less roster is what every config written before descriptions existed
+  # produces, and it must join exactly as it did before.
+  def test_entry_doc_is_nil_when_the_roster_carries_none
+    roster = [Rostered.new(kind: :runner, workflow: "wf", name: "a", entity_id: runner_identity("wf", "a"))]
+    fleet = Fleet.new(roster: roster, state_registry: @registry)
+
+    assert_nil fleet.entries.first.doc
+  end
+
+  def test_workflow_doc_is_looked_up_by_name
+    doc = Fleet::Doc.build(description: "Analyses tracker tasks.", support: nil)
+    fleet = Fleet.new(roster: [], state_registry: @registry, workflow_docs: { "wf" => doc })
+
+    assert_same doc, fleet.workflow_doc("wf")
+    assert_nil fleet.workflow_doc("other")
+    assert_nil fleet.workflow_doc(nil)
+  end
+
   # --- Empty roster ---------------------------------------------------------
 
   def test_an_empty_roster_yields_empty_results

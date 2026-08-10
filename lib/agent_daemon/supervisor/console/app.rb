@@ -34,6 +34,23 @@ module AgentDaemon
         TEXT_HEADERS = { "content-type" => "text/plain; charset=utf-8" }.freeze
 
         EM_DASH = "—"
+        ELLIPSIS = "…"
+
+        # Characters of an operator's `description:` that the fleet page shows
+        # under a name. Long enough for a sentence, short enough that a card
+        # keeps its shape in the narrowest grid column; the entity page renders
+        # the description in full, so nothing is lost, only deferred.
+        SUMMARY_LIMIT = 120
+
+        # `support:` keys in the order the entity page renders them, with their
+        # labels. Config validates the vocabulary (Config::SUPPORT_KEYS); this
+        # is the presentation half — a key absent from the config renders no row
+        # at all rather than an empty one.
+        SUPPORT_LABELS = [
+          ["owner", "Owner"],
+          ["runbook", "Runbook"],
+          ["on_failure", "If it breaks"]
+        ].freeze
 
         # Robot-head favicon, inlined as a data URI so no extra route is needed:
         # a real /favicon.ico would sit behind the default-deny middleware and
@@ -214,7 +231,35 @@ module AgentDaemon
 
           article h3 { margin: 0 0 0.9rem; font-size: 1.05rem; }
           article dl,
-          .entity-diagnostics { margin: 0 0 1rem; }
+          .entity-diagnostics,
+          .entity-support { margin: 0 0 1rem; }
+
+          /* One clipped line under a name on the fleet page. */
+          .doc-summary {
+            margin: -0.5rem 0 0.9rem;
+            color: #425466;
+            overflow-wrap: anywhere;
+          }
+
+          section > .doc-summary { margin: -0.5rem 0 1rem; }
+
+          /* The entity page shows the description verbatim: an operator's line
+             breaks are the structure of the text (a short list of steps), and
+             this is deliberately not markdown — the text is escaped, never
+             parsed. */
+          .doc-text {
+            margin: 0 0 1rem;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+          }
+
+          /* Same reason as .doc-text: on_failure is usually more than one line. */
+          .entity-support dd { white-space: pre-wrap; }
+
+          /* The <dl> is a section's last child, so its bottom margin would
+             stack on top of the section's padding. */
+          .entity-support:last-child { margin-bottom: 0; }
+          .doc-text:last-child { margin-bottom: 0; }
 
           /* The <dl> is the card's last child, so its own bottom margin would
              stack on top of the card's padding. */
@@ -222,6 +267,7 @@ module AgentDaemon
 
           article dl > div,
           .entity-diagnostics > div,
+          .entity-support > div,
           .activity-timeline li dl > div {
             display: grid;
             grid-template-columns: minmax(5.5rem, auto) 1fr;
@@ -232,10 +278,12 @@ module AgentDaemon
 
           article dt,
           .entity-diagnostics dt,
+          .entity-support dt,
           .activity-timeline dt { color: #425466; font-weight: 600; }
 
           article dd,
           .entity-diagnostics dd,
+          .entity-support dd,
           .activity-timeline dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 
           .liveness {
@@ -1152,7 +1200,8 @@ module AgentDaemon
 
           workflows.each_with_index do |(name, group_entries), index|
             html << entity_group(name, group_entries, heading_id: "workflow-#{index}-heading",
-                                  label: "Entities in workflow #{name}")
+                                  label: "Entities in workflow #{name}",
+                                  doc: @fleet.workflow_doc(name))
           end
           unless fleet_wide.empty?
             html << entity_group("Fleet-wide", fleet_wide, heading_id: "fleet-wide-heading",
@@ -1182,15 +1231,34 @@ module AgentDaemon
         # implicit list role in Safari/VoiceOver, which would take the group's
         # aria-label and its item count with it — the whole point of labelling
         # the group.
-        def entity_group(name, entries, heading_id:, label:)
+        def entity_group(name, entries, heading_id:, label:, doc: nil)
           cards = entries.map { |entry| entity_card(entry) }.join
           <<~HTML
             <section aria-labelledby="#{heading_id}">
             <h2 id="#{heading_id}">#{esc(name)}</h2>
-            <ul aria-label="#{esc(label)}" role="list">
+            #{doc_summary(doc)}<ul aria-label="#{esc(label)}" role="list">
             #{cards}</ul>
             </section>
           HTML
+        end
+
+        # The fleet page is a scan surface, so a Doc contributes exactly one
+        # muted line here: its description's first line, clipped. The full text
+        # and the support block live on the entity page — see doc_section.
+        # Returns "" (not an empty <p>) when there is nothing to say, which is
+        # also what every doc-less config renders.
+        def doc_summary(doc)
+          summary = summarize(doc&.description)
+          return "" unless summary
+
+          %(<p class="doc-summary">#{esc(summary)}</p>\n)
+        end
+
+        def summarize(description)
+          line = description.to_s.lines.map(&:strip).find { |candidate| !candidate.empty? }
+          return nil unless line
+
+          line.length > SUMMARY_LIMIT ? "#{line[0, SUMMARY_LIMIT].rstrip}#{ELLIPSIS}" : line
         end
 
         def entity_card(entry)
@@ -1200,7 +1268,7 @@ module AgentDaemon
           <<~HTML
             <li><article>
             <h3>#{entity_link(entry)}</h3>
-            <dl>
+            #{doc_summary(entry.doc)}<dl>
             <div><dt>Kind</dt><dd>#{esc(entry.kind)}</dd></div>
             <div><dt>Liveness</dt><dd>#{liveness_cell(entry.liveness)}</dd></div>
             <div><dt>Note</dt><dd>#{esc(note)}</dd></div>
@@ -1271,9 +1339,61 @@ module AgentDaemon
             #{restart_delayed_warning(entry)}<p>#{restart_placeholder}</p>
             #{STALENESS_NOTE}
             </section>
-            #{activity_section(entry)}
+            #{doc_sections(entry)}#{activity_section(entry)}
             #{terminal_section(entry)}
           HTML
+        end
+
+        # Two independent sections, either of which may be absent: what this
+        # single piece of work is, and what the workflow around it is. They are
+        # separate because they come from different places in the config and a
+        # workflow's runbook is the fallback when a runner has none of its own.
+        # Config-time text only — nothing here reflects runtime state, so it
+        # renders identically on every refresh.
+        def doc_sections(entry)
+          own = doc_section(entry.doc, heading_id: "entity-doc-heading", title: "What this does")
+          workflow_doc = entry.workflow && @fleet.workflow_doc(entry.workflow)
+          around = doc_section(workflow_doc, heading_id: "workflow-doc-heading",
+                                title: "About workflow #{entry.workflow}")
+          "#{own}#{around}"
+        end
+
+        def doc_section(doc, heading_id:, title:)
+          return "" unless doc
+
+          description = doc.description ? %(<p class="doc-text">#{esc(doc.description)}</p>\n) : ""
+          rows = support_rows(doc.support)
+          support = rows.empty? ? "" : %(<dl class="entity-support">\n#{rows}\n</dl>\n)
+
+          <<~HTML
+            <section aria-labelledby="#{heading_id}">
+            <h2 id="#{heading_id}">#{esc(title)}</h2>
+            #{description}#{support}</section>
+          HTML
+        end
+
+        def support_rows(support)
+          return "" unless support
+
+          SUPPORT_LABELS.filter_map do |key, label|
+            value = support[key]
+            next unless value.is_a?(String) && !value.strip.empty?
+
+            %(<div><dt>#{label}</dt><dd>#{support_value(key, value)}</dd></div>)
+          end.join("\n")
+        end
+
+        # Config already rejects a non-http(s) runbook; the scheme is checked
+        # again here because this is the line that turns operator text into an
+        # href, and a link element must never be built on a validation done
+        # somewhere else. A URL that fails the check renders as plain text.
+        def support_value(key, value)
+          text = value.strip
+          unless key == "runbook" && text.start_with?("http://", "https://")
+            return esc(text)
+          end
+
+          %(<a href="#{esc(text)}" rel="noopener noreferrer">#{esc(text)}</a>)
         end
 
         def generation_cell(generation)

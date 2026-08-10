@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.11.0] - 2026-08-10
+
+### Added
+- Optional `description:` and `support:` (`owner`, `runbook`, `on_failure`) keys, accepted both at the top of a workflow config and inside a single `runners` entry. The daemon ignores them; they exist so someone on support who did not write the config can tell what a flow is for and what to do about it.
+- The console renders them: one clipped description line under each entity and workflow name on the fleet page, and the full text plus the support block on the entity page — as two independent sections, the entity's own followed by its workflow's. `on_failure` keeps the operator's line breaks (`white-space: pre-wrap`).
+
+### Security
+- Descriptions are operator prose rendered escaped, never parsed as markdown. `support.runbook` is validated as an `http(s)` URL at config load, and the console re-checks the scheme before emitting an `<a href>` — a URL that fails renders as text. Descriptions do not pass through the Redactor, so they must not contain secrets.
+
 ## [0.10.1] - 2026-08-08
 
 ### Fixed

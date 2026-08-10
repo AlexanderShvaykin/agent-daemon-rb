@@ -3,6 +3,7 @@
 require "yaml"
 require "erb"
 require "json"
+require "uri"
 
 module AgentDaemon
   class ConfigError < StandardError; end
@@ -37,6 +38,15 @@ module AgentDaemon
     TRACKER_TRIGGER_DEFAULTS    = { "interval" => 60, "jitter" => 5 }.freeze
     FILE_TRIGGER_DEFAULTS       = { "interval" => 10, "jitter" => 5 }.freeze
     MATTERMOST_TRIGGER_DEFAULTS = { "interval" => 2, "jitter" => 0 }.freeze
+
+    # The whole `support:` vocabulary, at both the config and the runner level.
+    # Closed on purpose: a typo'd key would otherwise vanish silently and the
+    # console would show nothing where support expects a runbook.
+    SUPPORT_KEYS = %w[owner runbook on_failure].freeze
+
+    # A runbook is rendered as an anchor by the console, so anything but http(s)
+    # is rejected at load rather than turned into a javascript:/data: link.
+    RUNBOOK_SCHEMES = %w[http https].freeze
 
     VALID_TRIGGER_TYPES   = %w[tracker file mattermost].freeze
     VALID_BACKENDS        = %w[claude opencode].freeze
@@ -77,6 +87,19 @@ module AgentDaemon
 
     def runners
       @runners
+    end
+
+    # Operator-authored prose describing what this whole workflow is for, and
+    # who to page when it breaks (both optional). Nothing in the daemon reads
+    # these — they exist so the supervisor console can tell someone who did not
+    # write the config what a flow does. The same two keys are accepted on a
+    # runner, where they describe that single piece of work.
+    def description
+      @data["description"]
+    end
+
+    def support
+      @data["support"]
     end
 
     # Every raw value `secret()` resolved while rendering this config, in call
@@ -187,6 +210,7 @@ module AgentDaemon
         @runners.each { |runner| errors.concat(validate_runner(runner)) }
       end
 
+      errors.concat(validate_documentation(@data["description"], @data["support"]))
       errors.concat(validate_tracker)
       errors.concat(validate_messenger)
 
@@ -283,7 +307,54 @@ module AgentDaemon
       end
 
       errors.concat(validate_trigger(label, runner["trigger"]))
+      errors.concat(validate_documentation(runner["description"], runner["support"],
+                                           prefix: "runner #{label.inspect}: "))
       errors
+    end
+
+    # Shared by the config level (no prefix) and the runner level. Both keys are
+    # optional; an absent key is not an error, but a present one must carry real
+    # text — a blank description is worse than none, since the console would
+    # render an empty block where support expects an answer.
+    def validate_documentation(description, support, prefix: "")
+      errors = []
+
+      unless description.nil? || (description.is_a?(String) && !description.strip.empty?)
+        errors << "#{prefix}description must be a non-empty String (got #{description.inspect})"
+      end
+
+      return errors if support.nil?
+
+      unless support.is_a?(Hash)
+        return errors << "#{prefix}support must be a Hash with any of #{SUPPORT_KEYS.join(', ')}"
+      end
+
+      unknown = support.keys - SUPPORT_KEYS
+      unless unknown.empty?
+        errors << "#{prefix}support has unknown key(s) #{unknown.join(', ')} (known: #{SUPPORT_KEYS.join(', ')})"
+      end
+
+      SUPPORT_KEYS.each do |key|
+        next unless support.key?(key)
+
+        value = support[key]
+        unless value.is_a?(String) && !value.strip.empty?
+          errors << "#{prefix}support.#{key} must be a non-empty String (got #{value.inspect})"
+        end
+      end
+
+      errors.concat(validate_runbook(support["runbook"], prefix))
+    end
+
+    def validate_runbook(runbook, prefix)
+      return [] unless runbook.is_a?(String) && !runbook.strip.empty?
+
+      uri = URI.parse(runbook.strip)
+      return [] if RUNBOOK_SCHEMES.include?(uri.scheme) && !uri.host.to_s.empty?
+
+      ["#{prefix}support.runbook must be an http(s) URL (got #{runbook.inspect})"]
+    rescue URI::InvalidURIError
+      ["#{prefix}support.runbook must be an http(s) URL (got #{runbook.inspect})"]
     end
 
     def validate_trigger(runner_label, trigger)

@@ -44,6 +44,8 @@ class TestSupervisorMaster < Minitest::Test
         }
         data["messenger"] = spec[:messenger] if spec[:messenger]
         data["logging"] = spec[:logging] if spec[:logging]
+        data["description"] = spec[:description] if spec[:description]
+        data["support"] = spec[:support] if spec[:support]
         File.write(File.join(wf_dir, "#{spec[:name]}.yml"), data.to_yaml)
       end
 
@@ -683,6 +685,63 @@ class TestSupervisorMaster < Minitest::Test
       entries = received_fleet.entries
       assert_equal %i[runner runner messenger reactor], entries.map(&:kind)
       assert_equal %w[a m messenger mattermost_reactor], entries.map(&:name)
+    end
+  end
+
+  # The config is the only source of these — a Master that reads them from the
+  # wrong place ships a console whose descriptions are permanently blank with a
+  # green suite, the same failure mode the restart_delay wiring test guards.
+  def test_console_factory_receives_a_fleet_carrying_config_authored_descriptions
+    received_fleet = nil
+    factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers|
+      received_fleet = fleet
+      ConsoleSpy.new(console_config)
+    end
+    documented_runner = tracker_runner("a").merge(
+      "description" => "Picks up open tasks.",
+      "support" => { "owner" => "@alexander" }
+    )
+
+    with_config(
+      [{
+        name: "wf",
+        runners: [documented_runner, tracker_runner("b")],
+        description: "Analyses tracker tasks.",
+        support: { "runbook" => "https://wiki.example.com/flows" }
+      }],
+      console: CONSOLE_BLOCK
+    ) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: factory)
+      master.send(:build_factories)
+      master.send(:start_console)
+
+      documented, undocumented = received_fleet.entries
+      workflow_doc = received_fleet.workflow_doc("wf")
+
+      assert_equal "Picks up open tasks.", documented.doc.description
+      assert_equal({ "owner" => "@alexander" }, documented.doc.support)
+      assert_nil undocumented.doc
+      assert_equal "Analyses tracker tasks.", workflow_doc.description
+      assert_equal({ "runbook" => "https://wiki.example.com/flows" }, workflow_doc.support)
+    end
+  end
+
+  # A workflow whose config says nothing must not appear in the docs map at
+  # all — the console renders a Doc iff it exists.
+  def test_a_workflow_without_descriptions_has_no_doc
+    received_fleet = nil
+    factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers|
+      received_fleet = fleet
+      ConsoleSpy.new(console_config)
+    end
+
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: factory)
+      master.send(:build_factories)
+      master.send(:start_console)
+
+      assert_nil received_fleet.workflow_doc("wf")
+      assert_nil received_fleet.entries.first.doc
     end
   end
 

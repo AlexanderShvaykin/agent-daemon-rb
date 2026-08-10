@@ -1954,4 +1954,162 @@ class TestConsoleApp < Minitest::Test
     assert_includes errors.first, "output buffers boom"
     assert_includes errors.first, "/entity"
   end
+
+  # --- Operator-authored descriptions --------------------------------------
+  #
+  # The audience for these is whoever is on support and did not write the
+  # config: the fleet page carries one clipped line per name, the entity page
+  # carries the full text plus the support block.
+
+  def documented_app(entity_doc: nil, workflow_doc: nil, name: "alpha")
+    id = RunnerIdentity.new(workflow: "wf", runner: name)
+    registry = StateRegistry.new
+    registry.publish(id, { status: :waiting, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: name, entity_id: id, doc: entity_doc)]
+    docs = workflow_doc ? { "wf" => workflow_doc } : {}
+    build_app(Fleet.new(roster: roster, state_registry: registry, workflow_docs: docs))
+  end
+
+  def doc(description: nil, support: nil)
+    Fleet::Doc.build(description: description, support: support)
+  end
+
+  def doc_section(body, heading_id)
+    body[/<section aria-labelledby="#{heading_id}">.*?<\/section>/m]
+  end
+
+  def test_fleet_page_shows_one_summary_line_per_entity_and_per_workflow
+    app = documented_app(entity_doc: doc(description: "Picks up open tasks."),
+                          workflow_doc: doc(description: "Analyses tracker tasks."))
+
+    group = section(get_on(app, "/").body, "wf")
+
+    assert_includes group, %(<p class="doc-summary">Analyses tracker tasks.</p>)
+    assert_includes group, %(<p class="doc-summary">Picks up open tasks.</p>)
+  end
+
+  # The card is a fixed-height grid cell, so a paragraph of prose would wreck
+  # the row it sits in — only the first line survives, clipped.
+  def test_fleet_page_clips_a_summary_to_its_first_line_and_length_limit
+    long = "#{'x' * 200}\nsecond line"
+    app = documented_app(entity_doc: doc(description: long))
+
+    group = section(get_on(app, "/").body, "wf")
+    summary = group[/<p class="doc-summary">(.*?)<\/p>/m, 1]
+
+    refute_includes summary, "second line"
+    assert_equal "#{'x' * App::SUMMARY_LIMIT}…", summary
+  end
+
+  # A doc-less fleet is what every config written before descriptions existed
+  # renders, and it must carry no empty paragraph at all.
+  def test_fleet_page_omits_the_summary_entirely_when_there_is_no_description
+    group = section(get_on(documented_app(entity_doc: doc(support: { "owner" => "@alexander" })), "/").body, "wf")
+
+    refute_includes group, %(<p class="doc-summary">)
+  end
+
+  def test_entity_page_renders_the_full_description_and_support_block
+    support = {
+      "owner" => "@alexander",
+      "runbook" => "https://wiki.example.com/flows/task-analyst",
+      "on_failure" => "Check the token.\nThen Restart."
+    }
+    app = documented_app(entity_doc: doc(description: "Picks up open tasks.\nComments the analysis.",
+                                          support: support))
+
+    section_html = doc_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body, "entity-doc-heading")
+
+    refute_nil section_html, "no entity doc section in the page"
+    assert_includes section_html, "<h2 id=\"entity-doc-heading\">What this does</h2>"
+    assert_includes section_html, %(<p class="doc-text">Picks up open tasks.\nComments the analysis.</p>)
+    assert_includes section_html, <<~HTML.chomp
+      <dl class="entity-support">
+      <div><dt>Owner</dt><dd>@alexander</dd></div>
+      <div><dt>Runbook</dt><dd><a href="https://wiki.example.com/flows/task-analyst" rel="noopener noreferrer">https://wiki.example.com/flows/task-analyst</a></dd></div>
+      <div><dt>If it breaks</dt><dd>Check the token.\nThen Restart.</dd></div>
+      </dl>
+    HTML
+  end
+
+  # The workflow's own prose is the fallback when the runner carries none, so
+  # it renders as its own section rather than being merged into the entity's.
+  def test_entity_page_renders_the_workflow_doc_as_a_separate_section
+    app = documented_app(entity_doc: doc(description: "Picks up open tasks."),
+                          workflow_doc: doc(description: "Analyses tracker tasks.",
+                                            support: { "owner" => "@platform" }))
+
+    body = get_on(app, "/entity?id=runner%3Awf%3Aalpha").body
+    workflow_section = doc_section(body, "workflow-doc-heading")
+
+    refute_nil workflow_section, "no workflow doc section in the page"
+    assert_includes workflow_section, "<h2 id=\"workflow-doc-heading\">About workflow wf</h2>"
+    assert_includes workflow_section, %(<p class="doc-text">Analyses tracker tasks.</p>)
+    assert_includes workflow_section, "<div><dt>Owner</dt><dd>@platform</dd></div>"
+    assert_operator body.index("entity-doc-heading"), :<, body.index("workflow-doc-heading"),
+                    "the entity's own doc must precede the workflow's"
+  end
+
+  # Both sections are independent: a documented runner in an undocumented
+  # workflow (and the reverse) must render exactly one of them.
+  def test_each_doc_section_is_omitted_when_its_half_is_absent
+    only_entity = get_on(documented_app(entity_doc: doc(description: "Picks up open tasks.")),
+                          "/entity?id=runner%3Awf%3Aalpha").body
+    only_workflow = get_on(documented_app(workflow_doc: doc(description: "Analyses tracker tasks.")),
+                            "/entity?id=runner%3Awf%3Aalpha").body
+    neither = get_on(documented_app, "/entity?id=runner%3Awf%3Aalpha").body
+
+    assert_nil doc_section(only_entity, "workflow-doc-heading")
+    refute_nil doc_section(only_entity, "entity-doc-heading")
+    assert_nil doc_section(only_workflow, "entity-doc-heading")
+    refute_nil doc_section(only_workflow, "workflow-doc-heading")
+    refute_includes neither, "doc-heading"
+  end
+
+  # A support key the operator did not set renders no row at all, never an
+  # empty one — the same contract the diagnostics rows already follow.
+  def test_support_rows_are_omitted_individually
+    app = documented_app(entity_doc: doc(support: { "owner" => "@alexander" }))
+
+    section_html = doc_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body, "entity-doc-heading")
+
+    assert_includes section_html, "<div><dt>Owner</dt><dd>@alexander</dd></div>"
+    refute_includes section_html, "Runbook"
+    refute_includes section_html, "If it breaks"
+    refute_includes section_html, "doc-text"
+  end
+
+  # Config rejects a non-http(s) runbook, but this is the line that turns
+  # operator text into an href — it must not rely on validation done elsewhere.
+  def test_a_non_http_runbook_renders_as_text_not_a_link
+    app = documented_app(entity_doc: doc(support: { "runbook" => "javascript:alert(1)" }))
+
+    section_html = doc_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body, "entity-doc-heading")
+
+    assert_includes section_html, "<div><dt>Runbook</dt><dd>javascript:alert(1)</dd></div>"
+    refute_includes section_html, "<a href=\"javascript:"
+  end
+
+  def test_operator_prose_is_escaped_everywhere_it_renders
+    payload = "<script>alert(1)</script>"
+    app = documented_app(entity_doc: doc(description: payload,
+                                          support: { "owner" => payload, "on_failure" => payload }),
+                          workflow_doc: doc(description: payload))
+
+    [get_on(app, "/").body, get_on(app, "/entity?id=runner%3Awf%3Aalpha").body].each do |body|
+      refute_includes body, payload
+      assert_includes body, "&lt;script&gt;alert(1)&lt;/script&gt;"
+    end
+  end
+
+  # The runbook href is attribute context, where a bare quote would break out
+  # of the attribute even though the URL passed the scheme check.
+  def test_a_runbook_url_is_escaped_in_the_href
+    app = documented_app(entity_doc: doc(support: { "runbook" => 'https://wiki.example.com/a"onmouseover="x' }))
+
+    section_html = doc_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body, "entity-doc-heading")
+
+    refute_includes section_html, 'onmouseover="x"'
+    assert_includes section_html, "&quot;onmouseover=&quot;x"
+  end
 end
