@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.12.0] - 2026-08-11
+
+### Added
+- `agent: null` in a runner suppresses the `--agent` flag entirely, so a runner can run on the CLI's own default agent. Omitting the key keeps the `task-analyst` default, as before. Both backends honour it — `Backend::OpenCode` reads the same key and would otherwise have died on `nil.shellescape`.
+- Optional `claude.model` key → `--model <value>` for the `claude` backend, mirroring the existing `opencode.model`. Absent means the CLI picks the model. Together with `agent: null` this is what lets a cheap, agent-less watchdog runner exist.
+
+### Changed
+- `Config` validates both new values at load and collects them with every other config problem: `agent` must be `null` or a non-empty String, and `claude.model` (when present) a non-empty String. `opencode.model` deliberately keeps its existing runtime `ArgumentError` — the asymmetry is documented, not an oversight.
+
+A config that sets neither key builds a byte-for-byte identical command; there are no breaking changes.
+
 ## [0.11.0] - 2026-08-10
 
 ### Added

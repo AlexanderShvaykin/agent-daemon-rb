@@ -344,4 +344,84 @@ class TestConfigRunners < Minitest::Test
       end
     end
   end
+
+  # `agent: null` means "run the CLI without --agent". Nothing in deep_merge
+  # says so explicitly — it survives only because a non-Hash override wins over
+  # the RUNNER_DEFAULTS value — so pin it here.
+  def test_null_agent_survives_the_merge_with_runner_defaults
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      path = write_config(dir, base_config(project_path, [tracker_runner("agent" => nil)]))
+
+      runner = AgentDaemon::Config.new(path).runners.first
+      assert runner.key?("agent")
+      assert_nil runner["agent"]
+    end
+  end
+
+  def test_rejects_unusable_agent_values
+    ["", 42].each do |agent|
+      Dir.mktmpdir do |dir|
+        project_path = with_project(dir)
+        path = write_config(dir, base_config(project_path, [tracker_runner("agent" => agent)]))
+
+        err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+        assert_includes err.message, '"default"'
+        assert_includes err.message, "agent must be a non-empty String or null"
+      end
+    end
+  end
+
+  def test_accepts_claude_model
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runner = tracker_runner("claude" => { "model" => "haiku" })
+      path = write_config(dir, base_config(project_path, [runner]))
+
+      assert_equal "haiku", AgentDaemon::Config.new(path).runners.first.dig("claude", "model")
+    end
+  end
+
+  def test_rejects_empty_claude_model
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runner = tracker_runner("claude" => { "model" => "" })
+      path = write_config(dir, base_config(project_path, [runner]))
+
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      assert_includes err.message, '"default"'
+      assert_includes err.message, "claude.model must be a non-empty String"
+    end
+  end
+
+  # Both new checks feed the shared error list rather than raising on the first
+  # problem, like every other runner check.
+  def test_collects_agent_and_claude_model_errors_together
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runner = tracker_runner("agent" => "", "claude" => { "model" => "" })
+      path = write_config(dir, base_config(project_path, [runner]))
+
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      assert_includes err.message, "agent must be a non-empty String or null"
+      assert_includes err.message, "claude.model must be a non-empty String"
+    end
+  end
+
+  # opencode.model stays a runtime check inside the backend — the asymmetry
+  # with claude.model is deliberate, and this change does not touch it.
+  def test_opencode_runner_without_a_model_loads_and_fails_at_command_build
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      path = write_config(dir, base_config(project_path, [tracker_runner("backend" => "opencode")]))
+
+      runner = AgentDaemon::Config.new(path).runners.first
+
+      flag = Object.new
+      def flag.value = false
+      backend = AgentDaemon::Backend.for(runner, flag, message_dir: "/tmp/msg", project_path: project_path)
+      err = assert_raises(ArgumentError) { backend.send(:build_command, "hello") }
+      assert_includes err.message, "opencode.model"
+    end
+  end
 end
