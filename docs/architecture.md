@@ -153,13 +153,21 @@ On timeout or shutdown, the entire process group receives `SIGTERM`, then
 
 ### Backend::Claude
 
-Builds: `cd <project_path> && claude -p <prompt> --agent <agent> --add-dir <dirs> --dangerously-skip-permissions --output-format text`
+Builds: `cd <project_path> && claude -p <prompt> [--agent <agent>] [--model <model>] --add-dir <dirs> --dangerously-skip-permissions --output-format text`
+
+`--agent` is optional: it is added only when the runner's `agent` value is a
+non-empty string. Omitting the key still yields `--agent task-analyst` (the
+`RUNNER_DEFAULTS` value); writing `agent: null` suppresses the flag entirely.
+`--model` is added only when the optional `claude.model` key is set — its value
+is validated at config load.
 
 ### Backend::OpenCode
 
-Builds: `cd <project_path> && opencode run <prompt> --agent <agent> --model <model> --dangerously-skip-permissions`
+Builds: `cd <project_path> && opencode run <prompt> [--agent <agent>] --model <model> --dangerously-skip-permissions`
 
-Requires `opencode.model` in the runner config.
+`--agent` follows the same rule as `Backend::Claude`. Requires
+`opencode.model` in the runner config; unlike `claude.model` it is checked at
+command-build time and raises `ArgumentError`, not at config load.
 
 ## Messenger
 

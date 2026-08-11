@@ -437,4 +437,59 @@ class TestBackendFactory < Minitest::Test
     assert_equal 1, cmd.scan("--add-dir").size
     assert_includes cmd, "--add-dir /tmp/msg"
   end
+
+  # --- Optional --agent, optional claude.model -----------------------------
+
+  # The exact bytes each backend produced before --agent became suppressible.
+  # Pinned literally: the guarantee "a config without the new keys builds the
+  # same command" is otherwise easy to break by a stray space or a reordered
+  # flag while every other assertion here still passes.
+  CLAUDE_BASELINE = "cd /tmp/proj && claude -p hello --agent task-analyst " \
+                    "--add-dir /tmp/msg --dangerously-skip-permissions --output-format text"
+  OPENCODE_BASELINE = "cd /tmp/proj && opencode run hello --agent task-analyst " \
+                      "--model gpt --dangerously-skip-permissions"
+
+  def test_commands_are_byte_identical_without_the_new_keys
+    assert_equal CLAUDE_BASELINE, command_for(AgentDaemon::Backend::Claude, "agent" => "task-analyst")
+    assert_equal OPENCODE_BASELINE,
+                 command_for(AgentDaemon::Backend::OpenCode,
+                             "agent" => "task-analyst", "opencode" => { "model" => "gpt" })
+  end
+
+  def test_claude_command_omits_agent_when_explicitly_null
+    refute_includes command_for(AgentDaemon::Backend::Claude, "agent" => nil), "--agent"
+  end
+
+  def test_opencode_command_omits_agent_when_explicitly_null
+    cmd = command_for(AgentDaemon::Backend::OpenCode, "agent" => nil, "opencode" => { "model" => "gpt" })
+    refute_includes cmd, "--agent"
+    assert_includes cmd, "--model gpt"
+  end
+
+  def test_commands_keep_the_default_agent_when_the_key_is_absent
+    assert_includes command_for(AgentDaemon::Backend::Claude), "--agent task-analyst"
+    assert_includes command_for(AgentDaemon::Backend::OpenCode, "opencode" => { "model" => "gpt" }),
+                    "--agent task-analyst"
+  end
+
+  def test_claude_command_adds_model_when_configured
+    assert_includes command_for(AgentDaemon::Backend::Claude, "claude" => { "model" => "haiku" }),
+                    "--model haiku"
+  end
+
+  def test_claude_command_omits_model_when_not_configured
+    refute_includes command_for(AgentDaemon::Backend::Claude), "--model"
+  end
+
+  private
+
+  def command_for(klass, runner_config = {})
+    backend = klass.new(
+      { "name" => "r", "extra_flags" => "" }.merge(runner_config),
+      @shutdown,
+      message_dir: "/tmp/msg",
+      project_path: "/tmp/proj"
+    )
+    backend.send(:build_command, "hello")
+  end
 end

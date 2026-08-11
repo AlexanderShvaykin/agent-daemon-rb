@@ -306,6 +306,15 @@ module AgentDaemon
         errors << "runner #{label.inspect}: backend must be one of #{VALID_BACKENDS.join(', ')} (got #{runner['backend'].inspect})"
       end
 
+      # `agent` is present in every merged runner (RUNNER_DEFAULTS supplies it),
+      # so the rule is about the value, not the key: nil means "pass no --agent
+      # flag" and is legal, anything else must work as the flag's argument.
+      agent = runner["agent"]
+      unless agent.nil? || (agent.is_a?(String) && !agent.empty?)
+        errors << "runner #{label.inspect}: agent must be a non-empty String or null (got #{agent.inspect})"
+      end
+
+      errors.concat(validate_claude(label, runner["claude"]))
       errors.concat(validate_trigger(label, runner["trigger"]))
       errors.concat(validate_documentation(runner["description"], runner["support"],
                                            prefix: "runner #{label.inspect}: "))
@@ -355,6 +364,23 @@ module AgentDaemon
       ["#{prefix}support.runbook must be an http(s) URL (got #{runbook.inspect})"]
     rescue URI::InvalidURIError
       ["#{prefix}support.runbook must be an http(s) URL (got #{runbook.inspect})"]
+    end
+
+    # The claude backend's optional per-backend block, mirroring `opencode:`.
+    # Only `model` lives here; an absent block leaves the model choice to the
+    # CLI. Unlike opencode.model this is checked at load, because it is
+    # optional and a bad value is cheap to catch here.
+    def validate_claude(runner_label, claude)
+      return [] if claude.nil?
+
+      unless claude.is_a?(Hash)
+        return ["runner #{runner_label.inspect}: claude must be a Hash (got #{claude.inspect})"]
+      end
+
+      model = claude["model"]
+      return [] if model.nil? || (model.is_a?(String) && !model.empty?)
+
+      ["runner #{runner_label.inspect}: claude.model must be a non-empty String (got #{model.inspect})"]
     end
 
     def validate_trigger(runner_label, trigger)

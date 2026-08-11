@@ -55,6 +55,9 @@ runners:
   - name: triage
     backend: claude            # "claude" (default) or "opencode"
     agent: task-analyst        # --agent flag passed to the CLI
+    # agent: null              # pass no --agent at all (both backends)
+    # claude:                  # optional, "claude" backend only
+    #   model: haiku           # --model flag; omit to let the CLI choose
     # Same optional, human-only pair as at the top of this file, scoped to this
     # one runner. Shown in the console next to this runner's name; note that
     # every runner key is also a prompt variable, so `{{description}}` works in
