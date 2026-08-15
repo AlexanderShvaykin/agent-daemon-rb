@@ -95,7 +95,7 @@ class TestStateRegistry < Minitest::Test
 
   def test_all_statuses_round_trip_across_entity_id_shapes
     identity = AgentDaemon::Supervisor::RunnerIdentity.new(workflow: "wf", runner: "r")
-    statuses = %i[waiting in_progress stopped running crashed exited]
+    statuses = %i[waiting in_progress stopped running crashed restart_requested exited]
 
     [identity, "messenger:wf", "mattermost_reactor"].each do |entity_id|
       statuses.each do |status|

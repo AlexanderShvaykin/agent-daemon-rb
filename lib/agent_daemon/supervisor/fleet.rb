@@ -72,14 +72,10 @@ module AgentDaemon
         in_progress: :alive, # Runner::Base, mid-item
         running: :alive, # Messenger#run, Mattermost::Reactor#run
         crashed: :restarting, # supervisor-published; auto-restart pending
-        # supervisor-published clean terminal exit — NOT auto-restarted
-        # (FR3). Correct as `:dead` for Epic 2 only: Epic 1's sole
-        # restart-intent producer (:crash_auto) fires on an already-dead
-        # thread, so the respawn-intent path (tick_stopping) never publishes
-        # :exited today. Epic 4 adds the first producer that queues a
-        # restart intent against a LIVE entity and must publish a distinct
-        # status when it does, or a runner mid-restart will render `dead`
-        # the instant an operator presses Restart (epics.md:499-502).
+        restart_requested: :restarting, # accepted intent; cooperative stop pending
+        # A clean terminal exit remains `:dead`; an accepted restart publishes
+        # the distinct `:restart_requested` status above, so it never renders
+        # as dead while turnover is pending (epics.md:218).
         exited: :dead,
         stopped: :dead # graceful fleet shutdown
       }.freeze

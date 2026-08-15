@@ -79,6 +79,7 @@ class TestFleet < Minitest::Test
       in_progress: :alive,
       running: :alive,
       crashed: :restarting,
+      restart_requested: :restarting,
       exited: :dead,
       stopped: :dead
     }
