@@ -340,7 +340,7 @@ module AgentDaemon
         config = workflow[:config]
         key = :"messenger:#{workflow[:name]}"
         entity_id = "messenger:#{workflow[:name]}"
-        @entity_factories[key] = ->(bundle) { Messenger.new(config, @shutdown_flag, sinks: bundle) }
+        @entity_factories[key] = ->(bundle, _cancel_token = nil) { Messenger.new(config, @shutdown_flag, sinks: bundle) }
         @entity_ids[key] = entity_id
         @log_levels[key] = resolve_log_level(config.logging["level"])
         @roster << Fleet::Rostered.new(kind: :messenger, workflow: workflow[:name], name: "messenger", entity_id: entity_id)
@@ -364,8 +364,8 @@ module AgentDaemon
       end
 
       # Mirrors Daemon#runner_factory_for's type dispatch exactly, but as a
-      # 1-arg callable receiving the per-generation Sinks::Bundle a
-      # RunnerSupervisor builds on each (re)spawn (Story 1.5). Kept
+      # callable receiving the per-generation Sinks::Bundle and optional
+      # cancel token a RunnerSupervisor builds on each (re)spawn. Kept
       # duplicated rather than shared with Daemon (see Dev Notes design
       # decision 4).
       def runner_factory_for(config, runner_config)
@@ -376,11 +376,11 @@ module AgentDaemon
 
         case type
         when "tracker"
-          ->(bundle) { Runner::Tracker.new(runner_config, message_dir, project_path, @shutdown_flag, tracker_config, sinks: bundle) }
+          ->(bundle, cancel_token = nil) { Runner::Tracker.new(runner_config, message_dir, project_path, @shutdown_flag, tracker_config, sinks: bundle, cancel_flag: cancel_token) }
         when "file"
-          ->(bundle) { Runner::File.new(runner_config, message_dir, project_path, @shutdown_flag, sinks: bundle) }
+          ->(bundle, cancel_token = nil) { Runner::File.new(runner_config, message_dir, project_path, @shutdown_flag, sinks: bundle, cancel_flag: cancel_token) }
         when "mattermost"
-          ->(bundle) { Runner::Mattermost.new(runner_config, message_dir, project_path, @shutdown_flag, sinks: bundle) }
+          ->(bundle, cancel_token = nil) { Runner::Mattermost.new(runner_config, message_dir, project_path, @shutdown_flag, sinks: bundle, cancel_flag: cancel_token) }
         else
           raise ArgumentError, "Unknown trigger type #{type.inspect} in runner #{runner_config['name'].inspect}"
         end
@@ -398,7 +398,7 @@ module AgentDaemon
         end
         return if mattermost_runners.empty?
 
-        @entity_factories[:mattermost_reactor] = lambda do |bundle|
+        @entity_factories[:mattermost_reactor] = lambda do |bundle, _cancel_token = nil|
           listeners = mattermost_runners.map do |runner_config|
             Mattermost::Listener.new(runner_config.fetch("trigger"), @shutdown_flag)
           end

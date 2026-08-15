@@ -63,7 +63,7 @@ module AgentDaemon
 
       attr_reader :state, :generation, :thread, :entity, :cancel_token
 
-      # entity_factory: 1-arg callable (bundle) -> object responding to #run.
+      # entity_factory: callable (bundle, optional cancel token) -> object responding to #run.
       # sinks_factory: 1-arg callable (generation) -> Sinks::Bundle; defaults
       # to a gen-stamped Bundle over Null sinks (output stays plain Null —
       # there is no output record shape to stamp, AD-14 is Epic 3's call).
@@ -141,7 +141,7 @@ module AgentDaemon
         generation = @generation + 1
         bundle = @sinks_factory.call(generation)
         cancel_token = CancelToken.new
-        entity = @entity_factory.call(bundle)
+        entity = @entity_factory.call(bundle, cancel_token)
         key = thread_key
 
         @generation = generation
@@ -167,8 +167,11 @@ module AgentDaemon
         Log.error("[#{thread_key}] Spawn failed: #{e.message}\n#{e.backtrace&.first(10)&.join("\n")}")
         # A failed replacement owns no generation, so it owns no token either.
         # Dropping the reference matters because the PREVIOUS generation's
-        # token is very likely already activated, and Story 4.2's pre-spawn
-        # cancel check would read that stale `true` and refuse to respawn.
+        # token is very likely already activated, and `cancel_token` is a
+        # public accessor: leaving a stale activated token on a supervisor
+        # that owns no live entity reads as "a stop is pending" to anything
+        # that inspects it. Story 4.2's cooperative-stop checkpoint lives in
+        # `Runner::Base#iterate`, not here — `spawn!` never reads the token.
         @cancel_token = nil
         @restart_at = monotonic_now + @restart_delay
         Log.warn("#{log_prefix} entering :restarting (restart deadline in #{@restart_delay}s)")
@@ -221,13 +224,18 @@ module AgentDaemon
         return handle_thread_death if @thread[:crashed]
 
         Log.info("#{log_prefix} exited cleanly")
-        # Re-assert the turnover status. The entity's OWN last publish on this
-        # generation is a terminal one (`Runner::Base#run` ends on
-        # `status: :stopped`, and Messenger/Reactor do the same), StateRegistry
-        # accepts equal generations last-write-wins, and the supervisor writes
-        # after the thread is confirmed dead — so without this line the console
-        # would render `dead` for the whole restart delay, which is exactly the
-        # CP-1 failure this story exists to prevent (epics.md:218).
+        # Re-assert the turnover status. StateRegistry accepts equal
+        # generations last-write-wins and the supervisor writes after the
+        # thread is confirmed dead, so without this line the console would
+        # render `dead` for the whole restart delay — exactly the CP-1 failure
+        # this story exists to prevent (epics.md:218).
+        #
+        # Since Story 4.2 a cancelled `Runner::Base#run` suppresses its own
+        # terminal `:stopped` (`runner/base.rb#cancelling?`), so on the local
+        # restart path there is usually nothing to overwrite. This line is
+        # still load-bearing for the paths that DO publish a terminal status:
+        # Messenger and the Reactor, which observe no token, and any entity
+        # whose stop coincided with a fleet drain (shutdown wins the gate).
         #
         # This is NOT the per-tick republish Task 2 bans: it fires once, on the
         # :stopping -> :restarting transition, and it re-arms

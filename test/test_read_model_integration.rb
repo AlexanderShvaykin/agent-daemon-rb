@@ -173,7 +173,7 @@ class TestReadModelIntegration < Minitest::Test
 
     supervisor = AgentDaemon::Supervisor::RunnerSupervisor.new(
       entity_id,
-      entity_factory: ->(bundle) { ReadModelCrashingEntity.new(bundle) },
+      entity_factory: ->(bundle, _cancel_token = nil) { ReadModelCrashingEntity.new(bundle) },
       shutdown_flag: AgentDaemon::ShutdownFlag.new,
       sinks_factory: sinks_factory
     )
@@ -222,7 +222,7 @@ class TestReadModelIntegration < Minitest::Test
       master = AgentDaemon::Supervisor::Master.new(config)
       master.send(:build_factories)
       master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] =
-        ->(bundle) { ReadModelPublishingCrashFake.new(bundle) }
+        ->(bundle, _cancel_token = nil) { ReadModelPublishingCrashFake.new(bundle) }
 
       master.send(:build_supervisors)
       supervisor = master.instance_variable_get(:@supervisors).fetch(:"runner:wf:a")
@@ -301,7 +301,7 @@ class TestReadModelIntegration < Minitest::Test
     end
     crashing_supervisor = AgentDaemon::Supervisor::RunnerSupervisor.new(
       "ent-1",
-      entity_factory: ->(_bundle) { Class.new { def run = raise("boom") }.new },
+      entity_factory: ->(_bundle, _cancel_token = nil) { Class.new { def run = raise("boom") }.new },
       shutdown_flag: AgentDaemon::ShutdownFlag.new,
       sinks_factory: crashing_sinks_factory
     )
@@ -314,7 +314,7 @@ class TestReadModelIntegration < Minitest::Test
     end
     healthy_supervisor = AgentDaemon::Supervisor::RunnerSupervisor.new(
       "ent-2",
-      entity_factory: ->(_bundle) { Class.new { def run = nil }.new },
+      entity_factory: ->(_bundle, _cancel_token = nil) { Class.new { def run = nil }.new },
       shutdown_flag: AgentDaemon::ShutdownFlag.new,
       sinks_factory: healthy_sinks_factory
     )

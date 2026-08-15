@@ -110,9 +110,8 @@ class TestSupervisorMaster < Minitest::Test
   end
 
   # --- Factory products --------------------------------------------------
-  # Factories are now 1-arg (Story 1.5: they receive the per-generation
-  # Sinks::Bundle a RunnerSupervisor builds), so each call site here passes
-  # one explicitly instead of relying on a captured null bundle.
+  # Factories receive the per-generation Sinks::Bundle and an optional
+  # generation cancel token. One-arg calls remain the compatibility proof.
 
   def test_factory_products_per_trigger_type
     with_config(
@@ -127,6 +126,11 @@ class TestSupervisorMaster < Minitest::Test
 
       instance = factories.fetch(:"runner:wf:t").call(AgentDaemon::Sinks::Bundle.null(identity))
       assert_instance_of AgentDaemon::Runner::Tracker, instance
+
+      token = AgentDaemon::Supervisor::CancelToken.new
+      token_instance = factories.fetch(:"runner:wf:t").call(AgentDaemon::Sinks::Bundle.null(identity), token)
+      assert_same token, token_instance.instance_variable_get(:@cancel_flag)
+      assert_same token, token_instance.instance_variable_get(:@backend).instance_variable_get(:@cancel_flag)
 
       sink_entity_id = instance.instance_variable_get(:@sinks).instance_variable_get(:@entity_id)
       assert_instance_of AgentDaemon::Supervisor::RunnerIdentity, sink_entity_id
@@ -147,6 +151,11 @@ class TestSupervisorMaster < Minitest::Test
 
       instance = factories.fetch(:"runner:wf:f").call(AgentDaemon::Sinks::Bundle.null)
       assert_instance_of AgentDaemon::Runner::File, instance
+
+      token = AgentDaemon::Supervisor::CancelToken.new
+      token_instance = factories.fetch(:"runner:wf:f").call(AgentDaemon::Sinks::Bundle.null, token)
+      assert_same token, token_instance.instance_variable_get(:@cancel_flag)
+      assert_same token, token_instance.instance_variable_get(:@backend).instance_variable_get(:@cancel_flag)
     end
   end
 
@@ -162,6 +171,11 @@ class TestSupervisorMaster < Minitest::Test
 
       instance = factories.fetch(:"runner:wf:m").call(AgentDaemon::Sinks::Bundle.null)
       assert_instance_of AgentDaemon::Runner::Mattermost, instance
+
+      token = AgentDaemon::Supervisor::CancelToken.new
+      token_instance = factories.fetch(:"runner:wf:m").call(AgentDaemon::Sinks::Bundle.null, token)
+      assert_same token, token_instance.instance_variable_get(:@cancel_flag)
+      assert_same token, token_instance.instance_variable_get(:@backend).instance_variable_get(:@cancel_flag)
     end
   end
 
@@ -183,6 +197,11 @@ class TestSupervisorMaster < Minitest::Test
       assert_instance_of AgentDaemon::Mattermost::Reactor, reactor
       listeners = reactor.instance_variable_get(:@listeners)
       assert_equal 2, listeners.size
+      assert_instance_of AgentDaemon::Mattermost::Reactor,
+                         factories.fetch(:mattermost_reactor).call(
+                           AgentDaemon::Sinks::Bundle.null("mattermost_reactor"),
+                           AgentDaemon::Supervisor::CancelToken.new
+                         )
     end
   end
 
@@ -215,6 +234,11 @@ class TestSupervisorMaster < Minitest::Test
 
       assert factories.key?(:"messenger:wfA")
       refute factories.key?(:"messenger:wfB")
+      assert_instance_of AgentDaemon::Messenger,
+                         factories.fetch(:"messenger:wfA").call(
+                           AgentDaemon::Sinks::Bundle.null("messenger:wfA"),
+                           AgentDaemon::Supervisor::CancelToken.new
+                         )
     end
   end
 
@@ -257,7 +281,7 @@ class TestSupervisorMaster < Minitest::Test
       master = AgentDaemon::Supervisor::Master.new(config)
       master.send(:build_factories)
       raising = Class.new { def run = raise("boom") }.new
-      master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] = ->(_bundle) { raising }
+      master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] = ->(_bundle, _cancel_token = nil) { raising }
 
       # Drive the real production path (build_supervisors/start_supervisors ->
       # RunnerSupervisor#spawn! -> factory.call(bundle).run), not a
@@ -306,9 +330,9 @@ class TestSupervisorMaster < Minitest::Test
       master = AgentDaemon::Supervisor::Master.new(config)
       master.send(:build_factories)
       master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] =
-        ->(_bundle) { Class.new { def run = raise("boom") }.new }
+        ->(_bundle, _cancel_token = nil) { Class.new { def run = raise("boom") }.new }
       master.instance_variable_get(:@entity_factories)[:"runner:wf:b"] =
-        ->(_bundle) { Class.new { def run = nil }.new }
+        ->(_bundle, _cancel_token = nil) { Class.new { def run = nil }.new }
 
       master.send(:build_supervisors)
       supervisors = master.instance_variable_get(:@supervisors)
@@ -932,7 +956,7 @@ class TestSupervisorMaster < Minitest::Test
   # serves the no-supervisor path, and only the Master has one to inject.
   def test_the_runner_supervisor_default_output_sink_stays_null
     bundle = AgentDaemon::Supervisor::RunnerSupervisor
-             .new("ent", entity_factory: ->(_b) {}, shutdown_flag: AgentDaemon::ShutdownFlag.new)
+             .new("ent", entity_factory: ->(_b, _cancel_token = nil) {}, shutdown_flag: AgentDaemon::ShutdownFlag.new)
              .send(:default_sinks_factory, 1)
 
     assert_instance_of AgentDaemon::Sinks::NullOutput, bundle.instance_variable_get(:@output)

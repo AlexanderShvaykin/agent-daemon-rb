@@ -36,9 +36,18 @@ class TestMessenger < Minitest::Test
     @tmpdir = Dir.mktmpdir
     @message_dir = File.join(@tmpdir, "to_message")
     FileUtils.mkdir_p(@message_dir)
+
+    # These tests exercise Messenger#run, which logs a line per delivery.
+    # AgentDaemon::Log's logger is a process-wide singleton, so silence it for
+    # the duration of this file and hand back whatever was installed before.
+    @prior_logger = AgentDaemon::Log.instance_variable_get(:@logger)
+    null_logger = ::Logger.new(File::NULL)
+    null_logger.level = ::Logger::FATAL
+    AgentDaemon::Log.instance_variable_set(:@logger, null_logger)
   end
 
   def teardown
+    AgentDaemon::Log.instance_variable_set(:@logger, @prior_logger)
     FileUtils.remove_entry(@tmpdir)
   end
 
