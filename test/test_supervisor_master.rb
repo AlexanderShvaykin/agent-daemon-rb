@@ -197,11 +197,44 @@ class TestSupervisorMaster < Minitest::Test
       assert_instance_of AgentDaemon::Mattermost::Reactor, reactor
       listeners = reactor.instance_variable_get(:@listeners)
       assert_equal 2, listeners.size
-      assert_instance_of AgentDaemon::Mattermost::Reactor,
-                         factories.fetch(:mattermost_reactor).call(
-                           AgentDaemon::Sinks::Bundle.null("mattermost_reactor"),
-                           AgentDaemon::Supervisor::CancelToken.new
-                         )
+      token = AgentDaemon::Supervisor::CancelToken.new
+      token_instance = factories.fetch(:mattermost_reactor).call(
+        AgentDaemon::Sinks::Bundle.null("mattermost_reactor"), token
+      )
+      assert_instance_of AgentDaemon::Mattermost::Reactor, token_instance
+      assert_same token, token_instance.instance_variable_get(:@cancel_flag)
+    end
+  end
+
+  # AC16's second half — "no listener threads are spawned outside its
+  # ownership" — is a property of the *real* factory, and the story's pin for
+  # it drives a RunnerSupervisorStoppableFake under the id string
+  # "mattermost_reactor", so build_reactor_factory is never invoked there.
+  # Restart turnover calls this lambda once per generation: each call must mint
+  # its own listeners, or a replacement reactor would adopt objects the
+  # superseded generation still owns.
+  def test_each_reactor_generation_owns_freshly_built_listeners
+    with_config(
+      [
+        { name: "wfA", runners: [mattermost_runner("m1")] },
+        { name: "wfB", runners: [mattermost_runner("m2")] }
+      ]
+    ) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      factory = master.instance_variable_get(:@entity_factories).fetch(:mattermost_reactor)
+
+      generations = 2.times.map do
+        factory.call(AgentDaemon::Sinks::Bundle.null("mattermost_reactor"),
+                     AgentDaemon::Supervisor::CancelToken.new)
+      end
+      first, second = generations.map { |r| r.instance_variable_get(:@listeners) }
+
+      refute_same generations[0], generations[1]
+      assert_equal 2, first.size
+      assert_equal 2, second.size
+      assert_empty first.map(&:object_id) & second.map(&:object_id),
+                   "a replacement reactor generation must not adopt the superseded generation's listeners"
     end
   end
 
@@ -234,11 +267,12 @@ class TestSupervisorMaster < Minitest::Test
 
       assert factories.key?(:"messenger:wfA")
       refute factories.key?(:"messenger:wfB")
-      assert_instance_of AgentDaemon::Messenger,
-                         factories.fetch(:"messenger:wfA").call(
-                           AgentDaemon::Sinks::Bundle.null("messenger:wfA"),
-                           AgentDaemon::Supervisor::CancelToken.new
-                         )
+      token = AgentDaemon::Supervisor::CancelToken.new
+      token_instance = factories.fetch(:"messenger:wfA").call(
+        AgentDaemon::Sinks::Bundle.null("messenger:wfA"), token
+      )
+      assert_instance_of AgentDaemon::Messenger, token_instance
+      assert_same token, token_instance.instance_variable_get(:@cancel_flag)
     end
   end
 
@@ -494,8 +528,9 @@ class TestSupervisorMaster < Minitest::Test
   end
 
   def spy_factory(spies, **kwargs)
-    lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry, _output_buffers|
+    lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry, _output_buffers, restart_control: nil|
       spies << ConsoleSpy.new(console_config, **kwargs)
+      spies.last.instance_variable_set(:@restart_control, restart_control)
       spies.last
     end
   end
@@ -622,7 +657,8 @@ class TestSupervisorMaster < Minitest::Test
   # A factory that blows up before returning an object is the misconfiguration
   # case (bad base_url, unusable auth block) — same rule applies.
   def test_a_console_factory_that_raises_does_not_stop_the_fleet
-    exploding = lambda do |_console_config, _fleet, _activity_log, _event_bus, _state_registry, _output_buffers|
+    exploding = lambda do |_console_config, _fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
+                          restart_control: nil|
       raise "factory boom"
     end
     with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
@@ -689,7 +725,8 @@ class TestSupervisorMaster < Minitest::Test
 
   def test_console_factory_receives_a_fleet_whose_roster_covers_runners_messenger_and_reactor_in_order
     received_fleet = nil
-    factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers|
+    factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
+                        restart_control: nil|
       received_fleet = fleet
       ConsoleSpy.new(console_config)
     end
@@ -709,6 +746,7 @@ class TestSupervisorMaster < Minitest::Test
       entries = received_fleet.entries
       assert_equal %i[runner runner messenger reactor], entries.map(&:kind)
       assert_equal %w[a m messenger mattermost_reactor], entries.map(&:name)
+      assert_equal ["tracker", "mattermost", nil, nil], entries.map(&:trigger_type)
     end
   end
 
@@ -717,7 +755,8 @@ class TestSupervisorMaster < Minitest::Test
   # green suite, the same failure mode the restart_delay wiring test guards.
   def test_console_factory_receives_a_fleet_carrying_config_authored_descriptions
     received_fleet = nil
-    factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers|
+    factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
+                        restart_control: nil|
       received_fleet = fleet
       ConsoleSpy.new(console_config)
     end
@@ -754,7 +793,8 @@ class TestSupervisorMaster < Minitest::Test
   # all — the console renders a Doc iff it exists.
   def test_a_workflow_without_descriptions_has_no_doc
     received_fleet = nil
-    factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers|
+    factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
+                        restart_control: nil|
       received_fleet = fleet
       ConsoleSpy.new(console_config)
     end
@@ -776,7 +816,8 @@ class TestSupervisorMaster < Minitest::Test
   # it back through the activity_log the factory received.
   def test_console_factory_receives_an_activity_log_reading_the_masters_own_event_bus
     received_activity_log = nil
-    factory = lambda do |console_config, _fleet, activity_log, _event_bus, _state_registry, _output_buffers|
+    factory = lambda do |console_config, _fleet, activity_log, _event_bus, _state_registry, _output_buffers,
+                        restart_control: nil|
       received_activity_log = activity_log
       ConsoleSpy.new(console_config)
     end
@@ -796,7 +837,8 @@ class TestSupervisorMaster < Minitest::Test
 
   def test_console_factory_receives_the_masters_exact_event_bus_and_state_registry
     received = nil
-    factory = lambda do |console_config, _fleet, _activity_log, event_bus, state_registry, _output_buffers|
+    factory = lambda do |console_config, _fleet, _activity_log, event_bus, state_registry, _output_buffers,
+                        restart_control: nil|
       received = [event_bus, state_registry]
       ConsoleSpy.new(console_config)
     end
@@ -816,7 +858,8 @@ class TestSupervisorMaster < Minitest::Test
   # make snapshot(entry.entity_id) return :empty forever, silently.
   def test_console_factory_receives_the_masters_exact_output_buffers
     received = nil
-    factory = lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry, output_buffers|
+    factory = lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry, output_buffers,
+                        restart_control: nil|
       received = output_buffers
       ConsoleSpy.new(console_config)
     end
@@ -826,6 +869,64 @@ class TestSupervisorMaster < Minitest::Test
       master.send(:start_console)
 
       assert_same master.output_buffers, received
+    end
+  end
+
+  def test_console_factory_receives_a_restart_control_for_the_supervised_roster
+    received = nil
+    factory = lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
+                        restart_control: nil|
+      received = restart_control
+      ConsoleSpy.new(console_config)
+    end
+
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: factory)
+      master.send(:build_factories)
+      master.send(:build_supervisors)
+      master.send(:start_console)
+
+      assert_instance_of AgentDaemon::Supervisor::RestartControl, received
+      assert_equal 1, received.request_restart("runner:wf:a", actor: "console:alice")
+    end
+  end
+
+  # The console looks an id up in two maps built at different points:
+  # Fleet keys rows off Rostered#entity_id, RestartControl off
+  # RunnerIdentity.key_for(@entity_ids). Proving the runner id resolves proves
+  # only the case where both happen to be a RunnerIdentity. AC14 (a Messenger
+  # restart is scoped to its own workflow) and AC15/AC16 (the global reactor)
+  # both ride on the String-keyed half, which nothing exercised.
+  def test_the_restart_control_resolves_every_console_id_the_fleet_can_render
+    received = nil
+    factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
+                        restart_control: nil|
+      received = [restart_control, fleet]
+      ConsoleSpy.new(console_config)
+    end
+
+    with_config(
+      [{
+        name: "wf",
+        runners: [tracker_runner("a"), mattermost_runner("m")],
+        messenger: { "webhook_url" => "https://example.com/h" }
+      }],
+      console: CONSOLE_BLOCK
+    ) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, console_factory: factory)
+      master.send(:build_factories)
+      master.send(:build_supervisors)
+      master.send(:start_console)
+
+      control, fleet = received
+      ids = fleet.entries.map(&:id)
+
+      assert_includes ids, "messenger:wf"
+      assert_includes ids, "mattermost_reactor"
+      ids.each do |id|
+        assert_equal 1, control.request_restart(id, actor: "console:alice"),
+                     "the console can render #{id} but the restart control cannot resolve it"
+      end
     end
   end
 
@@ -866,6 +967,8 @@ class TestSupervisorMaster < Minitest::Test
 
       assert_equal AgentDaemon::Supervisor::RunnerSupervisor::RESTART_DELAY,
                    fleet.instance_variable_get(:@restart_delay)
+      assert_equal config.restart_warning_margin_seconds,
+                   fleet.instance_variable_get(:@restart_warning_margin)
     end
   end
 

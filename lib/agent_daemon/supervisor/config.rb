@@ -8,6 +8,7 @@ require "uri"
 require_relative "../config"
 require_relative "runner_identity"
 require_relative "event_bus"
+require_relative "fleet"
 
 module AgentDaemon
   module Supervisor
@@ -37,6 +38,11 @@ module AgentDaemon
         # not a console is configured (Epic 5's history writer and Epic 6's
         # counters both subscribe to the same pipeline).
         "output_buffer_bytes" => 262_144,
+        # Extra time beyond RunnerSupervisor::RESTART_DELAY before the read
+        # model labels a restart as delayed. Shares Fleet's constant so a
+        # Fleet built without a config cannot disagree with one built by
+        # Master.
+        "restart_warning_margin_seconds" => Fleet::RESTART_STUCK_MARGIN,
         # Optional web console (AD-6). nil ⇒ disabled and never validated, so a
         # supervisor config written before the console existed keeps loading
         # unchanged (Story 2.2 AC8).
@@ -74,8 +80,10 @@ module AgentDaemon
       # memory ceiling (capacity_bytes × rostered entities, NFR7) an operator
       # can reach with a single typo.
       OUTPUT_BUFFER_BYTES_RANGE = (16_384..4_194_304).freeze
+      RESTART_WARNING_MARGIN_RANGE = (1..300).freeze
 
-      attr_reader :config_path, :config_dir, :workflows, :event_bus_capacity, :output_buffer_bytes, :console
+      attr_reader :config_path, :config_dir, :workflows, :event_bus_capacity, :output_buffer_bytes,
+                  :restart_warning_margin_seconds, :console
 
       def initialize(path)
         @config_path = File.expand_path(path)
@@ -86,6 +94,7 @@ module AgentDaemon
         @workflows = build_workflows(@data["workflows"])
         @event_bus_capacity = @data["event_bus_capacity"]
         @output_buffer_bytes = @data["output_buffer_bytes"]
+        @restart_warning_margin_seconds = @data["restart_warning_margin_seconds"]
         @console = build_console(@data["console"])
         validate!
       end
@@ -226,6 +235,12 @@ module AgentDaemon
         unless positive_integer?(@output_buffer_bytes) && OUTPUT_BUFFER_BYTES_RANGE.cover?(@output_buffer_bytes)
           errors << "output_buffer_bytes must be an integer in #{OUTPUT_BUFFER_BYTES_RANGE} " \
                      "(got #{@output_buffer_bytes.inspect}) in #{@config_path}"
+        end
+
+        unless positive_integer?(@restart_warning_margin_seconds) &&
+               RESTART_WARNING_MARGIN_RANGE.cover?(@restart_warning_margin_seconds)
+          errors << "restart_warning_margin_seconds must be an integer in #{RESTART_WARNING_MARGIN_RANGE} " \
+                    "(got #{@restart_warning_margin_seconds.inspect}) in #{@config_path}"
         end
 
         errors.concat(validate_console)

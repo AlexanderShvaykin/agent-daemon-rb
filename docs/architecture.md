@@ -330,9 +330,10 @@ subsystem layered *on top of* the core described above — the core itself does
 not know it exists (see "Dependency isolation" below). The full invariant set
 this subsystem is built against (AD-1…AD-16) is captured in the project's
 internal architecture spine — a planning artifact kept outside this repository,
-not a shipped document; this section describes the shape actually implemented in Epic 1
-— the in-memory live console shipped in Epic 2; SQLite history and the metrics
-exporter remain assigned to Epics 5 and 6.
+not a shipped document; this section describes the shape implemented through
+Epic 4 — including the in-memory live console and authenticated restart
+control. SQLite history and the metrics exporter remain assigned to Epics 5
+and 6.
 
 ### Layout
 
@@ -343,12 +344,13 @@ One file per concern under `lib/agent_daemon/supervisor/`:
 | `config.rb`              | Loads a supervisor config that enumerates per-workflow configs |
 | `master.rb`              | Boots and drives every workflow's threads in one process     |
 | `runner_supervisor.rb`   | Per-entity crash/restart state machine (generation tracking) |
+| `restart_control.rb`     | Console-facing id-to-supervisor restart command boundary     |
 | `runner_identity.rb`     | Composite `(workflow, runner)` identity value object          |
 | `state_registry.rb`      | Generation-CAS current state plus accepted-write revision     |
 | `event_bus.rb`           | Bounded event ring with independent pull cursors               |
 | `fleet.rb`               | Config roster left-joined with current registry state          |
 | `activity_log.rb`        | Per-entity recent events projected from the bounded bus         |
-| `console/`               | Rack/Puma UI, GitLab OAuth sessions and authenticated SSE       |
+| `console/`               | Rack/Puma UI, GitLab OAuth, authenticated SSE and restart controls |
 
 ### Supervisor config
 
@@ -361,6 +363,9 @@ workflow names, a workflow or runner name containing the `:` identity
 delimiter, a referenced config that fails to load, and two workflows whose
 `message_dir`/`output_dir`/trigger work-dirs collide (a shared `project_path`
 alone is not a collision). See `examples/supervisor.yml`.
+`restart_warning_margin_seconds` is a supervisor-level integer (default 5,
+range 1..300) added to the fixed restart delay only when the read model decides
+whether to display a delayed-restart warning; it does not change scheduling.
 
 ### Master: one process, many workflows
 
@@ -377,6 +382,9 @@ Each entity is wrapped in a `RunnerSupervisor` (below); `Master#start` drives
 all of them through a single non-blocking ~1s tick loop
 (`supervise_until_shutdown`) instead of a blocking idle sleep, so one entity's
 restart delay never stalls another's supervision.
+Entity factories receive `(bundle, cancel_token)`. After building the exact
+supervisor roster, the master exposes an immutable console-id map only through
+`RestartControl`; the console never owns or reads entity threads.
 
 **Shutdown** is centralized: `SIGINT`/`SIGTERM` set one shared `ShutdownFlag`
 (same primitive as the standalone daemon), which stops the tick loop and joins
@@ -389,23 +397,34 @@ the in-flight agent process group of any thread still alive after its join
 timeout (never `Thread#kill` — the thread itself is abandoned to process exit;
 only its owned OS process group is killed).
 
-### Per-entity supervisor: crash auto-restart and generation
+### Per-entity supervisor: restart lifecycle, cancellation, and generation
 
 `RunnerSupervisor` is a small state machine (`:running → :stopping →
 :restarting → :running…` or terminal `:exited`) supervising a single entity's
 full lifecycle — this covers all three entity kinds (runner, messenger,
-reactor), not just runners. `#tick` is its only driver, called ~1/s by the
-master; it never sleeps, so a pending restart is a recorded monotonic
-deadline, not a blocking wait.
+reactor), not just runners. `#tick` is its only state-transition driver, called
+~1/s by the master; it never sleeps, so a pending restart is a recorded
+monotonic deadline, not a blocking wait. `#request_restart(actor)` is the
+thread-safe ingress: callers enqueue intents from any thread, while only the
+master's tick drains them and mutates lifecycle state. Concurrent requests
+coalesce into one replacement generation, retaining the deduplicated actor set
+and earliest millisecond request time for the structured restart event.
 
 A crash (an uncaught exception on the entity's own thread) schedules an
-automatic respawn after `RESTART_DELAY` (60s); a clean exit does not
-auto-restart (manual restart is Epic 4's concern) and becomes terminal.
+automatic respawn after `RESTART_DELAY` (60s); a clean exit becomes terminal
+unless a manual intent is queued. Each spawn also mints a fresh `CancelToken`.
+When a live entity accepts a restart, the supervisor activates that token
+before publishing `restart_requested`, then waits for cooperative exit before
+the delayed respawn. Runners pass it through their backend process loop;
+Messengers and the shared Mattermost reactor observe it in their own loops.
+Shutdown wins every restart gate: no new turnover or replacement starts after
+the shared shutdown flag is set.
+
 Every (re)spawn increments a monotonic **generation** counter starting at 1,
-and builds a fresh sink bundle for that generation — a superseded (old-gen)
-entity's late publish still carries its own, now-stale generation, so a
-downstream consumer (Epic 2's read model) can always tell which instance a
-record came from.
+and builds a fresh sink bundle and cancellation token for that generation — a
+superseded (old-gen) entity's late publish still carries its own, now-stale
+generation, so a downstream consumer (Epic 2's read model) can always tell
+which instance a record came from.
 
 ### Publish seam (why the core needs no supervisor require)
 
@@ -451,6 +470,29 @@ session. GitLab tokens remain in private session records; HTML receives only an
 immutable username/CSRF view. Group membership is rechecked fail-closed at most
 once per session per 60 seconds, with concurrent streams coalesced onto one
 lookup and no store mutex held during network I/O.
+
+Authenticated **entity detail** pages expose native restart controls; the fleet
+list keeps a disabled affordance on purpose, so one page never carries a form
+and a CSRF token per card for an action whose diagnostics live elsewhere. The
+default-deny, CSRF-protected `POST /restart` reads mutation parameters from the
+form body only, derives the actor from the server-side session username, and
+delegates through the master's immutable `RestartControl` id-to-supervisor map.
+Unknown ids use the fixed non-disclosing 404, a missing control is 503, shutdown
+refusal is 503, and acceptance redirects with 303 to the entity and
+target-generation acknowledgement — which the page renders only while the read
+model agrees a restart is in flight, since the target travels in the query
+string and is therefore forgeable. Every accepted restart also emits one
+`Log.info` line naming the actor and target generation: until Epic 5's writer
+lands, that line is the only record of the action that survives the process. A
+Mattermost runner restart affects only its file consumer; the fleet-wide reactor
+routes through a server-rendered `GET /restart` confirmation whose POST carries
+`confirmed=fleet-wide`. That step is a UI guard against an unconsidered click,
+not an authorization boundary — any client already holding a valid session and
+CSRF token can send the flag directly. Restarting entities disable the control,
+and a restart older than `RESTART_DELAY + restart_warning_margin_seconds`
+(default margin 5s, range 1..300) gains a visible warning; this is an
+operational hint, not proof of failure. Restart state and activity remain
+bounded and in-memory until Epic 5 adds persistence.
 
 That recheck is driven by the live SSE stream, not by page rendering: `Auth`
 publishes the revalidation callable into the Rack environment and `GET /events`

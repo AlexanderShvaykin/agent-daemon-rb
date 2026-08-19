@@ -107,18 +107,22 @@ class RunnerSupervisorDeferredCrashFake
   end
 end
 
-# Drives the supervisor's injected `clock:` seam. Only the supervising thread
-# reads it, so the plain accessor needs no synchronisation — and unlike a
-# Time.now monkeypatch it leaves concurrently running entity threads alone.
 class RunnerSupervisorStubClock
-  attr_accessor :now
-
   def initialize(now)
     @now = now
+    @mutex = Mutex.new
+  end
+
+  def now
+    @mutex.synchronize { @now }
+  end
+
+  def now=(value)
+    @mutex.synchronize { @now = value }
   end
 
   def call
-    @now
+    now
   end
 end
 
@@ -483,6 +487,93 @@ class TestRunnerSupervisor < Minitest::Test
     first_thread&.join(1)
   end
 
+  def test_cancel_token_is_active_before_restart_requested_is_published
+    stop_flag = AgentDaemon::ShutdownFlag.new
+    token_states = []
+    supervisor = nil
+    state_sink = Object.new
+    state_sink.define_singleton_method(:publish) do |_entity_id, record|
+      token_states << supervisor.cancel_token.value if record[:status] == :restart_requested
+    end
+    sinks_factory = lambda do |generation|
+      AgentDaemon::Sinks::Bundle.new(
+        entity_id: "ent-1",
+        state: AgentDaemon::Supervisor::GenerationStamp.new(generation, state_sink),
+        event: AgentDaemon::Supervisor::GenerationStamp.new(generation, RunnerSupervisorRecordingSink.new)
+      )
+    end
+    supervisor = AgentDaemon::Supervisor::RunnerSupervisor.new(
+      "ent-1",
+      entity_factory: ->(_bundle, _cancel_token = nil) { RunnerSupervisorLoopingFake.new(stop_flag) },
+      shutdown_flag: AgentDaemon::ShutdownFlag.new,
+      restart_delay: 0,
+      sinks_factory: sinks_factory
+    )
+    supervisor.spawn!
+
+    supervisor.request_restart(:manual)
+    supervisor.tick
+
+    assert_equal [true], token_states
+  ensure
+    stop_flag&.set!
+    supervisor&.thread&.join(1)
+  end
+
+  def test_request_restart_from_a_foreign_thread_while_tick_is_running
+    stop_flag = AgentDaemon::ShutdownFlag.new
+    publish_entered = Queue.new
+    publish_release = Queue.new
+    block_next_restart_publish = true
+    state_sink = Object.new
+    state_sink.define_singleton_method(:publish) do |_entity_id, record|
+      next unless record[:status] == :restart_requested && block_next_restart_publish
+
+      block_next_restart_publish = false
+      publish_entered << true
+      publish_release.pop
+    end
+    event_recorder = RunnerSupervisorRecordingSink.new
+    clock = RunnerSupervisorStubClock.new(Time.utc(2026, 8, 19, 12, 0, 0))
+    sinks_factory = lambda do |generation|
+      AgentDaemon::Sinks::Bundle.new(
+        entity_id: "ent-1",
+        state: AgentDaemon::Supervisor::GenerationStamp.new(generation, state_sink),
+        event: AgentDaemon::Supervisor::GenerationStamp.new(generation, event_recorder)
+      )
+    end
+    supervisor = AgentDaemon::Supervisor::RunnerSupervisor.new(
+      "ent-1",
+      entity_factory: ->(_bundle, _cancel_token = nil) { RunnerSupervisorLoopingFake.new(stop_flag) },
+      shutdown_flag: AgentDaemon::ShutdownFlag.new,
+      restart_delay: 0,
+      sinks_factory: sinks_factory,
+      clock: clock
+    )
+    supervisor.spawn!
+    supervisor.request_restart(:first)
+
+    tick_thread = Thread.new { supervisor.tick }
+    publish_entered.pop
+    requester = Thread.new { supervisor.request_restart(:foreign) }
+    requester.join(1)
+    publish_release << true
+    tick_thread.join(1)
+
+    stop_flag.set!
+    supervisor.thread.join(1)
+    supervisor.tick
+    supervisor.tick
+
+    assert_equal %i[first foreign], event_recorder.calls.fetch(0).last[:actor].sort
+  ensure
+    publish_release << true if tick_thread&.alive?
+    stop_flag&.set!
+    requester&.join(1)
+    tick_thread&.join(1)
+    supervisor&.thread&.join(1)
+  end
+
   def test_clean_death_in_stopping_honours_the_queued_intent_and_respawns
     stop_flag = AgentDaemon::ShutdownFlag.new
     supervisor, state_recorder, event_recorder = build_supervisor(
@@ -522,6 +613,94 @@ class TestRunnerSupervisor < Minitest::Test
 
     assert_equal :restart, event[:type]
     assert_equal [:manual], event[:actor]
+  ensure
+    stop_flag&.set!
+    supervisor&.thread&.join(1)
+  end
+
+  def test_two_consecutive_restarts_use_fresh_tokens_and_both_complete
+    tokens = []
+    supervisor, _state_recorder, event_recorder = build_supervisor(
+      "ent-1",
+      lambda do |_bundle, cancel_token|
+        tokens << cancel_token
+        RunnerSupervisorStoppableFake.new(cancel_token)
+      end,
+      restart_delay: 0
+    )
+    supervisor.spawn!
+
+    supervisor.request_restart(:first)
+    supervisor.tick
+    supervisor.thread.join(1)
+    supervisor.tick
+    supervisor.tick
+
+    supervisor.request_restart(:second)
+    supervisor.tick
+    supervisor.thread.join(1)
+    supervisor.tick
+    supervisor.tick
+
+    assert_equal 3, supervisor.generation
+    assert_equal 3, tokens.length
+    refute_same tokens[0], tokens[1]
+    refute_same tokens[1], tokens[2]
+    assert_equal [%i[first], %i[second]], event_recorder.calls.map { |_id, event| event[:actor] }
+  ensure
+    supervisor&.cancel_token&.set!
+    supervisor&.thread&.join(1)
+  end
+
+  def test_shutdown_after_reaching_stopping_prevents_terminal_restart_publication
+    shutdown_flag = AgentDaemon::ShutdownFlag.new
+    supervisor, state_recorder = build_supervisor(
+      "ent-1",
+      ->(_bundle, cancel_token) { RunnerSupervisorStoppableFake.new(cancel_token) },
+      shutdown_flag: shutdown_flag,
+      restart_delay: 0
+    )
+    supervisor.spawn!
+    supervisor.request_restart(:manual)
+    supervisor.tick
+    supervisor.thread.join(1)
+
+    shutdown_flag.set!
+    supervisor.tick
+
+    assert_equal :stopping, supervisor.state
+    assert_equal [["ent-1", { status: :restart_requested, generation: 1 }]], state_recorder.calls
+  ensure
+    supervisor&.cancel_token&.set!
+    supervisor&.thread&.join(1)
+  end
+
+  def test_reactor_restart_creates_exactly_one_replacement_generation_and_event
+    stop_flag = AgentDaemon::ShutdownFlag.new
+    factory_calls = 0
+    supervisor, _state_recorder, event_recorder = build_supervisor(
+      "mattermost_reactor",
+      lambda do |_bundle, _cancel_token = nil|
+        factory_calls += 1
+        RunnerSupervisorStoppableFake.new(stop_flag)
+      end,
+      restart_delay: 0
+    )
+    assert supervisor.spawn!
+    first_thread = supervisor.thread
+
+    supervisor.request_restart("console:alice")
+    supervisor.tick
+    stop_flag.set!
+    first_thread.join(1)
+    supervisor.tick
+    supervisor.tick
+
+    assert_equal 2, supervisor.generation
+    assert_equal 2, factory_calls
+    assert_equal 1, event_recorder.calls.size
+    assert_equal :restart, event_recorder.calls.first.last[:type]
+    assert_equal ["console:alice"], event_recorder.calls.first.last[:actor]
   ensure
     stop_flag&.set!
     supervisor&.thread&.join(1)

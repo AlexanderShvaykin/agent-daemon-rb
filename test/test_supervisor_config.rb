@@ -531,6 +531,55 @@ class TestSupervisorConfig < Minitest::Test
     end
   end
 
+  # --- restart_warning_margin_seconds (Story 4.3 Task 5) -----------------
+
+  def with_restart_warning_margin(value)
+    specs = [{ name: "a", file: "a", data: sandboxed_workflow_data }]
+    with_supervisor(specs) do |_dir, path|
+      data = YAML.safe_load(File.read(path))
+      data["restart_warning_margin_seconds"] = value unless value == :omitted
+      File.write(path, data.to_yaml)
+      yield path
+    end
+  end
+
+  def test_restart_warning_margin_defaults_to_five_seconds
+    with_restart_warning_margin(:omitted) do |path|
+      assert_equal 5, AgentDaemon::Supervisor::Config.new(path).restart_warning_margin_seconds
+    end
+  end
+
+  def test_restart_warning_margin_accepts_its_boundaries_and_an_override
+    [1, 17, 300].each do |value|
+      with_restart_warning_margin(value) do |path|
+        assert_equal value, AgentDaemon::Supervisor::Config.new(path).restart_warning_margin_seconds
+      end
+    end
+  end
+
+  def test_restart_warning_margin_rejects_out_of_range_and_non_integer_values
+    [0, 301, "5", 5.0, nil].each do |bad|
+      with_restart_warning_margin(bad) do |path|
+        error = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Supervisor::Config.new(path) }
+        assert_match(/restart_warning_margin_seconds must be an integer in 1\.\.300/, error.message)
+      end
+    end
+  end
+
+  def test_restart_warning_margin_error_is_collected_with_other_config_errors
+    specs = [{ name: "a", file: "a", data: sandboxed_workflow_data }]
+    with_supervisor(specs) do |_dir, path|
+      data = YAML.safe_load(File.read(path))
+      data["restart_warning_margin_seconds"] = 0
+      data["event_bus_capacity"] = -5
+      File.write(path, data.to_yaml)
+
+      error = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Supervisor::Config.new(path) }
+      assert_match(/event_bus_capacity must be a positive integer/, error.message)
+      assert_match(/restart_warning_margin_seconds must be an integer in 1\.\.300/, error.message)
+    end
+  end
+
   # --- Story 3.3 / DR1: resolved secrets are recorded ----------------------
 
   def with_env(vars)

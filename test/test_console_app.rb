@@ -25,6 +25,8 @@ require "agent_daemon/supervisor/redactor"
 # Every request goes through Rack::Lint, so a spec violation fails here rather
 # than under Puma.
 class TestConsoleApp < Minitest::Test
+  include LogStubbing
+
   App = AgentDaemon::Supervisor::Console::App
   Auth = AgentDaemon::Supervisor::Console::Auth
   SessionStore = AgentDaemon::Supervisor::Console::SessionStore
@@ -53,18 +55,63 @@ class TestConsoleApp < Minitest::Test
     end
   end
 
+  class RecordingRestartControl
+    attr_reader :calls
+
+    def initialize(result = 2, error: nil)
+      @result = result
+      @error = error
+      @calls = []
+    end
+
+    def request_restart(id, actor:)
+      raise @error if @error
+
+      @calls << [id, actor]
+      @result
+    end
+  end
+
+  class ConsoleStoppableEntity
+    def initialize(stop_flag)
+      @stop_flag = stop_flag
+    end
+
+    def run
+      Thread.pass until @stop_flag.value
+    end
+  end
+
+  class ConsoleMutableClock
+    attr_accessor :now
+
+    def initialize(now)
+      @now = now
+    end
+
+    def call
+      @now
+    end
+  end
+
   def setup
+    stub_null_logger!
     @registry = StateRegistry.new
     @fleet = Fleet.new(roster: [], state_registry: @registry)
     @app = build_app(@fleet)
     @sessions = SessionStore.new(ttl: 3_600)
   end
 
+  def teardown
+    restore_logger!
+  end
+
   def build_app(fleet, activity_log: ActivityLog.new(event_bus: EventBus.new),
                 live_updates: LiveUpdates.new(event_bus: EventBus.new, state_registry: StateRegistry.new),
-                output_buffers: OutputBuffers.new(capacity_bytes: OutputPipeline::DEFAULT_MAX_LINE_BYTES))
+                output_buffers: OutputBuffers.new(capacity_bytes: OutputPipeline::DEFAULT_MAX_LINE_BYTES),
+                restart_control: nil)
     Rack::MockRequest.new(Rack::Lint.new(App.new(fleet: fleet, activity_log: activity_log, live_updates: live_updates,
-                                                  output_buffers: output_buffers)))
+                                                  output_buffers: output_buffers, restart_control: restart_control)))
   end
 
   # The bare App, unwrapped — /events tests drive `#call` directly with a
@@ -109,6 +156,206 @@ class TestConsoleApp < Minitest::Test
   # own Fleet/StateRegistry without disturbing the shared empty-roster @app.
   def get_on(app, path, username: "alice")
     app.get(path, { Auth::SESSION_ENV_KEY => session_for(username) })
+  end
+
+  def restart_app(control)
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    [build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new), restart_control: control), id]
+  end
+
+  def post_restart(app, session:, params: {}, headers: {})
+    app.post("/restart", { Auth::SESSION_ENV_KEY => session, params: params }.merge(headers))
+  end
+
+  # --- Story 4.3 Task 3: authenticated restart POST ----------------------
+
+  def test_restart_post_uses_session_actor_and_redirects_with_the_target_generation
+    control = RecordingRestartControl.new(4)
+    app, = restart_app(control)
+    session = session_for("alice")
+
+    response = post_restart(
+      app,
+      session: session,
+      params: {
+        "_csrf" => session.csrf_token,
+        "id" => "runner:wf:alpha",
+        "actor" => "console:mallory",
+        "requested_at" => "1999-01-01T00:00:00Z"
+      }
+    )
+
+    assert_equal 303, response.status
+    assert_equal "/entity?id=runner%3Awf%3Aalpha&restarting=4", response.headers["location"]
+    assert_empty response.body
+    assert_equal [["runner:wf:alpha", "console:alice"]], control.calls
+  end
+
+  def test_restart_post_accepts_the_csrf_header
+    control = RecordingRestartControl.new
+    app, = restart_app(control)
+    session = session_for("alice")
+
+    response = post_restart(
+      app,
+      session: session,
+      params: { "id" => "runner:wf:alpha" },
+      headers: { "HTTP_X_CSRF_TOKEN" => session.csrf_token }
+    )
+
+    assert_equal 303, response.status
+    assert_equal [["runner:wf:alpha", "console:alice"]], control.calls
+  end
+
+  def test_restart_post_rejects_missing_or_invalid_csrf_before_control_lookup
+    control = RecordingRestartControl.new
+    app, = restart_app(control)
+    session = session_for("alice")
+
+    [nil, "", "wrong"].each do |csrf|
+      params = { "id" => "runner:wf:alpha" }
+      params["_csrf"] = csrf unless csrf.nil?
+      response = post_restart(app, session: session, params: params)
+
+      assert_equal 403, response.status
+      assert_equal "forbidden", response.body
+    end
+    assert_empty control.calls
+  end
+
+  def test_restart_post_rejects_invalid_and_unknown_ids_without_reflection
+    control = RecordingRestartControl.new(nil)
+    app, = restart_app(control)
+    session = session_for("alice")
+
+    errors = capture_log_errors do
+      [nil, "", ["runner:wf:alpha"], "<script>unknown</script>"].each do |id|
+        params = { "_csrf" => session.csrf_token }
+        params["id"] = id unless id.nil?
+        response = post_restart(app, session: session, params: params)
+
+        assert_equal 404, response.status
+        assert_equal "not found", response.body
+      end
+    end
+
+    assert_empty control.calls
+    assert_empty errors, "an unknown id must never reach a log line (AC5)"
+  end
+
+  def test_restart_post_turns_an_unparseable_body_into_a_denial
+    control = RecordingRestartControl.new
+    app, = restart_app(control)
+    session = session_for("alice")
+    body = "_csrf=#{Rack::Utils.escape(session.csrf_token)}&id=runner:wf:alpha&id[]=shadow"
+
+    response = app.post(
+      "/restart",
+      Auth::SESSION_ENV_KEY => session,
+      "CONTENT_TYPE" => "application/x-www-form-urlencoded",
+      input: body
+    )
+
+    assert_equal 403, response.status
+    assert_equal "forbidden", response.body
+    assert_empty control.calls
+  end
+
+  def test_restart_post_reports_shutdown_refusal
+    control = RecordingRestartControl.new(:refused)
+    app, = restart_app(control)
+    session = session_for("alice")
+
+    response = post_restart(
+      app,
+      session: session,
+      params: { "_csrf" => session.csrf_token, "id" => "runner:wf:alpha" }
+    )
+
+    assert_equal 503, response.status
+    assert_equal "shutting down", response.body
+  end
+
+  def test_restart_path_rejects_methods_other_than_post_and_confirmation_reads
+    control = RecordingRestartControl.new
+    app, = restart_app(control)
+    env = { Auth::SESSION_ENV_KEY => session_for("alice") }
+
+    put_response = app.put("/restart", env)
+    delete_response = app.delete("/restart", env)
+
+    assert_equal 405, put_response.status
+    assert_equal "method not allowed", put_response.body
+    assert_equal "GET, HEAD, POST", put_response.headers["allow"]
+    assert_equal 405, delete_response.status
+    assert_equal "GET, HEAD, POST", delete_response.headers["allow"]
+
+    # The confirmation reads the name claims: a GET on a non-reactor id is the
+    # same non-disclosing 404, and neither read reaches the control.
+    get_response = get_on(app, "/restart?id=runner%3Awf%3Aalpha")
+
+    assert_equal 404, get_response.status
+    assert_equal "not found", get_response.body
+    assert_empty control.calls
+  end
+
+  def test_restart_post_without_a_control_fails_closed
+    app, = restart_app(nil)
+    session = session_for("alice")
+
+    response = post_restart(
+      app,
+      session: session,
+      params: { "_csrf" => session.csrf_token, "id" => "runner:wf:alpha" }
+    )
+
+    # Distinct from the unknown-id 404 on purpose: this is the wiring fault the
+    # detail page already renders as "Restart unavailable", and it discloses
+    # nothing about the roster.
+    assert_equal 503, response.status
+    assert_equal "restart unavailable", response.body
+  end
+
+  # The branch that fails closed when the fleet roster and the restart-control
+  # map disagree: the id resolves on the read side, the control has no
+  # supervisor for it. Delete `return not_found if target_generation.nil?` and
+  # the console instead 303s with an empty generation for a restart never
+  # queued.
+  def test_restart_post_fails_closed_when_the_control_does_not_know_a_rostered_id
+    control = RecordingRestartControl.new(nil)
+    app, = restart_app(control)
+    session = session_for("alice")
+
+    response = post_restart(
+      app,
+      session: session,
+      params: { "_csrf" => session.csrf_token, "id" => "runner:wf:alpha" }
+    )
+
+    assert_equal 404, response.status
+    assert_equal "not found", response.body
+    assert_equal [["runner:wf:alpha", "console:alice"]], control.calls
+  end
+
+  def test_restart_control_failure_is_logged_and_returns_a_safe_error
+    control = RecordingRestartControl.new(error: RuntimeError.new("adapter boom"))
+    app, = restart_app(control)
+    session = session_for("alice")
+
+    errors = capture_log_errors do
+      @response = post_restart(
+        app,
+        session: session,
+        params: { "_csrf" => session.csrf_token, "id" => "runner:wf:alpha" }
+      )
+    end
+
+    assert_equal 500, @response.status
+    assert_equal "internal error", @response.body
+    refute_includes @response.body, "boom"
+    assert_equal 1, errors.size
+    assert_match(/RuntimeError: adapter boom/, errors.first)
   end
 
   # --- AC2: the health probe ----------------------------------------------
@@ -785,8 +1032,11 @@ class TestConsoleApp < Minitest::Test
     assert_includes body, 'aria-label="Entities in workflow &lt;script&gt;alert(&quot;workflow&quot;)&lt;/script&gt;"'
   end
 
-  # AC2/AD-13: the restart action exists for every kind, but Epic 4 owns the
-  # endpoint — there must be no form here that could 404.
+  # AC2/AD-13: the restart affordance exists for every kind on the fleet list,
+  # and on the list it stays disabled. The endpoint exists as of Story 4.3;
+  # AC1 puts the working control on the detail page instead, so that one page
+  # does not carry N forms and N CSRF tokens for an action whose diagnostics
+  # live elsewhere.
   def test_restart_placeholder_is_disabled_and_posts_nowhere
     id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
     roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
@@ -799,7 +1049,187 @@ class TestConsoleApp < Minitest::Test
     # matching /restart/ inside a <form> open tag would miss any action path
     # spelled differently, and the button sits outside that tag anyway.
     assert_equal ['<form method="post" action="/auth/logout">'], body.scan(/<form[^>]*>/),
-                 "the logout form must be the only <form> on the page until Epic 4 adds the restart endpoint"
+                 "AC1 scopes the restart action to the detail page: a fleet card must carry no form"
+  end
+
+  def test_detail_page_renders_a_csrf_protected_restart_form
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :waiting, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry),
+                    restart_control: RecordingRestartControl.new)
+    session = session_for("alice")
+
+    diagnostics = diagnostic_section(app.get(
+      "/entity?id=runner%3Awf%3Aalpha", Auth::SESSION_ENV_KEY => session
+    ).body)
+
+    assert_includes diagnostics, '<form method="post" action="/restart">'
+    assert_includes diagnostics, %(<input type="hidden" name="_csrf" value="#{session.csrf_token}">)
+    assert_includes diagnostics, '<input type="hidden" name="id" value="runner:wf:alpha">'
+    assert_includes diagnostics, '<button id="restart-action" type="submit">Restart</button>'
+  end
+
+  def test_detail_page_disables_restart_while_restarting
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :restart_requested, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry),
+                    restart_control: RecordingRestartControl.new)
+
+    diagnostics = diagnostic_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes diagnostics, '<button id="restart-action" type="button" disabled>Restarting…</button>'
+    refute_includes diagnostics, '<form method="post" action="/restart">'
+  end
+
+  def test_detail_page_explains_when_restart_control_is_unavailable
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new))
+
+    diagnostics = diagnostic_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes diagnostics, '<button id="restart-action" type="button" disabled>Restart unavailable</button>'
+    assert_includes diagnostics, "Restart control is not configured."
+    refute_includes diagnostics, 'action="/restart"'
+  end
+
+  def test_mattermost_runner_restart_note_names_the_consumer_only_boundary
+    id = RunnerIdentity.new(workflow: "wf", runner: "mentions")
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "mentions", entity_id: id,
+                                   trigger_type: "mattermost")]
+    app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new),
+                    restart_control: RecordingRestartControl.new)
+
+    diagnostics = diagnostic_section(get_on(app, "/entity?id=runner%3Awf%3Amentions").body)
+
+    assert_includes diagnostics, "Only this file-poll consumer restarts."
+    assert_includes diagnostics, "The WebSocket listener in the shared reactor is not restarted."
+  end
+
+  def test_restart_acceptance_flash_allows_only_a_bounded_decimal_generation
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :restart_requested, generation: 1 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_app(Fleet.new(roster: roster, state_registry: registry),
+                    restart_control: RecordingRestartControl.new)
+
+    accepted = get_on(app, "/entity?id=runner%3Awf%3Aalpha&restarting=2").body
+    malicious = get_on(app, "/entity?id=runner%3Awf%3Aalpha&restarting=%3Cscript%3Ebad%3C%2Fscript%3E").body
+    too_long = get_on(app, "/entity?id=runner%3Awf%3Aalpha&restarting=12345678901").body
+
+    assert_includes accepted, "Restart accepted — target generation 2"
+    refute_includes inert_body(malicious), "Restart accepted"
+    refute_includes malicious, "&lt;script&gt;bad&lt;/script&gt;"
+    refute_includes too_long, "Restart accepted"
+  end
+
+  # The target arrives in the query string, so it is forgeable and it outlives
+  # the action. Gating on the read model is what keeps it a receipt: an idle
+  # entity ignores a hand-crafted link, and revisiting the same redirect URL
+  # after the respawn landed shows nothing.
+  def test_restart_flash_is_suppressed_unless_the_read_model_agrees
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    idle = StateRegistry.new
+    idle.publish(id, { status: :running, generation: 1 })
+    respawned = StateRegistry.new
+    respawned.publish(id, { status: :restart_requested, generation: 2 })
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+
+    forged = get_on(build_app(Fleet.new(roster: roster, state_registry: idle),
+                              restart_control: RecordingRestartControl.new),
+                    "/entity?id=runner%3Awf%3Aalpha&restarting=999").body
+    stale = get_on(build_app(Fleet.new(roster: roster, state_registry: respawned),
+                             restart_control: RecordingRestartControl.new),
+                   "/entity?id=runner%3Awf%3Aalpha&restarting=2").body
+
+    refute_includes forged, "Restart accepted"
+    refute_includes stale, "Restart accepted"
+  end
+
+  def test_reactor_detail_routes_restart_through_a_get_confirmation
+    roster = [Fleet::Rostered.new(kind: :reactor, workflow: nil, name: "mattermost_reactor",
+                                   entity_id: "mattermost_reactor")]
+    app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new),
+                    restart_control: RecordingRestartControl.new)
+
+    diagnostics = diagnostic_section(get_on(app, "/entity?id=mattermost_reactor").body)
+
+    assert_includes diagnostics, '<form method="get" action="/restart">'
+    assert_includes diagnostics, '<input type="hidden" name="id" value="mattermost_reactor">'
+    assert_includes diagnostics, '<button id="restart-action" type="submit">Restart</button>'
+    refute_includes diagnostics, 'name="_csrf"'
+  end
+
+  def test_reactor_confirmation_names_fleet_wide_impact_and_carries_a_post_form
+    roster = [Fleet::Rostered.new(kind: :reactor, workflow: nil, name: "mattermost_reactor",
+                                   entity_id: "mattermost_reactor")]
+    app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new),
+                    restart_control: RecordingRestartControl.new)
+    session = session_for("alice")
+
+    response = app.get("/restart?id=mattermost_reactor", Auth::SESSION_ENV_KEY => session)
+    head = app.request("HEAD", "/restart?id=mattermost_reactor", Auth::SESSION_ENV_KEY => session)
+
+    assert_equal 200, response.status
+    assert_equal 200, head.status
+    assert_empty head.body
+    assert_includes response.body, "Confirm fleet-wide Mattermost reactor restart"
+    assert_includes response.body, "Every workflow's Mattermost listeners will disconnect and reconnect temporarily."
+    assert_includes response.body, '<header class="console-header">'
+    assert_includes response.body, '<h1>agent-daemon console</h1>'
+    assert_includes response.body, '<main id="console-content">'
+    assert_includes response.body, '<section aria-labelledby="restart-confirmation-heading">'
+    assert_includes response.body, '<h2 id="restart-confirmation-heading">Confirm fleet-wide Mattermost reactor restart</h2>'
+    assert_includes response.body, '<form method="post" action="/restart">'
+    assert_includes response.body, %(<input type="hidden" name="_csrf" value="#{session.csrf_token}">)
+    assert_includes response.body, '<input type="hidden" name="confirmed" value="fleet-wide">'
+    assert_includes response.body, '<button id="restart-action" type="submit">Restart fleet-wide reactor</button>'
+    assert_includes response.body, '<a href="/entity?id=mattermost_reactor">Cancel</a>'
+  end
+
+  def test_reactor_post_requires_confirmation_before_calling_the_control
+    control = RecordingRestartControl.new(2)
+    roster = [Fleet::Rostered.new(kind: :reactor, workflow: nil, name: "mattermost_reactor",
+                                   entity_id: "mattermost_reactor")]
+    app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new), restart_control: control)
+    session = session_for("alice")
+
+    rejected = post_restart(
+      app,
+      session: session,
+      params: { "_csrf" => session.csrf_token, "id" => "mattermost_reactor" }
+    )
+
+    assert_equal 303, rejected.status
+    assert_equal "/restart?id=mattermost_reactor", rejected.headers["location"]
+    assert_empty control.calls
+
+    accepted = post_restart(
+      app,
+      session: session,
+      params: { "_csrf" => session.csrf_token, "id" => "mattermost_reactor", "confirmed" => "fleet-wide" }
+    )
+
+    assert_equal 303, accepted.status
+    assert_equal [["mattermost_reactor", "console:alice"]], control.calls
+  end
+
+  def test_reactor_confirmation_unknown_id_is_the_fixed_not_found
+    roster = [Fleet::Rostered.new(kind: :reactor, workflow: nil, name: "mattermost_reactor",
+                                   entity_id: "mattermost_reactor")]
+    app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new),
+                    restart_control: RecordingRestartControl.new)
+
+    response = get_on(app, "/restart?id=%3Cscript%3Eunknown%3C%2Fscript%3E")
+
+    assert_equal 404, response.status
+    assert_equal "not found", response.body
+    refute_includes response.body, "script"
   end
 
   # --- Story 2.4: per-runner detail page -----------------------------------
@@ -966,6 +1396,26 @@ class TestConsoleApp < Minitest::Test
                     "the delayed warning must precede the restart control"
     assert_includes fresh, "<div><dt>Restarting for</dt><dd>1s</dd></div>"
     refute_includes fresh, "Restart delayed"
+  end
+
+  def test_a_stuck_requested_restart_uses_neutral_copy_and_offers_no_second_form
+    id = RunnerIdentity.new(workflow: "wf", runner: "slow")
+    registry = StateRegistry.new
+    registry.publish(id, { status: :restart_requested, generation: 1 })
+    published_at = registry.snapshot(id).fetch(:observed_monotonic)
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "slow", entity_id: id)]
+    app = build_app(
+      Fleet.new(roster: roster, state_registry: registry, restart_delay: 60,
+                restart_warning_margin: 5, clock: -> { published_at + 66 }),
+      restart_control: RecordingRestartControl.new
+    )
+
+    diagnostics = diagnostic_section(get_on(app, "/entity?id=runner%3Awf%3Aslow").body)
+
+    assert_includes diagnostics, "Restart taking longer than expected — waiting for the entity to stop"
+    refute_includes diagnostics, "respawn is failing"
+    assert_operator diagnostics.index("Restart taking longer"), :<, diagnostics.index("Restarting…")
+    refute_includes diagnostics, '<form method="post" action="/restart">'
   end
 
   # AC9: a messenger/reactor entity has no work-item/attempt semantics at all.
@@ -1287,16 +1737,18 @@ class TestConsoleApp < Minitest::Test
   def test_a_restart_event_renders_its_actor_set_and_timestamp
     id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
     bus = EventBus.new
-    bus.publish(id, { type: :restart, actor: [:crash_auto], generation: 2 })
+    bus.publish(id, { type: :restart, actor: [:crash_auto], generation: 2,
+                      requested_at: "2026-08-19T10:15:04.221Z", at: "2026-08-19T10:16:04Z" })
     roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
     app = build_activity_app(roster: roster, event_bus: bus)
 
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
-    assert_match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/, section)
+    assert_includes section, "<dt>When</dt><dd>2026-08-19T10:16:04Z</dd>"
     assert_includes section, "<dt>Generation</dt><dd>2</dd>"
     assert_includes section, "<dt>Event</dt><dd>restart</dd>"
-    assert_includes section, "<dt>Detail</dt><dd>actor: crash_auto</dd>"
+    assert_includes section,
+                    "<dt>Detail</dt><dd>actor: crash_auto · requested 2026-08-19T10:15:04.221Z</dd>"
   end
 
   def test_a_multi_actor_restart_set_renders_joined
@@ -1309,6 +1761,54 @@ class TestConsoleApp < Minitest::Test
     section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
 
     assert_includes section, "actor: crash_auto, console_alice"
+  end
+
+  def test_coalesced_restart_renders_both_actors_and_the_earliest_request_time
+    id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
+    registry = StateRegistry.new
+    bus = EventBus.new
+    shutdown_flag = AgentDaemon::ShutdownFlag.new
+    stop_flag = AgentDaemon::ShutdownFlag.new
+    clock = ConsoleMutableClock.new(Time.utc(2026, 8, 19, 10, 15, 4, 221_000))
+    sinks_factory = lambda do |generation|
+      AgentDaemon::Sinks::Bundle.new(
+        entity_id: id,
+        state: GenerationStamp.new(generation, registry),
+        event: GenerationStamp.new(generation, bus)
+      )
+    end
+    supervisor = AgentDaemon::Supervisor::RunnerSupervisor.new(
+      id,
+      entity_factory: ->(_bundle, _token = nil) { ConsoleStoppableEntity.new(stop_flag) },
+      shutdown_flag: shutdown_flag,
+      restart_delay: 0,
+      sinks_factory: sinks_factory,
+      clock: clock
+    )
+    assert supervisor.spawn!
+    first_thread = supervisor.thread
+
+    supervisor.request_restart("console:alice")
+    supervisor.tick
+    clock.now = Time.utc(2026, 8, 19, 10, 15, 5, 999_000)
+    supervisor.request_restart("console:bob")
+    stop_flag.set!
+    first_thread.join(1)
+    supervisor.tick
+    supervisor.tick
+
+    roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
+    app = build_activity_app(roster: roster, state_registry: registry, event_bus: bus)
+    section = activity_section(get_on(app, "/entity?id=runner%3Awf%3Aalpha").body)
+
+    assert_includes section,
+                    "actor: console:alice, console:bob · requested 2026-08-19T10:15:04.221Z"
+    assert_includes section, "<dt>When</dt><dd>2026-08-19T10:15:05Z</dd>"
+    assert_equal 1, bus.records.count { |record| record[:type] == :restart }
+  ensure
+    shutdown_flag&.set!
+    stop_flag&.set!
+    supervisor&.thread&.join(1)
   end
 
   def test_a_restart_with_an_empty_actor_array_renders_the_em_dash

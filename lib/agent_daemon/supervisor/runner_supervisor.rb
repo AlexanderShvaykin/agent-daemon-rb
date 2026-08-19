@@ -199,8 +199,8 @@ module AgentDaemon
           # tick_restarting then refuses to resolve — the entity would render
           # `restarting` (and eventually "restart delayed") forever (AC12).
           if intent_pending? && !@shutdown_flag.value
-            @bundle.publish_state(status: :restart_requested)
             @cancel_token.set!
+            @bundle.publish_state(status: :restart_requested)
             @state = :stopping
           end
           return
@@ -213,6 +213,16 @@ module AgentDaemon
       # token. The entity-side observer is added separately; this supervisor
       # never force-kills its thread.
       def tick_stopping
+        # Shutdown wins the gate, same as its two siblings: without this,
+        # Master#finalize_supervisors can record `restart_requested` as an
+        # entity's terminal shutdown state. The read-model consequence is
+        # accepted, not overlooked — the last published status stays
+        # `restart_requested`, so a console still up during the drain renders
+        # the entity `restarting` and, past the margin, the neutral "taking
+        # longer than expected" copy. That copy is true of a draining entity;
+        # the alternative (a terminal status the fleet never actually reached)
+        # is not.
+        return if @shutdown_flag.value
         return if @thread.alive?
 
         # A crash here is indistinguishable from :running's and takes the
@@ -233,9 +243,8 @@ module AgentDaemon
         # Since Story 4.2 a cancelled `Runner::Base#run` suppresses its own
         # terminal `:stopped` (`runner/base.rb#cancelling?`), so on the local
         # restart path there is usually nothing to overwrite. This line is
-        # still load-bearing for the paths that DO publish a terminal status:
-        # Messenger and the Reactor, which observe no token, and any entity
-        # whose stop coincided with a fleet drain (shutdown wins the gate).
+        # still load-bearing for any entity that publishes a terminal status
+        # while its cooperative cancellation and clean return overlap.
         #
         # This is NOT the per-tick republish Task 2 bans: it fires once, on the
         # :stopping -> :restarting transition, and it re-arms

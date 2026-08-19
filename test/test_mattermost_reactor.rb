@@ -3,12 +3,14 @@
 require "test_helper"
 
 class TestMattermostReactor < Minitest::Test
+  include LogStubbing
+
   def setup
-    AgentDaemon::Log.instance_variable_set(:@logger, ::Logger.new(::File::NULL))
+    stub_null_logger!
   end
 
   def teardown
-    AgentDaemon::Log.instance_variable_set(:@logger, nil)
+    restore_logger!
   end
 
   # A fake listener whose #prepare either succeeds (returning self, as the real
@@ -33,6 +35,20 @@ class TestMattermostReactor < Minitest::Test
     end
   end
 
+  class StateSink
+    attr_reader :records, :published
+
+    def initialize
+      @records = []
+      @published = Thread::Queue.new
+    end
+
+    def publish(_entity_id, record)
+      @records << record
+      @published << record
+    end
+  end
+
   def test_prepare_listeners_skips_failures_and_keeps_others
     ok = FakeListener.new("ok")
     bad = FakeListener.new("bad", raise_on_prepare: true)
@@ -49,5 +65,27 @@ class TestMattermostReactor < Minitest::Test
     reactor = AgentDaemon::Mattermost::Reactor.new([a, b], AgentDaemon::ShutdownFlag.new)
 
     assert_equal [a, b], reactor.prepare_listeners
+  end
+
+  def test_generation_cancel_stops_the_reactor_without_publishing_stopped
+    listener = FakeListener.new("ok")
+    shutdown_flag = AgentDaemon::ShutdownFlag.new
+    cancel_flag = AgentDaemon::ShutdownFlag.new
+    state_sink = StateSink.new
+    sinks = AgentDaemon::Sinks::Bundle.new(entity_id: "mattermost_reactor", state: state_sink)
+    reactor = AgentDaemon::Mattermost::Reactor.new(
+      [listener], shutdown_flag, sinks: sinks, cancel_flag: cancel_flag
+    )
+
+    thread = Thread.new { reactor.run }
+    assert_equal({ status: :running }, state_sink.published.pop)
+    cancel_flag.set!
+
+    assert thread.join(2), "cancelled reactor did not return within its existing timer bound"
+    assert listener.started
+    assert_equal [{ status: :running }], state_sink.records
+  ensure
+    shutdown_flag&.set!
+    thread&.join(2)
   end
 end

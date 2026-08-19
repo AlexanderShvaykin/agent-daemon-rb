@@ -105,4 +105,20 @@ class TestActivityLog < Minitest::Test
     assert_equal [2, 1, 1], entries.map(&:generation)
     assert_equal [3, 2, 1], entries.map(&:seq)
   end
+
+  def test_restart_requested_at_is_copied_through_the_entry_whitelist
+    id = runner_identity("wf", "alpha")
+    @bus.publish(
+      id,
+      type: :restart,
+      actor: ["console:alice"],
+      requested_at: "2026-08-19T10:15:04.221Z",
+      at: "2026-08-19T10:16:04Z"
+    )
+
+    entry = ActivityLog.new(event_bus: @bus).recent("runner:wf:alpha").first
+
+    assert_equal "2026-08-19T10:15:04.221Z", entry.requested_at
+    assert_equal "2026-08-19T10:16:04Z", entry.at
+  end
 end

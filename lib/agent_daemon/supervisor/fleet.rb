@@ -46,7 +46,7 @@ module AgentDaemon
       # (the value Sinks::Bundle stamps on every publish and therefore what
       # keys the registry), not a rebuilt copy. doc is the entity's own Doc, or
       # nil — messenger and reactor rows never carry one.
-      Rostered = Struct.new(:kind, :workflow, :name, :entity_id, :doc, keyword_init: true)
+      Rostered = Struct.new(:kind, :workflow, :name, :entity_id, :doc, :trigger_type, keyword_init: true)
 
       # A rostered entity joined with its current registry state (or none).
       # The first five members and :id, :generation, :work_item, :attempt,
@@ -60,7 +60,7 @@ module AgentDaemon
       Entry = Struct.new(:kind, :workflow, :name, :status, :liveness,
                           :id, :entity_id, :generation, :work_item, :attempt,
                           :observed_at, :seconds_since_published, :stuck_restarting,
-                          :doc,
+                          :doc, :trigger_type,
                           keyword_init: true)
 
       # Maps a snapshot's raw published :status to a three-way liveness. A
@@ -104,10 +104,11 @@ module AgentDaemon
       # here rather than copied onto every Entry — it belongs to the group, not
       # to the row, and the console renders it once per workflow heading.
       def initialize(roster:, state_registry:, restart_delay: nil, clock: DEFAULT_CLOCK,
-                     workflow_docs: {})
+                     workflow_docs: {}, restart_warning_margin: RESTART_STUCK_MARGIN)
         @roster = roster.dup.freeze
         @state_registry = state_registry
         @restart_delay = restart_delay
+        @restart_warning_margin = restart_warning_margin
         @clock = clock
         @workflow_docs = workflow_docs.dup.freeze
       end
@@ -178,7 +179,8 @@ module AgentDaemon
           observed_at: snapshot && snapshot[:observed_at],
           seconds_since_published: since_published,
           stuck_restarting: stuck_restarting?(liveness, since_published),
-          doc: rostered.doc
+          doc: rostered.doc,
+          trigger_type: rostered.trigger_type
         )
       end
 
@@ -199,7 +201,7 @@ module AgentDaemon
         return false unless liveness == :restarting
         return false unless @restart_delay && seconds_since_published
 
-        seconds_since_published > @restart_delay + RESTART_STUCK_MARGIN
+        seconds_since_published > @restart_delay + @restart_warning_margin
       end
     end
   end

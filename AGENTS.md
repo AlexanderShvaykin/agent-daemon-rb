@@ -34,6 +34,7 @@ Read `docs/architecture.md` first — it is the authoritative design reference. 
 - **Backend factory:** `Backend.for(...)` dispatches on the `backend` config key. Backends run the CLI via `Open3.popen3` with `pgroup: true` and return a `Result` with `reason` ∈ `:ok | :failed | :timeout | :killed`. On timeout/shutdown the whole process group gets `SIGTERM` then `SIGKILL` after 2s.
 - **Two independent failure counters:** per-item attempts (`max_attempts`, default 3 → `after_exhausted`) vs. consecutive *trigger* errors (`MAX_CONSECUTIVE_ERRORS` = 3 → writes a `SYSTEM:<runner>` error YAML to `message_dir` for the Messenger to notify). `:killed` results roll the attempt counter back (shutdown is not a failure).
 - **Crash recovery:** `Daemon#monitor_threads` restarts any thread that died with `Thread.current[:crashed]` after `RESTART_DELAY` (60s).
+- **Supervisor restart control:** The authenticated console never manipulates threads directly. CSRF-protected `POST /restart` — id and confirmation read from the form body only, CSRF token from the body or an `X-CSRF-Token` header — calls the master-owned `RestartControl`, which queues an actor-labelled intent on `RunnerSupervisor`; each generation gets a fresh `CancelToken` observed separately from the process-wide `ShutdownFlag`. Restart activity remains in-memory until Epic 5.
 
 ## Config (`config.rb`)
 

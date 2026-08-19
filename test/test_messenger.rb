@@ -5,6 +5,8 @@ require "tmpdir"
 require "yaml"
 
 class TestMessenger < Minitest::Test
+  include LogStubbing
+
   class ConfigStub
     attr_reader :messenger, :message_dir
 
@@ -32,6 +34,36 @@ class TestMessenger < Minitest::Test
     end
   end
 
+  # Trips the generation cancel token on its first delivery, so a Messenger
+  # holding a backlog has to observe the token *inside* the per-file loop to
+  # stop. Without that, the only cancel-aware test writes zero files and never
+  # enters the loop at all.
+  class CancellingTransportStub < TransportStub
+    def initialize(cancel_flag)
+      super()
+      @cancel_flag = cancel_flag
+    end
+
+    def deliver(message)
+      super
+      @cancel_flag.set!
+    end
+  end
+
+  class StateSink
+    attr_reader :records, :published
+
+    def initialize
+      @records = []
+      @published = Thread::Queue.new
+    end
+
+    def publish(_entity_id, record)
+      @records << record
+      @published << record
+    end
+  end
+
   def setup
     @tmpdir = Dir.mktmpdir
     @message_dir = File.join(@tmpdir, "to_message")
@@ -40,14 +72,11 @@ class TestMessenger < Minitest::Test
     # These tests exercise Messenger#run, which logs a line per delivery.
     # AgentDaemon::Log's logger is a process-wide singleton, so silence it for
     # the duration of this file and hand back whatever was installed before.
-    @prior_logger = AgentDaemon::Log.instance_variable_get(:@logger)
-    null_logger = ::Logger.new(File::NULL)
-    null_logger.level = ::Logger::FATAL
-    AgentDaemon::Log.instance_variable_set(:@logger, null_logger)
+    stub_null_logger!
   end
 
   def teardown
-    AgentDaemon::Log.instance_variable_set(:@logger, @prior_logger)
+    restore_logger!
     FileUtils.remove_entry(@tmpdir)
   end
 
@@ -112,5 +141,53 @@ class TestMessenger < Minitest::Test
 
     refute delivered.key?("channel")
     refute delivered.key?("user")
+  end
+
+  def test_generation_cancel_stops_the_messenger_without_publishing_stopped
+    config = ConfigStub.new(mattermost_config.merge("interval" => 60), @message_dir)
+    shutdown_flag = AgentDaemon::ShutdownFlag.new
+    cancel_flag = AgentDaemon::ShutdownFlag.new
+    state_sink = StateSink.new
+    sinks = AgentDaemon::Sinks::Bundle.new(entity_id: "messenger:wf", state: state_sink)
+    messenger = AgentDaemon::Messenger.new(
+      config, shutdown_flag, sinks: sinks, cancel_flag: cancel_flag
+    )
+
+    thread = Thread.new { messenger.run }
+    assert_equal({ status: :running }, state_sink.published.pop)
+    cancel_flag.set!
+
+    assert thread.join(2), "cancelled Messenger did not return within its existing tick bound"
+    assert_equal [{ status: :running }], state_sink.records
+  ensure
+    shutdown_flag&.set!
+    thread&.join(2)
+  end
+
+  # `iterate`'s per-file gate is `break if stopping?`, not `break if
+  # @shutdown_flag.value`. Revert that one line and a manually restarted
+  # Messenger drains its whole queue to the webhook before returning, which is
+  # exactly the turnover window the restart is waiting on.
+  def test_generation_cancel_stops_the_messenger_mid_backlog
+    3.times do |i|
+      File.write(File.join(@message_dir, "m#{i}.yml"), { "text" => "n#{i}" }.to_yaml)
+    end
+    config = ConfigStub.new(mattermost_config.merge("interval" => 60), @message_dir)
+    shutdown_flag = AgentDaemon::ShutdownFlag.new
+    cancel_flag = AgentDaemon::ShutdownFlag.new
+    transport = CancellingTransportStub.new(cancel_flag)
+    messenger = AgentDaemon::Messenger.new(config, shutdown_flag, cancel_flag: cancel_flag)
+    messenger.instance_variable_set(:@transport, transport)
+
+    thread = Thread.new { messenger.run }
+
+    assert thread.join(2), "cancelled Messenger did not return within its existing tick bound"
+    assert_equal 1, transport.messages.size,
+                 "a cancelled Messenger must stop mid-backlog, not drain the queue"
+    assert_equal 2, Dir.glob(File.join(@message_dir, "*.yml")).size,
+                 "the undelivered messages must stay in message_dir for the next generation"
+  ensure
+    shutdown_flag&.set!
+    thread&.join(2)
   end
 end

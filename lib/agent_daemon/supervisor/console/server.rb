@@ -40,6 +40,7 @@ module AgentDaemon
         attr_reader :port
 
         def initialize(console_config, fleet:, activity_log:, event_bus:, state_registry:, output_buffers:,
+                       restart_control: nil,
                        log_writer: Puma::LogWriter.stdio)
           @bind = console_config.fetch("bind")
           @port = console_config.fetch("port")
@@ -51,6 +52,7 @@ module AgentDaemon
           @fleet = fleet
           @activity_log = activity_log
           @output_buffers = output_buffers
+          @restart_control = restart_control
           @live_updates = LiveUpdates.new(event_bus: event_bus, state_registry: state_registry,
                                            output_buffers: output_buffers)
           @log_writer = log_writer
@@ -145,7 +147,7 @@ module AgentDaemon
           @sessions = SessionStore.new(ttl: @session_ttl)
           Auth.new(
             App.new(fleet: @fleet, activity_log: @activity_log, live_updates: @live_updates,
-                    output_buffers: @output_buffers),
+                    output_buffers: @output_buffers, restart_control: @restart_control),
             sessions: @sessions,
             gitlab: gitlab,
             allowed_groups: @auth_config.fetch("allowed_groups"),

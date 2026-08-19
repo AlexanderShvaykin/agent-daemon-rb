@@ -21,9 +21,10 @@ module AgentDaemon
     # logic is the pure, directly-testable seam; the EM.run body itself is
     # smoke-test-only.
     class Reactor
-      def initialize(listeners, shutdown_flag, sinks: nil)
+      def initialize(listeners, shutdown_flag, sinks: nil, cancel_flag: nil)
         @listeners = listeners
         @shutdown_flag = shutdown_flag
+        @cancel_flag = cancel_flag
         @sinks = sinks || Sinks::Bundle.null("mattermost_reactor")
       end
 
@@ -37,16 +38,16 @@ module AgentDaemon
 
         if prepared.empty?
           Log.warn("[Mattermost::Reactor] no listeners prepared, nothing to run")
-          @sinks.publish_state(status: :stopped)
+          @sinks.publish_state(status: :stopped) unless cancelling?
           return
         end
 
         EM.run do
           prepared.each(&:start)
-          EM.add_periodic_timer(1) { EM.stop if @shutdown_flag.value }
+          EM.add_periodic_timer(1) { EM.stop if stopping? }
         end
 
-        @sinks.publish_state(status: :stopped)
+        @sinks.publish_state(status: :stopped) unless cancelling?
         Log.info("[Mattermost::Reactor] Thread stopping gracefully")
       end
 
@@ -60,6 +61,16 @@ module AgentDaemon
           Log.error("[Mattermost::Reactor] skipping listener that failed to prepare: #{e.message}")
           nil
         end
+      end
+
+      private
+
+      def stopping?
+        @shutdown_flag.value || @cancel_flag&.value
+      end
+
+      def cancelling?
+        @cancel_flag&.value && !@shutdown_flag.value
       end
     end
   end
