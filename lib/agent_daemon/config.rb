@@ -315,6 +315,7 @@ module AgentDaemon
       end
 
       errors.concat(validate_claude(label, runner["claude"]))
+      errors.concat(validate_fallback_agent(label, runner["fallback_agent"])) if runner.key?("fallback_agent")
       errors.concat(validate_trigger(label, runner["trigger"]))
       errors.concat(validate_documentation(runner["description"], runner["support"],
                                            prefix: "runner #{label.inspect}: "))
@@ -381,6 +382,30 @@ module AgentDaemon
       return [] if model.nil? || (model.is_a?(String) && !model.empty?)
 
       ["runner #{runner_label.inspect}: claude.model must be a non-empty String (got #{model.inspect})"]
+    end
+
+    def validate_fallback_agent(runner_label, fallback_agent)
+      unless fallback_agent.is_a?(Hash)
+        return ["runner #{runner_label.inspect}: fallback_agent must be a Hash (got #{fallback_agent.inspect})"]
+      end
+
+      errors = []
+      unknown = fallback_agent.keys - %w[command args]
+      unless unknown.empty?
+        errors << "runner #{runner_label.inspect}: fallback_agent has unknown key(s) #{unknown.join(', ')} (known: command, args)"
+      end
+
+      command = fallback_agent["command"]
+      unless command.is_a?(String) && !command.strip.empty?
+        errors << "runner #{runner_label.inspect}: fallback_agent.command must be a non-empty String (got #{command.inspect})"
+      end
+
+      args = fallback_agent["args"]
+      unless args.is_a?(Array) && args.all? { |arg| arg.is_a?(String) }
+        errors << "runner #{runner_label.inspect}: fallback_agent.args must be an Array of Strings (got #{args.inspect})"
+      end
+
+      errors
     end
 
     def validate_trigger(runner_label, trigger)

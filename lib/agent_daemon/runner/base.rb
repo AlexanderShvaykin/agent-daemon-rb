@@ -27,6 +27,11 @@ module AgentDaemon
         @backend = Backend.for(runner_config, shutdown_flag,
                                message_dir: message_dir, project_path: project_path,
                                sinks: @sinks)
+        @effective_backend = if @backend.is_a?(Backend::ConfiguredAgent)
+                               runner_config.fetch("fallback_agent").fetch("command")
+                             else
+                               runner_config.fetch("backend", "claude")
+                             end
         @prompt_template = PromptTemplate.new(runner_config.fetch("prompt_template_path"))
       end
 
@@ -107,7 +112,7 @@ module AgentDaemon
         prompt = render_prompt(item)
         @attempts[key] += 1
         attempt_no = @attempts[key]
-        Log.info("[#{log_tag}] Running #{@runner_config['backend']} for #{key} (attempt #{attempt_no}/#{@max_attempts})")
+        Log.info("[#{log_tag}] Running #{@effective_backend} for #{key} (attempt #{attempt_no}/#{@max_attempts})")
 
         @sinks.publish_event(type: :started, work_item: key, attempt: attempt_no, at: Time.now.utc.iso8601)
         @sinks.publish_state(status: :in_progress, work_item: key, attempt: attempt_no)

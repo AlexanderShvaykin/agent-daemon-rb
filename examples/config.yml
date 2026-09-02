@@ -58,6 +58,13 @@ runners:
     # agent: null              # pass no --agent at all (both backends)
     # claude:                  # optional, "claude" backend only
     #   model: haiku           # --model flag; omit to let the CLI choose
+    # Optional operator-controlled alternative for this Claude runner. At
+    # backend construction time, exact FALLBACK_AGENT=1 selects this command;
+    # every other value keeps Claude. Each token and the final rendered prompt
+    # are shell-escaped independently. Ignored for OpenCode runners.
+    # fallback_agent:
+    #   command: omp
+    #   args: [--print, --auto-approve, --model, gpt-5.3-codex]
     # Same optional, human-only pair as at the top of this file, scoped to this
     # one runner. Shown in the console next to this runner's name; note that
     # every runner key is also a prompt variable, so `{{description}}` works in

@@ -132,7 +132,11 @@ the originating thread (see [Transports](#transports)).
 ## Backends
 
 `Backend.for(runner_config, ...)` is a factory that returns the correct
-subclass based on the `backend` key (`"claude"` or `"opencode"`).
+subclass based on the `backend` key (`"claude"` or `"opencode"`). For a Claude
+runner with a valid `fallback_agent` block, exact `FALLBACK_AGENT=1` selects
+`Backend::ConfiguredAgent` when the backend is constructed. Every other
+environment value, a missing block, or an OpenCode runner preserves the normal
+selection. Runner logs name the effective backend command.
 
 ### Backend::Base
 
@@ -168,6 +172,25 @@ Builds: `cd <project_path> && opencode run <prompt> [--agent <agent>] --model <m
 `--agent` follows the same rule as `Backend::Claude`. Requires
 `opencode.model` in the runner config; unlike `claude.model` it is checked at
 command-build time and raises `ArgumentError`, not at config load.
+
+### Backend::ConfiguredAgent
+
+An optional per-runner fallback for Claude scenarios. Its configuration is a
+closed executable-plus-arguments shape:
+
+```yaml
+fallback_agent:
+  command: omp
+  args: [--print, --auto-approve, --model, gpt-5.3-codex]
+```
+
+Configuration loading requires a non-blank String `command`, an `args` Array
+containing only Strings, and no keys other than `command` and `args`. The
+backend builds `cd <project_path> && <command> <args...> <prompt>`, shell-escaping
+every token independently and always placing the rendered prompt last. It
+inherits timeout, output, cancellation, shutdown, and process-group handling
+unchanged from `Backend::Base`; it is selection, not an automatic retry after a
+Claude failure.
 
 ## Messenger
 
@@ -317,6 +340,8 @@ Config loading fails immediately with descriptive errors when:
 - Trigger-specific required keys are missing (e.g. a `mattermost` trigger
   requires `base_url`, `token`, `team`, and a non-empty `channels` list).
 - A prompt template file does not exist on disk.
+- A runner's optional `fallback_agent` is not a Hash with exactly a non-blank
+  String `command` and an `args` Array containing only Strings.
 - A `description` is present but blank or not a String, `support` is not a Hash,
   it carries an unknown key, one of its values is blank, or `support.runbook` is
   not an `http(s)` URL — at either the config or the runner level.

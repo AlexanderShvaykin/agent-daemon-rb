@@ -4,6 +4,7 @@ require "test_helper"
 require "tmpdir"
 require "yaml"
 require "fileutils"
+require "stringio"
 
 class StubBackend
   attr_reader :calls
@@ -48,6 +49,7 @@ end
 
 class TestRunnerTracker < Minitest::Test
   def setup
+    @prior_logger = AgentDaemon::Log.instance_variable_get(:@logger)
     @tmpdir = Dir.mktmpdir
     @project_path = File.join(@tmpdir, "project")
     @message_dir = File.join(@project_path, "to_message")
@@ -74,6 +76,8 @@ class TestRunnerTracker < Minitest::Test
   end
 
   def teardown
+    AgentDaemon::Log.instance_variable_set(:@logger, @prior_logger)
+    AgentDaemon::Log.clear_context
     FileUtils.remove_entry(@tmpdir)
   end
 
@@ -91,11 +95,56 @@ class TestRunnerTracker < Minitest::Test
     runner.instance_variable_get(:@attempts)
   end
 
+  def capture_runner_log
+    prior = AgentDaemon::Log.instance_variable_get(:@logger)
+    io = StringIO.new
+    logger = ::Logger.new(io)
+    logger.level = ::Logger::INFO
+    logger.formatter = proc { |_severity, _datetime, _progname, msg| "#{msg}\n" }
+    AgentDaemon::Log.use(logger)
+    yield
+    io.string
+  ensure
+    AgentDaemon::Log.instance_variable_set(:@logger, prior)
+  end
+
+  def with_fallback_agent(value)
+    prior = ENV["FALLBACK_AGENT"]
+    ENV["FALLBACK_AGENT"] = value
+    yield
+  ensure
+    prior.nil? ? ENV.delete("FALLBACK_AGENT") : ENV["FALLBACK_AGENT"] = prior
+  end
+
   def test_first_attempt_increments_and_runs
     runner = build_runner([:ok])
     backend = runner.instance_variable_get(:@backend)
     runner.send(:process_item, { "key" => "TI-1" })
     assert_equal 1, backend.calls
+  end
+
+  def test_enabled_fallback_logs_the_effective_command
+    @runner_config["fallback_agent"] = { "command" => "omp", "args" => ["--print"] }
+
+    log = with_fallback_agent("1") do
+      capture_runner_log do
+        build_runner([:ok]).send(:process_item, { "key" => "TI-LOG-FALLBACK" })
+      end
+    end
+
+    assert_includes log, "[Runner default] Running omp for TI-LOG-FALLBACK (attempt 1/3)"
+  end
+
+  def test_disabled_fallback_logs_the_primary_claude_backend
+    @runner_config["fallback_agent"] = { "command" => "omp", "args" => ["--print"] }
+
+    log = with_fallback_agent("0") do
+      capture_runner_log do
+        build_runner([:ok]).send(:process_item, { "key" => "TI-LOG-PRIMARY" })
+      end
+    end
+
+    assert_includes log, "[Runner default] Running claude for TI-LOG-PRIMARY (attempt 1/3)"
   end
 
   def test_ok_removes_counter

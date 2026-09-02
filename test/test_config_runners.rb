@@ -408,6 +408,65 @@ class TestConfigRunners < Minitest::Test
     end
   end
 
+  def test_accepts_valid_fallback_agent
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      fallback = { "command" => "omp", "args" => ["--print", "--model", "gpt"] }
+      path = write_config(dir, base_config(project_path, [tracker_runner("fallback_agent" => fallback)]))
+
+      assert_equal fallback, AgentDaemon::Config.new(path).runners.first["fallback_agent"]
+    end
+  end
+
+  def test_rejects_non_hash_fallback_agent
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      path = write_config(dir, base_config(project_path, [tracker_runner("fallback_agent" => "omp")]))
+
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      assert_includes err.message, 'runner "default": fallback_agent must be a Hash'
+    end
+  end
+
+  def test_rejects_invalid_fallback_command
+    [nil, "", "   ", 42].each do |command|
+      Dir.mktmpdir do |dir|
+        project_path = with_project(dir)
+        fallback = { "command" => command, "args" => [] }
+        path = write_config(dir, base_config(project_path, [tracker_runner("fallback_agent" => fallback)]))
+
+        err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+        assert_includes err.message, 'runner "default": fallback_agent.command must be a non-empty String'
+      end
+    end
+  end
+
+  def test_rejects_invalid_fallback_args
+    [nil, "--print", ["--print", 42]].each do |args|
+      Dir.mktmpdir do |dir|
+        project_path = with_project(dir)
+        fallback = { "command" => "omp", "args" => args }
+        path = write_config(dir, base_config(project_path, [tracker_runner("fallback_agent" => fallback)]))
+
+        err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+        assert_includes err.message, 'runner "default": fallback_agent.args must be an Array of Strings'
+      end
+    end
+  end
+
+  def test_rejects_unknown_fallback_keys_and_aggregates_other_errors
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      fallback = { "command" => "", "args" => "--print", "model" => "gpt" }
+      path = write_config(dir, base_config(project_path, [tracker_runner("fallback_agent" => fallback)]))
+
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      assert_includes err.message, "fallback_agent has unknown key(s) model"
+      assert_includes err.message, "fallback_agent.command must be a non-empty String"
+      assert_includes err.message, "fallback_agent.args must be an Array of Strings"
+    end
+  end
+
   # opencode.model stays a runtime check inside the backend — the asymmetry
   # with claude.model is deliberate, and this change does not touch it.
   def test_opencode_runner_without_a_model_loads_and_fails_at_command_build

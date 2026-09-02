@@ -16,7 +16,8 @@ module AgentDaemon
       name = runner_config.fetch("backend", "claude")
       case name
       when "claude"
-        Claude.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path, sinks: sinks, cancel_flag: cancel_flag)
+        klass = ENV["FALLBACK_AGENT"] == "1" && runner_config["fallback_agent"] ? ConfiguredAgent : Claude
+        klass.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path, sinks: sinks, cancel_flag: cancel_flag)
       when "opencode"
         OpenCode.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path, sinks: sinks, cancel_flag: cancel_flag)
       else

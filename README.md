@@ -79,6 +79,7 @@ Stop with `Ctrl+C` or `kill <pid>` -- graceful shutdown waits for current iterat
 | `prompt_template` | Path to prompt template file, relative to config directory (required) |
 | `backend` | `claude` (default) or `opencode` |
 | `agent` | Agent name passed to the CLI (default: `task-analyst`) |
+| `fallback_agent` | Optional `{command, args}` fallback for a Claude runner |
 | `timeout` | Backend execution timeout in seconds (default: `1200`) |
 | `max_attempts` | Retries before giving up on a task (default: `3`) |
 | `extra_flags` | Additional CLI flags passed to the backend |
@@ -119,6 +120,20 @@ Files are moved to `archive_dir` on success or `failed_dir` after `max_attempts`
 - **opencode** -- Invokes OpenCode CLI (`opencode`) with the same flags
 
 Both backends `cd` into `project_path` and pass `--add-dir` for `message_dir` and `output_dir`.
+
+A Claude runner may configure an operator-controlled fallback command:
+
+```yaml
+fallback_agent:
+  command: omp
+  args: [--print, --auto-approve, --model, gpt-5.3-codex]
+```
+
+When the daemon constructs that runner's backend, the exact environment value
+`FALLBACK_AGENT=1` selects the fallback. Unset values and every other value keep
+Claude unchanged; runners without the block and all OpenCode runners also keep
+their primary backend. The daemon executes `command`, then each configured
+argument, then the rendered prompt as one final shell-escaped argument.
 
 ## Prompt Templates
 

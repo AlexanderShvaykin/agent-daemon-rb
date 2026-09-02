@@ -356,6 +356,16 @@ end
 class TestBackendFactory < Minitest::Test
   def setup
     @shutdown = TestShutdownFlag.new
+    @original_fallback_agent = ENV["FALLBACK_AGENT"]
+    ENV.delete("FALLBACK_AGENT")
+  end
+
+  def teardown
+    if @original_fallback_agent
+      ENV["FALLBACK_AGENT"] = @original_fallback_agent
+    else
+      ENV.delete("FALLBACK_AGENT")
+    end
   end
 
   def test_factory_builds_claude_by_default
@@ -376,6 +386,119 @@ class TestBackendFactory < Minitest::Test
       project_path: "/tmp/proj"
     )
     assert_instance_of AgentDaemon::Backend::OpenCode, backend
+  end
+
+  def test_factory_builds_configured_agent_for_claude_when_exactly_enabled
+    ENV["FALLBACK_AGENT"] = "1"
+
+    backend = factory_backend("backend" => "claude", "fallback_agent" => fallback_config)
+
+    assert_instance_of AgentDaemon::Backend::ConfiguredAgent, backend
+  end
+
+  def test_factory_builds_configured_agent_when_backend_key_is_omitted
+    ENV["FALLBACK_AGENT"] = "1"
+
+    backend = factory_backend("fallback_agent" => fallback_config)
+
+    assert_instance_of AgentDaemon::Backend::ConfiguredAgent, backend
+  end
+
+  def test_factory_keeps_claude_for_every_other_environment_value
+    [nil, "", "0", "true", "01"].each do |value|
+      value ? ENV["FALLBACK_AGENT"] = value : ENV.delete("FALLBACK_AGENT")
+
+      assert_instance_of AgentDaemon::Backend::Claude,
+                         factory_backend("backend" => "claude", "fallback_agent" => fallback_config),
+                         "expected primary backend for FALLBACK_AGENT=#{value.inspect}"
+    end
+  end
+
+  def test_factory_keeps_claude_when_enabled_without_fallback_config
+    ENV["FALLBACK_AGENT"] = "1"
+
+    assert_instance_of AgentDaemon::Backend::Claude, factory_backend("backend" => "claude")
+  end
+
+  def test_factory_ignores_fallback_for_opencode
+    ENV["FALLBACK_AGENT"] = "1"
+
+    backend = factory_backend("backend" => "opencode", "fallback_agent" => fallback_config)
+
+    assert_instance_of AgentDaemon::Backend::OpenCode, backend
+  end
+
+  def test_only_configured_claude_runners_select_fallback
+    ENV["FALLBACK_AGENT"] = "1"
+
+    backends = [
+      factory_backend("name" => "configured", "backend" => "claude", "fallback_agent" => fallback_config),
+      factory_backend("name" => "primary", "backend" => "claude"),
+      factory_backend("name" => "opencode", "backend" => "opencode", "fallback_agent" => fallback_config)
+    ]
+
+    assert_equal [AgentDaemon::Backend::ConfiguredAgent, AgentDaemon::Backend::Claude,
+                  AgentDaemon::Backend::OpenCode], backends.map(&:class)
+  end
+
+  def test_configured_agent_shell_escapes_each_token_and_appends_prompt_last
+    ENV["FALLBACK_AGENT"] = "1"
+    backend = factory_backend(
+      "backend" => "claude",
+      "fallback_agent" => {
+        "command" => "/tmp/My Agent/omp",
+        "args" => ["--label", "two words", "$(touch /tmp/not-created)"]
+      }
+    )
+    prompt = "hello; touch /tmp/not-created either"
+
+    command = backend.send(:build_command, prompt)
+    invocation = command.split(" && ", 2).last
+
+    assert_equal ["/tmp/My Agent/omp", "--label", "two words", "$(touch /tmp/not-created)", prompt],
+                 Shellwords.split(invocation)
+    assert_equal prompt, Shellwords.split(invocation).last
+  end
+
+  def test_configured_agent_executes_prompt_as_one_final_argument
+    ENV["FALLBACK_AGENT"] = "1"
+    prompt = "two words; printf injected"
+    backend = factory_backend(
+      "backend" => "claude",
+      "fallback_agent" => {
+        "command" => RbConfig.ruby,
+        "args" => ["-e", "STDOUT.write(ARGV.inspect)", "fixed argument"]
+      },
+      project_path: Dir.tmpdir
+    )
+
+    result = backend.run(prompt)
+
+    assert_equal :ok, result.reason
+    assert_equal ["fixed argument", prompt].inspect, result.stdout
+  end
+
+  def test_configured_agent_receives_all_lifecycle_dependencies
+    ENV["FALLBACK_AGENT"] = "1"
+    cancel = TestShutdownFlag.new
+    sinks = AgentDaemon::Sinks::Bundle.null("configured")
+    runner = { "name" => "r", "backend" => "claude", "fallback_agent" => fallback_config }
+
+    backend = AgentDaemon::Backend.for(
+      runner,
+      @shutdown,
+      message_dir: "/tmp/msg",
+      project_path: "/tmp/proj",
+      sinks: sinks,
+      cancel_flag: cancel
+    )
+
+    assert_same runner, backend.instance_variable_get(:@runner_config)
+    assert_same @shutdown, backend.instance_variable_get(:@shutdown_flag)
+    assert_equal "/tmp/msg", backend.instance_variable_get(:@message_dir)
+    assert_equal "/tmp/proj", backend.instance_variable_get(:@project_path)
+    assert_same sinks, backend.instance_variable_get(:@sinks)
+    assert_same cancel, backend.instance_variable_get(:@cancel_flag)
   end
 
   def test_factory_forwards_cancel_flag
@@ -456,6 +579,19 @@ class TestBackendFactory < Minitest::Test
                              "agent" => "task-analyst", "opencode" => { "model" => "gpt" })
   end
 
+  def test_disabled_fallback_keeps_primary_claude_command_byte_identical
+    ENV["FALLBACK_AGENT"] = "0"
+    backend = factory_backend(
+      "backend" => "claude",
+      "agent" => "task-analyst",
+      "extra_flags" => "",
+      "fallback_agent" => fallback_config
+    )
+
+    assert_instance_of AgentDaemon::Backend::Claude, backend
+    assert_equal CLAUDE_BASELINE, backend.send(:build_command, "hello")
+  end
+
   def test_claude_command_omits_agent_when_explicitly_null
     refute_includes command_for(AgentDaemon::Backend::Claude, "agent" => nil), "--agent"
   end
@@ -482,6 +618,19 @@ class TestBackendFactory < Minitest::Test
   end
 
   private
+
+  def fallback_config
+    { "command" => "omp", "args" => ["--print", "--auto-approve"] }
+  end
+
+  def factory_backend(project_path: "/tmp/proj", **config)
+    AgentDaemon::Backend.for(
+      { "name" => "r" }.merge(config),
+      @shutdown,
+      message_dir: "/tmp/msg",
+      project_path: project_path
+    )
+  end
 
   def command_for(klass, runner_config = {})
     backend = klass.new(
