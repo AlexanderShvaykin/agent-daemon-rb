@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.14.0] - 2026-09-02
+
+### Added
+- Optional per-runner `fallback_agent` configuration for Claude runners. Exact process-wide `FALLBACK_AGENT=1` selects each configured fallback when the backend is constructed; this is startup-time selection, not an automatic retry after Claude fails. Other values, runners without the block, and OpenCode runners keep their existing backend.
+- The fallback runs from `project_path` and receives its required `command`, every String in required `args` (an empty Array is valid), and the rendered prompt as one final shell-escaped argument. All OMP options, including permissions, model, agent, and extra directories, must be declared explicitly in `args`; Claude-generated flags are not inherited.
+- Configured fallbacks reuse the existing timeout, output, cooperative cancellation, shutdown, and process-group lifecycle. Runner logs report the effective executable.
+
+### Changed
+- `fallback_agent` is validated eagerly as a closed `{command, args}` shape. Unknown keys, a blank/non-String command, and non-String arguments are rejected while configurations without the block remain backward compatible.
+
 ## [0.13.0] - 2026-08-19
 
 ### Added
