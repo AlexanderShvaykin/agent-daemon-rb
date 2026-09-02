@@ -81,10 +81,12 @@ class TestRunnerTracker < Minitest::Test
     FileUtils.remove_entry(@tmpdir)
   end
 
-  def build_runner(reasons, tracker_stub: nil)
+  def build_runner(reasons, tracker_stub: nil, cancel_flag: nil)
+    options = {}
+    options[:cancel_flag] = cancel_flag if cancel_flag
     runner = AgentDaemon::Runner::Tracker.new(
       @runner_config, @message_dir, @project_path, StubShutdown.new,
-      { "token" => "t", "org_id" => "o" }
+      { "token" => "t", "org_id" => "o" }, **options
     )
     runner.instance_variable_set(:@backend, StubBackend.new(reasons))
     runner.instance_variable_set(:@tracker, tracker_stub) if tracker_stub
@@ -147,6 +149,17 @@ class TestRunnerTracker < Minitest::Test
     assert_includes log, "[Runner default] Running claude for TI-LOG-PRIMARY (attempt 1/3)"
   end
 
+  def test_forwards_cancel_flag_to_backend
+    token = Struct.new(:value).new(false)
+    runner = AgentDaemon::Runner::Tracker.new(
+      @runner_config, @message_dir, @project_path, StubShutdown.new,
+      { "token" => "t", "org_id" => "o" }, cancel_flag: token
+    )
+
+    assert_same token, runner.instance_variable_get(:@cancel_flag)
+    assert_same token, runner.instance_variable_get(:@backend).instance_variable_get(:@cancel_flag)
+  end
+
   def test_ok_removes_counter
     runner = build_runner([:ok])
     runner.send(:process_item, { "key" => "TI-2" })
@@ -160,9 +173,26 @@ class TestRunnerTracker < Minitest::Test
   end
 
   def test_killed_rolls_back_counter
-    runner = build_runner([:killed])
+    token = Struct.new(:value).new(true)
+    runner = build_runner([:killed], cancel_flag: token)
     runner.send(:process_item, { "key" => "TI-5" })
+    assert attempts(runner).key?("TI-5"), "positive control: the issue must have been attempted"
     assert_equal 0, attempts(runner)["TI-5"]
+    assert_operator attempts(runner)["TI-5"], :>=, 0
+  end
+
+  def test_killed_issue_is_returned_by_the_ordinary_query_again
+    issue = {"key" => "TI-9"}
+    tracker = Object.new
+    tracker.define_singleton_method(:search_issues) { |_query| [issue] }
+    token = Struct.new(:value).new(true)
+    runner = build_runner([:killed], tracker_stub: tracker, cancel_flag: token)
+
+    first = runner.send(:fetch_work_items).first
+    runner.send(:process_item, first)
+
+    assert_equal [issue], runner.send(:fetch_work_items)
+    assert_equal 0, attempts(runner)["TI-9"]
   end
 
   def test_exhausted_skips_backend

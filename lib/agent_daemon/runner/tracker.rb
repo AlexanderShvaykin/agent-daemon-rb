@@ -5,8 +5,8 @@ require_relative "base"
 module AgentDaemon
   module Runner
     class Tracker < Base
-      def initialize(runner_config, message_dir, project_path, shutdown_flag, tracker_config, sinks: nil)
-        super(runner_config, message_dir, project_path, shutdown_flag, sinks: sinks)
+      def initialize(runner_config, message_dir, project_path, shutdown_flag, tracker_config, sinks: nil, cancel_flag: nil)
+        super(runner_config, message_dir, project_path, shutdown_flag, sinks: sinks, cancel_flag: cancel_flag)
         @query = runner_config.fetch("trigger").fetch("query")
         @tracker = ::AgentDaemon::Tracker.new(tracker_config)
       end

@@ -283,13 +283,14 @@ class TestSinksRunnerIntegration < Minitest::Test
     FileUtils.remove_entry(@tmpdir)
   end
 
-  def build_runner(reasons, sinks: nil, shutdown: nil)
+  def build_runner(reasons, sinks: nil, shutdown: nil, cancel_flag: nil)
     shutdown ||= SinksPredicateShutdown.new { false }
-    runner = if sinks
-      AgentDaemon::Runner::File.new(@runner_config, @message_dir, @project_path, shutdown, sinks: sinks)
-    else
-      AgentDaemon::Runner::File.new(@runner_config, @message_dir, @project_path, shutdown)
-    end
+    options = {}
+    options[:cancel_flag] = cancel_flag if cancel_flag
+    options[:sinks] = sinks if sinks
+    # An empty `options` splats to nothing, so the no-kwargs construction the
+    # standalone/NFR5 assertions rely on is still what happens by default.
+    runner = AgentDaemon::Runner::File.new(@runner_config, @message_dir, @project_path, shutdown, **options)
     runner.instance_variable_set(:@backend, SinksStubBackend.new(reasons))
     runner
   end
@@ -341,6 +342,48 @@ class TestSinksRunnerIntegration < Minitest::Test
     recorder.calls.each { |entity_id, _| assert_same identity, entity_id }
   end
 
+  def test_cancelled_item_does_not_publish_waiting_after_finished
+    path = write_work_item
+    recorder = RecordingSink.new
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: "ent-1", state: recorder, event: recorder)
+    cancel_flag = SinksPredicateShutdown.new { true }
+    runner = build_runner([:killed], sinks: bundle, cancel_flag: cancel_flag)
+
+    runner.send(:process_item, path)
+
+    payloads = recorder.calls.map(&:last)
+    finished_index = payloads.index { |payload| payload[:type] == :finished }
+    refute_nil finished_index, "positive control: the killed run must publish finished"
+    refute payloads.drop(finished_index + 1).any? { |payload| payload[:status] == :waiting }
+  end
+
+  def test_cancelled_run_does_not_publish_stopped
+    recorder = RecordingSink.new
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: "ent-1", state: recorder, event: recorder)
+    cancel_flag = SinksPredicateShutdown.new { true }
+    runner = build_runner([], sinks: bundle, cancel_flag: cancel_flag)
+
+    runner.run
+
+    assert_equal [{status: :waiting}], recorder.calls.map(&:last)
+  end
+
+  def test_shutdown_wins_over_cancel_for_terminal_state_publishes
+    path = write_work_item
+    recorder = RecordingSink.new
+    bundle = AgentDaemon::Sinks::Bundle.new(entity_id: "ent-1", state: recorder, event: recorder)
+    shutdown = SinksPredicateShutdown.new { true }
+    cancel_flag = SinksPredicateShutdown.new { true }
+    runner = build_runner([:killed], sinks: bundle, shutdown: shutdown, cancel_flag: cancel_flag)
+
+    runner.send(:process_item, path)
+    runner.run
+
+    states = recorder.calls.map(&:last).select { |payload| payload.key?(:status) }
+    assert_includes states, {status: :waiting}
+    assert_equal({status: :stopped}, states.last)
+  end
+
   def test_raising_sinks_never_break_item_processing
     path = write_work_item
     raising = RaisingSink.new
@@ -356,6 +399,13 @@ class TestSinksRunnerIntegration < Minitest::Test
   def test_default_constructed_runner_processes_item_without_sinks_kwarg
     path = write_work_item
     runner = build_runner([:ok])
+
+    assert_nil runner.instance_variable_get(:@cancel_flag)
+    assert_nil runner.instance_variable_get(:@backend).instance_variable_get(:@cancel_flag)
+    refute runner.send(:stopping?)
+
+    stopped_runner = build_runner([], shutdown: SinksPredicateShutdown.new { true })
+    assert stopped_runner.send(:stopping?)
 
     runner.send(:process_item, path)
 

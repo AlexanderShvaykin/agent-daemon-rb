@@ -20,9 +20,10 @@ module AgentDaemon
       end
     end
 
-    def initialize(config, shutdown_flag, sinks: nil)
+    def initialize(config, shutdown_flag, sinks: nil, cancel_flag: nil)
       @config = config
       @shutdown_flag = shutdown_flag
+      @cancel_flag = cancel_flag
       @sinks = sinks || Sinks::Bundle.null("messenger")
       @messenger_config = config.messenger
       @transport = Transport.for(@messenger_config)
@@ -33,12 +34,12 @@ module AgentDaemon
       Log.info("[Messenger] Thread started")
       @sinks.publish_state(status: :running)
 
-      until @shutdown_flag.value
+      until stopping?
         iterate
         wait_interval
       end
 
-      @sinks.publish_state(status: :stopped)
+      @sinks.publish_state(status: :stopped) unless cancelling?
       Log.info("[Messenger] Thread stopping gracefully")
     end
 
@@ -51,7 +52,7 @@ module AgentDaemon
       Log.info("[Messenger] Found #{files.size} message(s) to send")
 
       files.each do |file|
-        break if @shutdown_flag.value
+        break if stopping?
         process_file(file)
       end
     rescue => e
@@ -108,10 +109,18 @@ module AgentDaemon
     def wait_interval
       interval = @messenger_config["interval"]
       elapsed = 0
-      while elapsed < interval && !@shutdown_flag.value
+      while elapsed < interval && !stopping?
         sleep(1)
         elapsed += 1
       end
+    end
+
+    def stopping?
+      @shutdown_flag.value || @cancel_flag&.value
+    end
+
+    def cancelling?
+      @cancel_flag&.value && !@shutdown_flag.value
     end
   end
 end

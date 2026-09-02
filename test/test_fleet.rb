@@ -79,6 +79,7 @@ class TestFleet < Minitest::Test
       in_progress: :alive,
       running: :alive,
       crashed: :restarting,
+      restart_requested: :restarting,
       exited: :dead,
       stopped: :dead
     }
@@ -268,6 +269,20 @@ class TestFleet < Minitest::Test
 
     assert entry.stuck_restarting
     assert_equal 66, entry.seconds_since_published
+  end
+
+  def test_stuck_restarting_uses_the_injected_warning_margin
+    id = runner_identity("wf", "flaky")
+    @registry.publish(id, { status: :crashed, generation: 1 })
+    published_at = @registry.snapshot(id).fetch(:observed_monotonic)
+    roster = [Rostered.new(kind: :runner, workflow: "wf", name: "flaky", entity_id: id)]
+    before = Fleet.new(roster: roster, state_registry: @registry, restart_delay: 60,
+                       restart_warning_margin: 10, clock: -> { published_at + 70 })
+    after = Fleet.new(roster: roster, state_registry: @registry, restart_delay: 60,
+                      restart_warning_margin: 10, clock: -> { published_at + 71 })
+
+    refute before.entries.first.stuck_restarting
+    assert after.entries.first.stuck_restarting
   end
 
   def test_stuck_restarting_is_false_for_an_in_progress_entity_of_any_age

@@ -814,6 +814,70 @@ class TestConsoleAuth < Minitest::Test
     assert_equal 1, @app.calls.size, "the expired request must not reach the app"
   end
 
+  def test_an_expired_session_restart_post_never_reaches_the_app_and_returns_to_a_page
+    _response, _pending_id, session_id = login!
+    csrf = @sessions.fetch(session_id).csrf_token
+    assert_equal 200, @stack.post(
+      "/restart",
+      with_cookie(session_id).merge(params: { "_csrf" => csrf, "id" => "runner:wf:alpha" })
+    ).status
+
+    @clock.advance(TTL)
+    response = @stack.post(
+      "/restart",
+      with_cookie(session_id).merge(params: { "_csrf" => csrf, "id" => "runner:wf:alpha" })
+    )
+
+    assert_equal 302, response.status
+    assert_equal "/auth/login?return_to=%2F", response.headers["location"]
+    assert_equal 1, @app.calls.size, "the expired restart must not reach the control boundary"
+  end
+
+  def test_a_membership_revoked_session_restart_post_never_reaches_the_app
+    _response, _pending_id, session_id = login!
+    page = @stack.get("/", with_cookie(session_id))
+    assert_equal 200, page.status
+    authorization = @app.calls.last.fetch(:authorization)
+
+    @gitlab.groups = ["unrelated"]
+    @clock.advance(Auth::GROUP_RECHECK_INTERVAL)
+    refute authorization.call
+    calls_before_restart = @app.calls.size
+
+    response = @stack.post("/restart", with_cookie(session_id).merge(params: { "_csrf" => "stale" }))
+
+    assert_equal 302, response.status
+    assert_equal "/auth/login?return_to=%2F", response.headers["location"]
+    assert_equal calls_before_restart, @app.calls.size
+  end
+
+  def test_viewer_and_operator_group_members_both_reach_the_restart_route
+    { viewer: "backoffice", operator: "platform/sre" }.each do |role, group|
+      fresh_stack!
+      @gitlab.groups = [group]
+      _response, _pending_id, session_id = login!
+      csrf = @sessions.fetch(session_id).csrf_token
+
+      response = @stack.post(
+        "/restart",
+        with_cookie(session_id).merge(params: { "_csrf" => csrf, "id" => "runner:wf:alpha" })
+      )
+
+      assert_equal 200, response.status, "#{role} must not be action-gated"
+      assert_equal "/restart", @app.calls.last.fetch(:path)
+
+      # The stronger half of FR15's v1 posture: a role gate cannot be added
+      # inside App#restart by accident, because the role never crosses this
+      # boundary. PublicSession carries a username and a CSRF token and
+      # nothing else, so gating on a role would first have to widen the
+      # struct — a deliberate act, not a slip.
+      forwarded = @app.calls.last.fetch(:session)
+
+      assert_equal %i[username csrf_token], forwarded.members
+      refute_respond_to forwarded, :role
+    end
+  end
+
   # --- responses -----------------------------------------------------------
 
   def test_denial_bodies_never_echo_user_input

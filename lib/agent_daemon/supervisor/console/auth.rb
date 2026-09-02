@@ -56,7 +56,7 @@ module AgentDaemon
         # land on a dead end; /events is the SSE endpoint, so returning there
         # drops the browser on a raw text/event-stream instead of a page —
         # and an expired stream's own redirect carries exactly that path.
-        NON_RETURN_PATHS = [LOGIN_PATH, CALLBACK_PATH, LOGOUT_PATH, "/events"].freeze
+        NON_RETURN_PATHS = [LOGIN_PATH, CALLBACK_PATH, LOGOUT_PATH, "/events", "/restart"].freeze
 
         STATE_BYTES = 32
         GROUP_RECHECK_INTERVAL = 60

@@ -175,11 +175,17 @@ class TestSupervisorShutdown < Minitest::Test
 
   # Blocks until the process group is gone, so the assertion does not race the
   # child's reap — Process.kill(0, ...) succeeds against a not-yet-reaped zombie.
+  #
+  # EPERM is accepted alongside ESRCH for the same reason test_backend_execute
+  # accepts it: once our group is reaped its gid can be recycled by a group
+  # another user owns, and the probe then reports EPERM instead of ESRCH. It
+  # is a deliberate, narrow loosening — a group WE still own always answers
+  # signal 0 successfully, so a genuinely surviving agent still fails here.
   def assert_process_group_reaped(pid)
     100.times do
       Process.kill(0, -pid)
       sleep(0.05)
-    rescue Errno::ESRCH
+    rescue Errno::ESRCH, Errno::EPERM
       return pass
     end
     flunk("process group #{pid} still alive after the sweep")
@@ -251,8 +257,8 @@ class TestSupervisorShutdown < Minitest::Test
       # Stub the runner entities: a real Runner::Tracker would issue a live
       # request to api.tracker.yandex.net on its first iterate.
       factories = master.instance_variable_get(:@entity_factories)
-      factories[:"runner:wfA:a"] = ->(_bundle) { CooperativeStub.new(flag) }
-      factories[:"runner:wfB:b"] = ->(_bundle) { CooperativeStub.new(flag) }
+      factories[:"runner:wfA:a"] = ->(_bundle, _cancel_token = nil) { CooperativeStub.new(flag) }
+      factories[:"runner:wfB:b"] = ->(_bundle, _cancel_token = nil) { CooperativeStub.new(flag) }
 
       master.send(:build_supervisors)
       master.send(:start_supervisors)
@@ -278,7 +284,7 @@ class TestSupervisorShutdown < Minitest::Test
       master.send(:build_factories)
       flag = master.instance_variable_get(:@shutdown_flag)
       master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] =
-        ->(_bundle) { CooperativeStub.new(flag) }
+        ->(_bundle, _cancel_token = nil) { CooperativeStub.new(flag) }
 
       driver = Thread.new do
         sleep(0.05) until master.instance_variable_get(:@supervisors).any?
@@ -307,7 +313,7 @@ class TestSupervisorShutdown < Minitest::Test
       master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
       master.send(:build_factories)
       flag = master.instance_variable_get(:@shutdown_flag)
-      master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] = ->(_bundle) { CooperativeStub.new(flag) }
+      master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] = ->(_bundle, _cancel_token = nil) { CooperativeStub.new(flag) }
 
       master.send(:build_supervisors)
       master.send(:start_supervisors)
@@ -329,7 +335,7 @@ class TestSupervisorShutdown < Minitest::Test
 
       master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 0.2)
       master.send(:build_factories)
-      master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] = ->(_bundle) { StuckStub.new }
+      master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] = ->(_bundle, _cancel_token = nil) { StuckStub.new }
 
       master.send(:build_supervisors)
       master.send(:start_supervisors)
@@ -352,7 +358,7 @@ class TestSupervisorShutdown < Minitest::Test
     spawned = 0
     supervisor = AgentDaemon::Supervisor::RunnerSupervisor.new(
       "runner:wf:a",
-      entity_factory: ->(_bundle) { spawned += 1; StuckStub.new },
+      entity_factory: ->(_bundle, _cancel_token = nil) { spawned += 1; StuckStub.new },
       shutdown_flag: flag,
       restart_delay: 0
     )
@@ -411,12 +417,60 @@ class TestSupervisorShutdown < Minitest::Test
     end
   end
 
+  def test_cooperative_kill_via_generation_token_reaps_and_preserves_file
+    with_config([{ name: "wf", runners: [file_runner("f")] }]) do |dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config)
+      master.send(:build_factories)
+      token = AgentDaemon::Supervisor::CancelToken.new
+      runner = master.instance_variable_get(:@entity_factories)
+                     .fetch(:"runner:wf:f")
+                     .call(AgentDaemon::Sinks::Bundle.null, token)
+
+      input_dir = File.join(dir, "proj-wf", "inbox")
+      path = File.join(input_dir, "TASK-1.yml")
+      File.write(path, "body")
+      backend = RecordingSleepBackend.new(
+        30, {}, master.instance_variable_get(:@shutdown_flag),
+        message_dir: File.join(dir, "proj-wf", "to_message"),
+        project_path: File.join(dir, "proj-wf"),
+        cancel_flag: token
+      )
+      runner.instance_variable_set(:@backend, backend)
+      thread = Thread.new { runner.send(:process_item, path) }
+
+      pid = nil
+      30.times do
+        pid = backend.instance_variable_get(:@current_pid)
+        break if pid
+
+        sleep(0.05)
+      end
+      refute_nil pid, "positive control: the subprocess must have started"
+
+      token.set!
+      assert thread.join(5), "runner did not finish its local-cancel path"
+
+      assert_equal :killed, backend.last_result.reason
+      assert_process_group_reaped(pid)
+      attempts = runner.instance_variable_get(:@attempts)
+      assert attempts.key?("TASK-1.yml"), "positive control: the item must have been attempted"
+      assert_equal 0, attempts["TASK-1.yml"]
+      assert_operator attempts["TASK-1.yml"], :>=, 0
+      assert File.exist?(path)
+      refute File.exist?(File.join(input_dir, "archive", "TASK-1.yml"))
+      refute File.exist?(File.join(input_dir, "failed", "TASK-1.yml"))
+    ensure
+      backend&.kill_current_process_group
+      thread&.join(1)
+    end
+  end
+
   def test_sweep_kills_wedged_backend_after_join_timeout
     with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |dir, config|
       master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 0.2)
       master.send(:build_factories)
       stub = WedgedRunnerStub.new(File.join(dir, "wedged"))
-      master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] = ->(_bundle) { stub }
+      master.instance_variable_get(:@entity_factories)[:"runner:wf:a"] = ->(_bundle, _cancel_token = nil) { stub }
 
       master.send(:build_supervisors)
       master.send(:start_supervisors)

@@ -46,7 +46,7 @@ module AgentDaemon
       # (the value Sinks::Bundle stamps on every publish and therefore what
       # keys the registry), not a rebuilt copy. doc is the entity's own Doc, or
       # nil — messenger and reactor rows never carry one.
-      Rostered = Struct.new(:kind, :workflow, :name, :entity_id, :doc, keyword_init: true)
+      Rostered = Struct.new(:kind, :workflow, :name, :entity_id, :doc, :trigger_type, keyword_init: true)
 
       # A rostered entity joined with its current registry state (or none).
       # The first five members and :id, :generation, :work_item, :attempt,
@@ -60,7 +60,7 @@ module AgentDaemon
       Entry = Struct.new(:kind, :workflow, :name, :status, :liveness,
                           :id, :entity_id, :generation, :work_item, :attempt,
                           :observed_at, :seconds_since_published, :stuck_restarting,
-                          :doc,
+                          :doc, :trigger_type,
                           keyword_init: true)
 
       # Maps a snapshot's raw published :status to a three-way liveness. A
@@ -72,14 +72,10 @@ module AgentDaemon
         in_progress: :alive, # Runner::Base, mid-item
         running: :alive, # Messenger#run, Mattermost::Reactor#run
         crashed: :restarting, # supervisor-published; auto-restart pending
-        # supervisor-published clean terminal exit — NOT auto-restarted
-        # (FR3). Correct as `:dead` for Epic 2 only: Epic 1's sole
-        # restart-intent producer (:crash_auto) fires on an already-dead
-        # thread, so the respawn-intent path (tick_stopping) never publishes
-        # :exited today. Epic 4 adds the first producer that queues a
-        # restart intent against a LIVE entity and must publish a distinct
-        # status when it does, or a runner mid-restart will render `dead`
-        # the instant an operator presses Restart (epics.md:499-502).
+        restart_requested: :restarting, # accepted intent; cooperative stop pending
+        # A clean terminal exit remains `:dead`; an accepted restart publishes
+        # the distinct `:restart_requested` status above, so it never renders
+        # as dead while turnover is pending (epics.md:218).
         exited: :dead,
         stopped: :dead # graceful fleet shutdown
       }.freeze
@@ -108,10 +104,11 @@ module AgentDaemon
       # here rather than copied onto every Entry — it belongs to the group, not
       # to the row, and the console renders it once per workflow heading.
       def initialize(roster:, state_registry:, restart_delay: nil, clock: DEFAULT_CLOCK,
-                     workflow_docs: {})
+                     workflow_docs: {}, restart_warning_margin: RESTART_STUCK_MARGIN)
         @roster = roster.dup.freeze
         @state_registry = state_registry
         @restart_delay = restart_delay
+        @restart_warning_margin = restart_warning_margin
         @clock = clock
         @workflow_docs = workflow_docs.dup.freeze
       end
@@ -182,7 +179,8 @@ module AgentDaemon
           observed_at: snapshot && snapshot[:observed_at],
           seconds_since_published: since_published,
           stuck_restarting: stuck_restarting?(liveness, since_published),
-          doc: rostered.doc
+          doc: rostered.doc,
+          trigger_type: rostered.trigger_type
         )
       end
 
@@ -203,7 +201,7 @@ module AgentDaemon
         return false unless liveness == :restarting
         return false unless @restart_delay && seconds_since_published
 
-        seconds_since_published > @restart_delay + RESTART_STUCK_MARGIN
+        seconds_since_published > @restart_delay + @restart_warning_margin
       end
     end
   end

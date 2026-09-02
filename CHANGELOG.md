@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.13.0] - 2026-08-19
+
+### Added
+- Epic 4 supervisor lifecycle: serialized crash/manual restart intents, per-generation cooperative `CancelToken` propagation across runners, Messenger, and the Mattermost reactor, generation-safe respawn, and ephemeral restart events with actor/request/completion times.
+- Authenticated restart control on every supervised entity's console detail page — runners, Messengers, and the global Mattermost reactor — with an explicit fleet-wide confirmation step for the reactor, restart progress and delay visibility, and a configurable `restart_warning_margin_seconds`. The fleet list keeps its disabled placeholder; the working control lives on the detail page.
+
+### Security
+- `POST /restart` stays behind default-deny session auth, requires constant-time CSRF validation, accepts its id and confirmation flag only from the form body, derives its actor only from the session, and returns the fixed non-disclosing 404 for unknown ids.
+- Every accepted restart emits one `Log.info` line naming the actor and target generation, so a manual restart leaves a record that survives the process.
+- Any member of any `allowed_groups` entry may restart any entity: roles are validated but do not gate actions in v1 (FR15), and that includes the fleet-wide reactor.
+
+### Known limitations
+- Restart activity is bounded and in-memory and does not survive supervisor restart; durable persistence remains Epic 5.
+- The fleet-wide reactor confirmation is a UI step, not an authorization boundary — a client already holding a valid session and CSRF token can post `confirmed=fleet-wide` without visiting the page.
+
 ## [0.12.0] - 2026-08-11
 
 ### Added

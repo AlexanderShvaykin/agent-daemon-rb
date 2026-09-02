@@ -34,7 +34,7 @@ module AgentDaemon
       # a bus hash to a renderer and no unexpected key rides along into the
       # page.
       Entry = Struct.new(:seq, :type, :at, :generation,
-                          :work_item, :attempt, :reason, :actor,
+                          :work_item, :attempt, :reason, :actor, :requested_at,
                           keyword_init: true)
 
       # Read by the console so the section heading advertises the limit this
@@ -69,7 +69,8 @@ module AgentDaemon
           work_item: record[:work_item],
           attempt: record[:attempt],
           reason: record[:reason],
-          actor: record[:actor]
+          actor: record[:actor],
+          requested_at: record[:requested_at]
         )
       end
     end

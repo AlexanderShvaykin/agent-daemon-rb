@@ -32,6 +32,7 @@ module AgentDaemon
           "cache-control" => "no-store"
         }.freeze
         TEXT_HEADERS = { "content-type" => "text/plain; charset=utf-8" }.freeze
+        RESTART_PATH = "/restart"
 
         EM_DASH = "—"
         ELLIPSIS = "…"
@@ -300,6 +301,14 @@ module AgentDaemon
           .liveness-unknown { color: #4b5563; background: #eceff2; }
 
           .status-note { margin: 0.3rem 0 0; color: #425466; }
+
+          .restart-control {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.3rem;
+            margin: 0.75rem 0 0;
+          }
 
           .restart-warning {
             padding: 0.75rem;
@@ -951,11 +960,12 @@ module AgentDaemon
         NO_CURSOR = [nil, nil, nil].freeze
         CURSOR_MAX_DIGITS = 19
 
-        def initialize(fleet:, activity_log:, live_updates:, output_buffers:)
+        def initialize(fleet:, activity_log:, live_updates:, output_buffers:, restart_control: nil)
           @fleet = fleet
           @activity_log = activity_log
           @live_updates = live_updates
           @output_buffers = output_buffers
+          @restart_control = restart_control
         end
 
         def call(env)
@@ -967,6 +977,7 @@ module AgentDaemon
           when "/healthz" then probe(request)
           when "/"        then page_request?(request) ? home(request, env[Auth::SESSION_ENV_KEY]) : not_found
           when "/entity"  then page_request?(request) ? entity_detail(request, env[Auth::SESSION_ENV_KEY]) : not_found
+          when RESTART_PATH then restart(request, env[Auth::SESSION_ENV_KEY])
           when "/events"  then events(request, env)
           else                 not_found
           end
@@ -1011,11 +1022,100 @@ module AgentDaemon
           entry = @fleet.find(id)
           return not_found unless entry
 
-          html(request, layout(session, entity_page(entry)))
+          html(request, layout(session, entity_page(entry, session, restart_target_param(request))))
         end
 
         def page_request?(request)
           request.get? || request.head?
+        end
+
+        def restart(request, session)
+          return restart_confirmation(request, session) if page_request?(request)
+          return method_not_allowed(request) unless request.post?
+
+          body = restart_params(request)
+          supplied = body&.[]("_csrf") || request.get_header("HTTP_X_CSRF_TOKEN")
+          return [403, TEXT_HEADERS.dup, ["forbidden"]] unless matches?(supplied, session&.csrf_token)
+
+          # A missing control is a wiring fault, not an unknown entity: the
+          # detail page renders "Restart unavailable" for exactly this state,
+          # so answering 404 here would send an operator hunting a bad id.
+          return [503, TEXT_HEADERS.dup, ["restart unavailable"]] unless @restart_control
+
+          id = body&.[]("id")
+          return not_found unless id.is_a?(String) && !id.empty?
+
+          entry = @fleet.find(id)
+          return not_found unless entry
+          if entry.kind == :reactor && body["confirmed"] != "fleet-wide"
+            return [303, TEXT_HEADERS.merge("location" => "#{RESTART_PATH}?id=#{Rack::Utils.escape(id)}"), []]
+          end
+
+          # RunnerSupervisor mints requested_at internally; accepting no
+          # timestamp here makes a form-supplied value unable to override it.
+          # The resulting event is intentionally ephemeral until Epic 5.
+          actor = "console:#{session.username}"
+          target_generation = @restart_control.request_restart(id, actor: actor)
+          return not_found if target_generation.nil?
+          return [503, TEXT_HEADERS.dup, ["shutting down"]] if target_generation == :refused
+
+          # The only record of a manual restart that survives the process until
+          # Epic 5's writer lands. Reached only after @fleet.find resolved, so
+          # the id here is a rostered one - AC5 governs unknown ids, which are
+          # answered above and never logged.
+          Log.info("[Console] restart accepted for #{id} by #{actor} -> generation #{target_generation}")
+
+          location = "/entity?id=#{Rack::Utils.escape(id)}&restarting=#{target_generation}"
+          [303, TEXT_HEADERS.merge("location" => location), []]
+        end
+
+        def restart_confirmation(request, session)
+          id = entity_id_param(request)
+          return not_found unless id.is_a?(String)
+
+          entry = @fleet.find(id)
+          return not_found unless entry&.kind == :reactor && @restart_control
+
+          html(request, layout(session, restart_confirmation_page(entry, session)))
+        end
+
+        def restart_confirmation_page(entry, session)
+          entity_href = esc("/entity?id=#{Rack::Utils.escape(entry.id)}")
+          <<~HTML
+            <p><a href="#{entity_href}">&larr; Entity</a></p>
+            <section aria-labelledby="restart-confirmation-heading">
+            <h2 id="restart-confirmation-heading">Confirm fleet-wide Mattermost reactor restart</h2>
+            <p>Every workflow's Mattermost listeners will disconnect and reconnect temporarily.</p>
+            <p>This affects the whole fleet, not only one workflow.</p>
+            <form method="post" action="#{RESTART_PATH}">
+            <input type="hidden" name="_csrf" value="#{esc(session&.csrf_token)}">
+            <input type="hidden" name="id" value="#{esc(entry.id)}">
+            <input type="hidden" name="confirmed" value="fleet-wide">
+            <button id="restart-action" type="submit">Restart fleet-wide reactor</button>
+            </form>
+            <p><a href="#{entity_href}">Cancel</a></p>
+            </section>
+          HTML
+        end
+
+        # POST is read explicitly: unlike entity GETs, the mutation contract
+        # lives only in the form body and must never be overridden by a query.
+        def restart_params(request)
+          request.POST
+        rescue *PARAM_ERRORS
+          nil
+        end
+
+        def matches?(supplied, expected)
+          return false unless supplied.is_a?(String) && !supplied.empty?
+          return false unless expected.is_a?(String) && !expected.empty?
+
+          Rack::Utils.secure_compare(supplied, expected)
+        end
+
+        def method_not_allowed(request)
+          headers = TEXT_HEADERS.merge("allow" => "GET, HEAD, POST")
+          [405, headers, request.head? ? [] : ["method not allowed"]]
         end
 
         def html(request, body)
@@ -1130,6 +1230,13 @@ module AgentDaemon
           id.nil? || id.empty? ? nil : id
         rescue *PARAM_ERRORS
           MALFORMED_PARAM
+        end
+
+        def restart_target_param(request)
+          value = request.GET["restarting"]
+          value if value.is_a?(String) && value.match?(/\A\d{1,10}\z/)
+        rescue *PARAM_ERRORS
+          nil
         end
 
         def not_found
@@ -1273,7 +1380,7 @@ module AgentDaemon
             <div><dt>Liveness</dt><dd>#{liveness_cell(entry.liveness)}</dd></div>
             <div><dt>Note</dt><dd>#{esc(note)}</dd></div>
             </dl>
-            #{restart_placeholder}
+            #{restart_card_placeholder}
             </article></li>
           HTML
         end
@@ -1309,11 +1416,13 @@ module AgentDaemon
           end
         end
 
-        # AC2/AD-13: every supervised entity gets a restart action, disabled
-        # until Epic 4 adds the endpoint. No <form>, no action, no POST
-        # target — a form pointing at a route that does not exist yet is a
-        # 404 waiting to be mistaken for a bug.
-        def restart_placeholder
+        # AC2/AD-13: every supervised entity gets a restart affordance on the
+        # fleet list, and on the list it stays disabled. The endpoint exists as
+        # of Story 4.3, but AC1 scopes the action to the detail page: a live
+        # control per card would put N forms and N CSRF tokens on one page for
+        # an action that wants the diagnostics beside it. The working control
+        # is #detail_restart_control.
+        def restart_card_placeholder
           '<button type="button" disabled>Restart</button>'
         end
 
@@ -1323,7 +1432,7 @@ module AgentDaemon
         # snapshot actually carries one (AC6/AC9: a crashed/exited/stopped
         # snapshot has no work_item field at all, and neither does a
         # messenger/reactor snapshot — the same absence check satisfies both).
-        def entity_page(entry)
+        def entity_page(entry, session, restart_target)
           <<~HTML
             <p><a href="/">&larr; Fleet</a></p>
             <section aria-labelledby="entity-diagnostics-heading">
@@ -1336,12 +1445,58 @@ module AgentDaemon
             #{work_item_rows(entry)}#{restarting_row(entry)}<div><dt>Generation</dt><dd>#{esc(generation_cell(entry.generation))}</dd></div>
             <div><dt>State published</dt><dd>#{esc(entry.observed_at || "never")}</dd></div>
             </dl>
-            #{restart_delayed_warning(entry)}<p>#{restart_placeholder}</p>
+            #{restart_flash(entry, restart_target)}#{restart_delayed_warning(entry)}#{detail_restart_control(entry, session)}
             #{STALENESS_NOTE}
             </section>
             #{doc_sections(entry)}#{activity_section(entry)}
             #{terminal_section(entry)}
           HTML
+        end
+
+        # The target arrives in the query string, which makes it forgeable and
+        # makes it outlive the action across refresh and every SSE re-render.
+        # Gating on the read model is what keeps it a receipt for a restart that
+        # actually happened: a hand-crafted ?restarting=N on an idle entity, and
+        # the same URL revisited after the respawn landed, both render nothing.
+        def restart_flash(entry, target)
+          return "" unless target && entry.liveness == :restarting
+          return "" unless target.to_i > entry.generation.to_i
+
+          %(<p class="status-note">Restart accepted — target generation #{target}</p>\n)
+        end
+
+        def detail_restart_control(entry, session)
+          control = if entry.liveness == :restarting
+                      '<button id="restart-action" type="button" disabled>Restarting…</button>'
+                    elsif @restart_control.nil?
+                      '<button id="restart-action" type="button" disabled>Restart unavailable</button>' \
+                        '<p class="status-note">Restart control is not configured.</p>'
+                    elsif entry.kind == :reactor
+                      <<~HTML.chomp
+                        <form method="get" action="#{RESTART_PATH}">
+                        <input type="hidden" name="id" value="#{esc(entry.id)}">
+                        <button id="restart-action" type="submit">Restart</button>
+                        </form>
+                      HTML
+                    else
+                      <<~HTML.chomp
+                        <form method="post" action="#{RESTART_PATH}">
+                        <input type="hidden" name="_csrf" value="#{esc(session&.csrf_token)}">
+                        <input type="hidden" name="id" value="#{esc(entry.id)}">
+                        <button id="restart-action" type="submit">Restart</button>
+                        </form>
+                      HTML
+                    end
+
+          note = mattermost_restart_note(entry)
+          %(<div class="restart-control">#{control}#{note}</div>\n)
+        end
+
+        def mattermost_restart_note(entry)
+          return "" unless entry.kind == :runner && entry.trigger_type == "mattermost"
+
+          '<p class="status-note">Only this file-poll consumer restarts. ' \
+            'The WebSocket listener in the shared reactor is not restarted.</p>'
         end
 
         # Two independent sections, either of which may be absent: what this
@@ -1435,7 +1590,12 @@ module AgentDaemon
         def restart_delayed_warning(entry)
           return "" unless entry.liveness == :restarting && entry.stuck_restarting
 
-          '<p class="restart-warning"><strong>Restart delayed</strong> — respawn is failing</p>'
+          message = if entry.status == :crashed
+                      '<strong>Restart delayed</strong> — respawn is failing'
+                    else
+                      'Restart taking longer than expected — waiting for the entity to stop'
+                    end
+          %(<p class="restart-warning">#{message}</p>)
         end
 
         # AC1/AC8: every entity kind gets this section — a messenger or the
@@ -1526,7 +1686,10 @@ module AgentDaemon
           when :finished then event.reason || EM_DASH
           when :restart
             actors = Array(event.actor)
-            actors.empty? ? EM_DASH : "actor: #{actors.join(', ')}"
+            parts = []
+            parts << "actor: #{actors.join(', ')}" unless actors.empty?
+            parts << "requested #{event.requested_at}" if event.requested_at
+            parts.empty? ? EM_DASH : parts.join(" · ")
           else EM_DASH
           end
         end

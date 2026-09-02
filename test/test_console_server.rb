@@ -338,6 +338,25 @@ class TestConsoleServer < Minitest::Test
     assert_includes response.body, "wired-through-marker"
   end
 
+  def test_the_server_forwards_restart_control_to_the_app
+    restart_control = Object.new
+    server = Server.new(
+      CONSOLE_CONFIG,
+      fleet: @fleet,
+      activity_log: @activity_log,
+      event_bus: @event_bus,
+      state_registry: @state_registry,
+      output_buffers: @output_buffers,
+      restart_control: restart_control,
+      log_writer: Puma::LogWriter.strings
+    )
+
+    stack = server.send(:build_app)
+    app = stack.instance_variable_get(:@app)
+
+    assert_same restart_control, app.instance_variable_get(:@restart_control)
+  end
+
   # The same proof one hop further out: through the REAL default
   # Master::CONSOLE_FACTORY, so the positional-argument → kwarg mapping added
   # for this story is executed rather than replaced by a test lambda.

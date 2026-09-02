@@ -11,11 +11,12 @@ module AgentDaemon
 
       attr_reader :name
 
-      def initialize(runner_config, message_dir, project_path, shutdown_flag, sinks: nil)
+      def initialize(runner_config, message_dir, project_path, shutdown_flag, sinks: nil, cancel_flag: nil)
         @runner_config = runner_config
         @message_dir = message_dir
         @project_path = project_path
         @shutdown_flag = shutdown_flag
+        @cancel_flag = cancel_flag
         @name = runner_config.fetch("name")
         @sinks = sinks || Sinks::Bundle.null(@name)
         @max_attempts = runner_config.fetch("max_attempts")
@@ -26,7 +27,7 @@ module AgentDaemon
         @backoff = nil
         @backend = Backend.for(runner_config, shutdown_flag,
                                message_dir: message_dir, project_path: project_path,
-                               sinks: @sinks)
+                               sinks: @sinks, cancel_flag: cancel_flag)
         @effective_backend = if @backend.is_a?(Backend::ConfiguredAgent)
                                runner_config.fetch("fallback_agent").fetch("command")
                              else
@@ -39,12 +40,12 @@ module AgentDaemon
         Log.info("[#{log_tag}] Thread started")
         @sinks.publish_state(status: :waiting)
 
-        until @shutdown_flag.value
+        until stopping?
           iterate
           wait_interval(next_wait_seconds)
         end
 
-        @sinks.publish_state(status: :stopped)
+        @sinks.publish_state(status: :stopped) unless cancelling?
         Log.info("[#{log_tag}] Thread stopping gracefully")
       end
 
@@ -61,6 +62,19 @@ module AgentDaemon
         "Runner #{@name}"
       end
 
+      def stopping?
+        @shutdown_flag.value || @cancel_flag&.value
+      end
+
+      # Local restart is the SOLE cause of the stop. Gates the two state
+      # publishes the supervisor owns during a turnover — never the loop
+      # exits, which take either signal. When both are set shutdown wins, so
+      # a token latched just before a fleet drain still publishes :stopped
+      # and cannot strand the entity on :restart_requested (NFR5, AC13).
+      def cancelling?
+        @cancel_flag&.value && !@shutdown_flag.value
+      end
+
       def iterate
         items = fetch_work_items_with_escalation
         return if items.nil? || items.empty?
@@ -68,7 +82,7 @@ module AgentDaemon
         Log.info("[#{log_tag}] Found #{items.size} work item(s)")
 
         items.each do |item|
-          break if @shutdown_flag.value
+          break if stopping?
           process_item(item)
         end
       rescue => e
@@ -134,12 +148,15 @@ module AgentDaemon
           after_failure(item)
         when :killed
           @attempts[key] -= 1
-          Log.info("[#{log_tag}] CLI killed for #{key} (shutdown), attempt rolled back")
+          # Same precedence as cancelling?: with both signals set the fleet is
+          # draining, and that is what the operator needs to read here.
+          cause = @shutdown_flag.value ? "shutdown" : "restart"
+          Log.info("[#{log_tag}] CLI killed for #{key} (#{cause}), attempt rolled back")
           after_killed(item)
         end
 
         @sinks.publish_event(type: :finished, work_item: key, reason: result.reason, attempt: attempt_no, at: Time.now.utc.iso8601)
-        @sinks.publish_state(status: :waiting)
+        @sinks.publish_state(status: :waiting) unless cancelling?
       end
 
       # --- Extension points ---
@@ -212,7 +229,7 @@ module AgentDaemon
 
       def wait_interval(seconds)
         elapsed = 0
-        while elapsed < seconds && !@shutdown_flag.value
+        while elapsed < seconds && !stopping?
           sleep(1)
           elapsed += 1
         end

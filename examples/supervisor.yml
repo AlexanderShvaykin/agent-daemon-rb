@@ -29,6 +29,10 @@ workflows:
 # than this is force-split into multiple records at this boundary.
 # output_buffer_bytes: 262144
 
+# Seconds of slack after the 60-second restart delay before the console shows
+# a delayed-restart warning. Default 5; accepted range 1-300.
+# restart_warning_margin_seconds: 5
+
 # Optional web console. OMIT THIS WHOLE BLOCK and no server is started and
 # nothing below is validated — a supervisor config without it behaves exactly
 # as it did before the console existed.

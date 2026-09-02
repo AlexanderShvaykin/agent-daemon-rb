@@ -148,6 +148,38 @@ sudo systemctl status agent-daemon@support.service
 journalctl -u agent-daemon@support.service -f
 ```
 
+### Restarting one entity instead of the whole unit
+
+When the supervisor runs with a console configured, `systemctl restart` is no
+longer the only lever. Each supervised entity — every runner, each workflow's
+Messenger, and the global Mattermost reactor — has a **Restart** button on its
+console detail page, reachable without SSH by anyone in `allowed_groups`. Roles
+are validated but do not gate the action in v1: any allowed user can restart any
+entity.
+
+What to expect when you press it:
+
+- The restart is **cooperative, not a kill.** The entity is asked to stop and is
+  respawned only after it returns; a runner mid-agent-run finishes tearing that
+  run down first. Expect the respawn itself to wait out the fixed 60-second
+  restart delay, so a normal restart takes roughly a minute end to end.
+- The control disables itself and the entity reads `restarting` until the new
+  generation is live. Past `60s + restart_warning_margin_seconds` (default 5) a
+  warning appears. It is a hint that the restart is slow, not proof it failed.
+- **Restarting the Mattermost reactor is fleet-wide.** There is one reactor per
+  process for every workflow, so its restart disconnects and reconnects every
+  workflow's Mattermost listeners. The console routes that action through a
+  confirmation page for this reason. Restarting a *Mattermost runner* is not
+  fleet-wide: only its file-poll consumer restarts, and its listener inside the
+  shared reactor is untouched.
+- Each accepted restart writes one line to the journal naming the operator and
+  the target generation, so `journalctl -u agent-daemon@support.service` is where
+  you find out who restarted what. The console's own activity log is in-memory
+  and does not survive a supervisor restart.
+
+`systemctl restart` remains the right tool for config changes, upgrades, and
+anything that must reload the process itself.
+
 ## 5. Deploy Updates
 
 A typical deploy is:

@@ -198,15 +198,95 @@ class TestBackendExecute < Minitest::Test
     end
 
     started = Time.now
-    result = backend.call("sleep 30", timeout: 60)
+    result = backend.call(%(sh -c 'trap "echo dying; exit 0" TERM; sleep 30'), timeout: 60)
     elapsed = Time.now - started
     thread.join
 
     assert_equal :killed, result.reason
     assert elapsed < 5
+    assert_includes result.stdout, "dying"
+    assert_kind_of Time, result.started_at
+    assert_kind_of Time, result.finished_at
+    assert_operator result.finished_at, :>=, result.started_at
+    assert_kind_of Integer, result.pid
     # A recycled pid owned by another user raises EPERM instead of ESRCH —
     # either way the original child is gone.
     assert_raises(Errno::ESRCH, Errno::EPERM) { Process.kill(0, result.pid) }
+  end
+
+  # AC6: the drain on the :killed path is the same code as the :timeout and
+  # shutdown paths, but only shutdown had pipeline evidence. Pin the cancel
+  # path on BOTH streams, through the sink the pipeline actually consumes —
+  # result.stdout alone would pass even if append_chunk never fired.
+  def test_cancel_drain_reaches_the_output_pipeline_on_both_streams
+    recorder = RecordingOutputSink.new
+    cancel = TestShutdownFlag.new
+    backend = build_backend(sinks: sink_bundle(recorder), cancel_flag: cancel)
+    thread = Thread.new do
+      sleep(0.3)
+      cancel.value = true
+    end
+
+    result = backend.call(
+      %(sh -c 'trap "echo dying; echo failing >&2; exit 0" TERM; sleep 30'),
+      timeout: 60
+    )
+    thread.join
+
+    assert_equal :killed, result.reason
+    assert_includes result.stdout, "dying"
+    assert_includes result.stderr, "failing"
+    assert(recorder.calls.any? { |_id, stream, chunk| stream == :stdout && chunk.include?("dying") },
+           "the late stdout line never reached the output sink")
+    assert(recorder.calls.any? { |_id, stream, chunk| stream == :stderr && chunk.include?("failing") },
+           "the late stderr line never reached the output sink")
+  end
+
+  # AC4's second half. Every other kill test uses a TERM-killable child, so
+  # the TERM -> TERM_GRACE_SECONDS probe -> KILL escalation in
+  # kill_process_group was reachable but unexercised. This child ignores TERM
+  # and restarts its sleeps, so only SIGKILL can end it.
+  def test_cancel_escalates_to_sigkill_for_a_child_that_ignores_term
+    cancel = TestShutdownFlag.new
+    backend = build_backend(cancel_flag: cancel)
+    thread = Thread.new do
+      sleep(0.3)
+      cancel.value = true
+    end
+
+    started = Time.now
+    result = backend.call(%(sh -c 'trap "" TERM; while :; do sleep 0.2; done'), timeout: 60)
+    elapsed = Time.now - started
+    thread.join
+
+    assert_equal :killed, result.reason
+    assert_operator elapsed, :>=, AgentDaemon::Backend::TERM_GRACE_SECONDS,
+                    "returned before the TERM grace period — the child cannot have ignored TERM"
+    assert_operator elapsed, :<, 10
+    assert_raises(Errno::ESRCH, Errno::EPERM) { Process.kill(0, -result.pid) }
+  end
+
+  # AC5 on the cancel path. A zombie still answers signal 0, so ESRCH on the
+  # leader pid right after `call` returns is the proof that wait_thr.value
+  # already reaped it — and a second kill against the now-absent group must
+  # stay silent rather than surface as a runner error.
+  def test_cancelled_child_is_reaped_once_and_a_second_kill_is_not_an_error
+    cancel = TestShutdownFlag.new
+    backend = build_backend(cancel_flag: cancel)
+    thread = Thread.new do
+      sleep(0.3)
+      cancel.value = true
+    end
+
+    result = backend.call("sleep 30", timeout: 60)
+    thread.join
+
+    assert_equal :killed, result.reason
+    assert_raises(Errno::ESRCH, Errno::EPERM) { Process.kill(0, result.pid) }
+    assert_nil backend.instance_variable_get(:@current_pid),
+               "the pid must be cleared only after the child was reaped"
+    backend.send(:kill_process_group, result.pid)
+    assert_raises(Errno::ECHILD) { Process.waitpid(result.pid) }
   end
 
   def test_ok_result_carries_timing_and_pid
@@ -242,6 +322,23 @@ class TestBackendExecute < Minitest::Test
 
     assert_equal :ok, result.reason
     assert_includes result.stdout, "ok"
+  end
+
+  def test_raising_output_sink_does_not_break_cancel_cleanup
+    raising = Object.new
+    raising.define_singleton_method(:append) { |_entity_id, _stream, _chunk| raise "sink boom" }
+    cancel = TestShutdownFlag.new
+    backend = build_backend(sinks: sink_bundle(raising), cancel_flag: cancel)
+    thread = Thread.new do
+      sleep(0.3)
+      cancel.value = true
+    end
+
+    result = backend.call("sleep 30", timeout: 60)
+    thread.join
+
+    assert_equal :killed, result.reason
+    assert_raises(Errno::ESRCH, Errno::EPERM) { Process.kill(0, result.pid) }
   end
 
   # --- Story 3.3 / DR4+DR9: the output run lifecycle -----------------------

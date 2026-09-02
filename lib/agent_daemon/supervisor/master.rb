@@ -3,6 +3,7 @@
 require_relative "../../agent_daemon"
 require_relative "config"
 require_relative "runner_supervisor"
+require_relative "restart_control"
 require_relative "state_registry"
 require_relative "event_bus"
 require_relative "fleet"
@@ -38,14 +39,16 @@ module AgentDaemon
       # Builds the console server from the config's `console` block. Injectable
       # for the same reason join_timeout is: a test must be able to make the
       # console fail on purpose and watch the fleet carry on regardless.
-      CONSOLE_FACTORY = lambda do |console_config, fleet, activity_log, event_bus, state_registry, output_buffers|
+      CONSOLE_FACTORY = lambda do |console_config, fleet, activity_log, event_bus, state_registry, output_buffers,
+                                   restart_control: nil|
         Console::Server.new(
           console_config,
           fleet: fleet,
           activity_log: activity_log,
           event_bus: event_bus,
           state_registry: state_registry,
-          output_buffers: output_buffers
+          output_buffers: output_buffers,
+          restart_control: restart_control
         )
       end
 
@@ -147,6 +150,10 @@ module AgentDaemon
             sinks_factory: read_model_sinks_factory(key)
           )
         end
+        supervisors_by_console_id = @supervisors.each_with_object({}) do |(key, supervisor), by_id|
+          by_id[RunnerIdentity.key_for(@entity_ids.fetch(key))] = supervisor
+        end
+        @restart_control = RestartControl.new(supervisors: supervisors_by_console_id, shutdown_flag: @shutdown_flag)
       end
 
       # The supervised fleet's sink bundle. It deliberately does NOT mirror
@@ -183,6 +190,7 @@ module AgentDaemon
       def fleet
         @fleet ||= Fleet.new(roster: @roster, state_registry: @state_registry,
                              restart_delay: RunnerSupervisor::RESTART_DELAY,
+                             restart_warning_margin: @config.restart_warning_margin_seconds,
                              workflow_docs: @workflow_docs)
       end
 
@@ -196,7 +204,10 @@ module AgentDaemon
       def start_console
         return if @config.console.nil?
 
-        console = @console_factory.call(@config.console, fleet, activity_log, @event_bus, @state_registry, @output_buffers)
+        console = @console_factory.call(
+          @config.console, fleet, activity_log, @event_bus, @state_registry, @output_buffers,
+          restart_control: @restart_control
+        )
         console.start
         @console = console
         Log.info("[Console] listening on #{@config.console['bind']}:#{console.port}")
@@ -327,7 +338,8 @@ module AgentDaemon
           @roster << Fleet::Rostered.new(kind: :runner, workflow: workflow[:name], name: runner_config["name"],
                                           entity_id: identity,
                                           doc: Fleet::Doc.build(description: runner_config["description"],
-                                                                support: runner_config["support"]))
+                                                                support: runner_config["support"]),
+                                          trigger_type: runner_config.dig("trigger", "type"))
         end
       end
 
@@ -340,7 +352,9 @@ module AgentDaemon
         config = workflow[:config]
         key = :"messenger:#{workflow[:name]}"
         entity_id = "messenger:#{workflow[:name]}"
-        @entity_factories[key] = ->(bundle) { Messenger.new(config, @shutdown_flag, sinks: bundle) }
+        @entity_factories[key] = lambda do |bundle, cancel_token = nil|
+          Messenger.new(config, @shutdown_flag, sinks: bundle, cancel_flag: cancel_token)
+        end
         @entity_ids[key] = entity_id
         @log_levels[key] = resolve_log_level(config.logging["level"])
         @roster << Fleet::Rostered.new(kind: :messenger, workflow: workflow[:name], name: "messenger", entity_id: entity_id)
@@ -364,8 +378,8 @@ module AgentDaemon
       end
 
       # Mirrors Daemon#runner_factory_for's type dispatch exactly, but as a
-      # 1-arg callable receiving the per-generation Sinks::Bundle a
-      # RunnerSupervisor builds on each (re)spawn (Story 1.5). Kept
+      # callable receiving the per-generation Sinks::Bundle and optional
+      # cancel token a RunnerSupervisor builds on each (re)spawn. Kept
       # duplicated rather than shared with Daemon (see Dev Notes design
       # decision 4).
       def runner_factory_for(config, runner_config)
@@ -376,11 +390,11 @@ module AgentDaemon
 
         case type
         when "tracker"
-          ->(bundle) { Runner::Tracker.new(runner_config, message_dir, project_path, @shutdown_flag, tracker_config, sinks: bundle) }
+          ->(bundle, cancel_token = nil) { Runner::Tracker.new(runner_config, message_dir, project_path, @shutdown_flag, tracker_config, sinks: bundle, cancel_flag: cancel_token) }
         when "file"
-          ->(bundle) { Runner::File.new(runner_config, message_dir, project_path, @shutdown_flag, sinks: bundle) }
+          ->(bundle, cancel_token = nil) { Runner::File.new(runner_config, message_dir, project_path, @shutdown_flag, sinks: bundle, cancel_flag: cancel_token) }
         when "mattermost"
-          ->(bundle) { Runner::Mattermost.new(runner_config, message_dir, project_path, @shutdown_flag, sinks: bundle) }
+          ->(bundle, cancel_token = nil) { Runner::Mattermost.new(runner_config, message_dir, project_path, @shutdown_flag, sinks: bundle, cancel_flag: cancel_token) }
         else
           raise ArgumentError, "Unknown trigger type #{type.inspect} in runner #{runner_config['name'].inspect}"
         end
@@ -398,11 +412,11 @@ module AgentDaemon
         end
         return if mattermost_runners.empty?
 
-        @entity_factories[:mattermost_reactor] = lambda do |bundle|
+        @entity_factories[:mattermost_reactor] = lambda do |bundle, cancel_token = nil|
           listeners = mattermost_runners.map do |runner_config|
             Mattermost::Listener.new(runner_config.fetch("trigger"), @shutdown_flag)
           end
-          Mattermost::Reactor.new(listeners, @shutdown_flag, sinks: bundle)
+          Mattermost::Reactor.new(listeners, @shutdown_flag, sinks: bundle, cancel_flag: cancel_token)
         end
         @entity_ids[:mattermost_reactor] = "mattermost_reactor"
         @roster << Fleet::Rostered.new(kind: :reactor, workflow: nil, name: "mattermost_reactor", entity_id: @entity_ids[:mattermost_reactor])

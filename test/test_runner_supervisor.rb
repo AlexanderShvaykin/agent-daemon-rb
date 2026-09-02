@@ -2,6 +2,8 @@
 
 require "test_helper"
 require "stringio"
+require "tmpdir"
+require "fileutils"
 
 # AD-5 lazy-require isolation: required explicitly here, never from the core
 # `require "agent_daemon"` graph.
@@ -81,6 +83,17 @@ class RunnerSupervisorStoppableFake
   end
 end
 
+class RunnerSupervisorCancelBackend
+  def initialize(cancel_token)
+    @cancel_token = cancel_token
+  end
+
+  def run(_prompt)
+    sleep(0.01) until @cancel_token.value
+    AgentDaemon::Backend::Result.new(false, "", "", :killed)
+  end
+end
+
 # Stays alive until the flag is set, then crashes — lets a test reach
 # :stopping with a live thread and still exercise the crash branch.
 class RunnerSupervisorDeferredCrashFake
@@ -94,8 +107,28 @@ class RunnerSupervisorDeferredCrashFake
   end
 end
 
+class RunnerSupervisorStubClock
+  def initialize(now)
+    @now = now
+    @mutex = Mutex.new
+  end
+
+  def now
+    @mutex.synchronize { @now }
+  end
+
+  def now=(value)
+    @mutex.synchronize { @now = value }
+  end
+
+  def call
+    now
+  end
+end
+
 class TestRunnerSupervisor < Minitest::Test
   ISO8601_RE = /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/
+  ISO8601_MS_RE = /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\z/
 
   def setup
     @prior_logger = AgentDaemon::Log.instance_variable_get(:@logger)
@@ -125,7 +158,7 @@ class TestRunnerSupervisor < Minitest::Test
   # so generation stamping is observable without touching the class's
   # production default.
   def build_supervisor(entity_id, entity_factory, shutdown_flag: AgentDaemon::ShutdownFlag.new, restart_delay: 0.05,
-                        log_level: nil)
+                        log_level: nil, clock: -> { Time.now.utc })
     state_recorder = RunnerSupervisorRecordingSink.new
     event_recorder = RunnerSupervisorRecordingSink.new
     sinks_factory = lambda do |generation|
@@ -141,15 +174,68 @@ class TestRunnerSupervisor < Minitest::Test
       shutdown_flag: shutdown_flag,
       restart_delay: restart_delay,
       sinks_factory: sinks_factory,
-      log_level: log_level
+      log_level: log_level,
+      clock: clock
     )
     [supervisor, state_recorder, event_recorder]
+  end
+
+  # --- Story 4.1 AC1/AC3: per-generation cancellation --------------------
+
+  def test_cancel_token_is_a_monotonic_one_way_boolean
+    token = AgentDaemon::Supervisor::CancelToken.new
+
+    refute token.value
+
+    token.set!
+
+    assert token.value
+    token.set!
+    assert token.value
+  end
+
+  def test_entity_factory_receives_the_supervisors_generation_token
+    captured = nil
+    factory = lambda do |_bundle, cancel_token|
+      captured = cancel_token
+      RunnerSupervisorCleanExitFake.new
+    end
+    supervisor, = build_supervisor("ent-1", factory)
+
+    assert supervisor.spawn!
+    assert_same supervisor.cancel_token, captured
+  ensure
+    supervisor&.thread&.join(1)
+  end
+
+  def test_respawn_mints_a_fresh_unset_cancel_token
+    supervisor, = build_supervisor(
+      "ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCrashingFake.new }, restart_delay: 0
+    )
+
+    supervisor.spawn!
+    first_token = supervisor.cancel_token
+    first_token.set!
+    supervisor.thread.join(2)
+    supervisor.tick
+    supervisor.tick
+
+    # Pin that a respawn actually happened, so the token assertions below
+    # cannot pass against a supervisor that never reached generation 2.
+    assert_equal :running, supervisor.state
+    assert_equal 2, supervisor.generation
+
+    refute_same first_token, supervisor.cancel_token
+    assert first_token.value
+    refute supervisor.cancel_token.value
+  ensure
+    supervisor&.thread&.join(2)
   end
 
   # --- AC1: crash auto-restart, generation bump, non-blocking delay ------
 
   def test_crash_moves_to_restarting_and_publishes_crashed_status_at_gen1
-    supervisor, state_recorder = build_supervisor("ent-1", ->(_bundle) { RunnerSupervisorCrashingFake.new })
+    supervisor, state_recorder = build_supervisor("ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCrashingFake.new })
 
     supervisor.spawn!
     supervisor.thread.join(1)
@@ -160,7 +246,7 @@ class TestRunnerSupervisor < Minitest::Test
   end
 
   def test_deadline_respawns_with_bumped_generation_and_emits_restart_event
-    supervisor, _state, event_recorder = build_supervisor("ent-1", ->(_bundle) { RunnerSupervisorCrashingFake.new })
+    supervisor, _state, event_recorder = build_supervisor("ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCrashingFake.new })
 
     supervisor.spawn!
     supervisor.thread.join(1)
@@ -177,12 +263,17 @@ class TestRunnerSupervisor < Minitest::Test
     assert_equal [:crash_auto], event[:actor]
     assert_equal 2, event[:generation]
     assert_match ISO8601_RE, event[:at]
+    # The crash path is the only restart producer reachable in production
+    # today, so AC14's request timestamp has to be pinned here and not only on
+    # the manual-intent tests: :crash_auto goes through the same intent queue
+    # precisely so this field is populated.
+    assert_match ISO8601_MS_RE, event[:requested_at]
   ensure
     supervisor&.thread&.join(1)
   end
 
   def test_tick_during_pending_delay_returns_immediately
-    supervisor, = build_supervisor("ent-1", ->(_bundle) { RunnerSupervisorCrashingFake.new }, restart_delay: 5)
+    supervisor, = build_supervisor("ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCrashingFake.new }, restart_delay: 5)
     supervisor.spawn!
     supervisor.thread.join(1)
     supervisor.tick
@@ -196,8 +287,8 @@ class TestRunnerSupervisor < Minitest::Test
   end
 
   def test_second_supervisors_crash_is_handled_while_first_still_awaits_delay
-    s1, = build_supervisor("ent-1", ->(_bundle) { RunnerSupervisorCrashingFake.new }, restart_delay: 5)
-    s2, = build_supervisor("ent-2", ->(_bundle) { RunnerSupervisorCrashingFake.new }, restart_delay: 0.05)
+    s1, = build_supervisor("ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCrashingFake.new }, restart_delay: 5)
+    s2, = build_supervisor("ent-2", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCrashingFake.new }, restart_delay: 0.05)
 
     s1.spawn!
     s1.thread.join(1)
@@ -220,7 +311,7 @@ class TestRunnerSupervisor < Minitest::Test
   # --- AC2: clean exit is never auto-restarted ----------------------------
 
   def test_clean_exit_is_terminal_and_never_restarted
-    supervisor, state_recorder = build_supervisor("ent-1", ->(_bundle) { RunnerSupervisorCleanExitFake.new })
+    supervisor, state_recorder = build_supervisor("ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCleanExitFake.new })
     supervisor.spawn!
     supervisor.thread.join(1)
     supervisor.tick
@@ -235,10 +326,82 @@ class TestRunnerSupervisor < Minitest::Test
     assert_equal 1, supervisor.generation
   end
 
+  def test_manual_intent_restarts_a_terminal_exited_entity
+    supervisor, state_recorder, event_recorder = build_supervisor(
+      "ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCleanExitFake.new }, restart_delay: 0
+    )
+    supervisor.spawn!
+    supervisor.thread.join(2)
+    supervisor.tick
+
+    supervisor.request_restart(:manual)
+    supervisor.tick
+
+    assert_equal :restarting, supervisor.state
+    assert_equal [
+      ["ent-1", { status: :exited, generation: 1 }],
+      ["ent-1", { status: :restart_requested, generation: 1 }]
+    ], state_recorder.calls
+
+    supervisor.tick
+
+    assert_equal :running, supervisor.state
+    assert_equal 2, supervisor.generation
+    assert_equal [:manual], event_recorder.calls.last.last[:actor]
+  ensure
+    supervisor&.thread&.join(2)
+  end
+
+  def test_shutdown_rejects_an_intent_against_a_terminal_exited_entity
+    shutdown_flag = AgentDaemon::ShutdownFlag.new
+    supervisor, state_recorder = build_supervisor(
+      "ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCleanExitFake.new },
+      shutdown_flag: shutdown_flag,
+      restart_delay: 0
+    )
+    supervisor.spawn!
+    supervisor.thread.join(2)
+    supervisor.tick
+
+    shutdown_flag.set!
+    supervisor.request_restart(:manual)
+    supervisor.tick
+
+    assert_equal :exited, supervisor.state
+    assert_equal 1, supervisor.generation
+    assert_equal [["ent-1", { status: :exited, generation: 1 }]], state_recorder.calls
+  end
+
+  def test_shutdown_rejects_an_intent_against_a_still_live_entity
+    shutdown_flag = AgentDaemon::ShutdownFlag.new
+    supervisor, state_recorder = build_supervisor(
+      "ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorLoopingFake.new(shutdown_flag) }, shutdown_flag: shutdown_flag
+    )
+    supervisor.spawn!
+    first_thread = supervisor.thread
+    first_token = supervisor.cancel_token
+
+    # Positive control: without the flag this very sequence is accepted (see
+    # test_intent_while_thread_alive_publishes_restart_requested_once_...).
+    shutdown_flag.set!
+    supervisor.request_restart(:manual)
+    supervisor.tick
+
+    # Master#finalize_supervisors ticks once after the flag is set; accepting
+    # here would strand the entity rendering `restarting` with no respawn ever
+    # coming (AC12).
+    assert_equal :running, supervisor.state
+    refute first_token.value
+    assert_empty state_recorder.calls
+  ensure
+    shutdown_flag&.set!
+    first_thread&.join(1)
+  end
+
   # --- AC3: generation stamps every publication ---------------------------
 
   def test_late_publish_through_old_bundle_still_carries_old_generation
-    supervisor, state_recorder = build_supervisor("ent-1", ->(bundle) { RunnerSupervisorLatePublishFake.new(bundle) })
+    supervisor, state_recorder = build_supervisor("ent-1", ->(bundle, _cancel_token = nil) { RunnerSupervisorLatePublishFake.new(bundle) })
 
     supervisor.spawn!
     old_entity = supervisor.entity
@@ -257,7 +420,7 @@ class TestRunnerSupervisor < Minitest::Test
   end
 
   def test_entity_publishes_carry_gen1_before_and_gen2_after_respawn
-    supervisor, state_recorder = build_supervisor("ent-1", ->(bundle) { RunnerSupervisorPublishingFake.new(bundle) })
+    supervisor, state_recorder = build_supervisor("ent-1", ->(bundle, _cancel_token = nil) { RunnerSupervisorPublishingFake.new(bundle) })
 
     supervisor.spawn!
     supervisor.thread.join(1)
@@ -277,7 +440,7 @@ class TestRunnerSupervisor < Minitest::Test
   # --- AC4: single restart-intent queue, at-most-one live instance -------
 
   def test_coalesced_restart_intents_produce_one_respawn_with_merged_actors
-    supervisor, _state, event_recorder = build_supervisor("ent-1", ->(_bundle) { RunnerSupervisorCrashingFake.new })
+    supervisor, _state, event_recorder = build_supervisor("ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCrashingFake.new })
 
     supervisor.spawn!
     supervisor.thread.join(1)
@@ -298,13 +461,14 @@ class TestRunnerSupervisor < Minitest::Test
     supervisor&.thread&.join(1)
   end
 
-  def test_intent_while_thread_alive_moves_to_stopping_without_a_second_thread
+  def test_intent_while_thread_alive_publishes_restart_requested_once_and_activates_its_token
     shutdown_flag = AgentDaemon::ShutdownFlag.new
-    supervisor, = build_supervisor(
-      "ent-1", ->(_bundle) { RunnerSupervisorLoopingFake.new(shutdown_flag) }, shutdown_flag: shutdown_flag
+    supervisor, state_recorder = build_supervisor(
+      "ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorLoopingFake.new(shutdown_flag) }, shutdown_flag: shutdown_flag
     )
     supervisor.spawn!
     first_thread = supervisor.thread
+    first_token = supervisor.cancel_token
 
     supervisor.request_restart(:manual)
     supervisor.tick
@@ -312,15 +476,108 @@ class TestRunnerSupervisor < Minitest::Test
     assert_equal :stopping, supervisor.state
     assert_same first_thread, supervisor.thread
     assert first_thread.alive?
+    assert first_token.value
+    assert_equal [["ent-1", { status: :restart_requested, generation: 1 }]], state_recorder.calls
+
+    supervisor.tick
+
+    assert_equal 1, state_recorder.calls.length, "restart_requested must publish only on acceptance"
   ensure
     shutdown_flag&.set!
     first_thread&.join(1)
   end
 
+  def test_cancel_token_is_active_before_restart_requested_is_published
+    stop_flag = AgentDaemon::ShutdownFlag.new
+    token_states = []
+    supervisor = nil
+    state_sink = Object.new
+    state_sink.define_singleton_method(:publish) do |_entity_id, record|
+      token_states << supervisor.cancel_token.value if record[:status] == :restart_requested
+    end
+    sinks_factory = lambda do |generation|
+      AgentDaemon::Sinks::Bundle.new(
+        entity_id: "ent-1",
+        state: AgentDaemon::Supervisor::GenerationStamp.new(generation, state_sink),
+        event: AgentDaemon::Supervisor::GenerationStamp.new(generation, RunnerSupervisorRecordingSink.new)
+      )
+    end
+    supervisor = AgentDaemon::Supervisor::RunnerSupervisor.new(
+      "ent-1",
+      entity_factory: ->(_bundle, _cancel_token = nil) { RunnerSupervisorLoopingFake.new(stop_flag) },
+      shutdown_flag: AgentDaemon::ShutdownFlag.new,
+      restart_delay: 0,
+      sinks_factory: sinks_factory
+    )
+    supervisor.spawn!
+
+    supervisor.request_restart(:manual)
+    supervisor.tick
+
+    assert_equal [true], token_states
+  ensure
+    stop_flag&.set!
+    supervisor&.thread&.join(1)
+  end
+
+  def test_request_restart_from_a_foreign_thread_while_tick_is_running
+    stop_flag = AgentDaemon::ShutdownFlag.new
+    publish_entered = Queue.new
+    publish_release = Queue.new
+    block_next_restart_publish = true
+    state_sink = Object.new
+    state_sink.define_singleton_method(:publish) do |_entity_id, record|
+      next unless record[:status] == :restart_requested && block_next_restart_publish
+
+      block_next_restart_publish = false
+      publish_entered << true
+      publish_release.pop
+    end
+    event_recorder = RunnerSupervisorRecordingSink.new
+    clock = RunnerSupervisorStubClock.new(Time.utc(2026, 8, 19, 12, 0, 0))
+    sinks_factory = lambda do |generation|
+      AgentDaemon::Sinks::Bundle.new(
+        entity_id: "ent-1",
+        state: AgentDaemon::Supervisor::GenerationStamp.new(generation, state_sink),
+        event: AgentDaemon::Supervisor::GenerationStamp.new(generation, event_recorder)
+      )
+    end
+    supervisor = AgentDaemon::Supervisor::RunnerSupervisor.new(
+      "ent-1",
+      entity_factory: ->(_bundle, _cancel_token = nil) { RunnerSupervisorLoopingFake.new(stop_flag) },
+      shutdown_flag: AgentDaemon::ShutdownFlag.new,
+      restart_delay: 0,
+      sinks_factory: sinks_factory,
+      clock: clock
+    )
+    supervisor.spawn!
+    supervisor.request_restart(:first)
+
+    tick_thread = Thread.new { supervisor.tick }
+    publish_entered.pop
+    requester = Thread.new { supervisor.request_restart(:foreign) }
+    requester.join(1)
+    publish_release << true
+    tick_thread.join(1)
+
+    stop_flag.set!
+    supervisor.thread.join(1)
+    supervisor.tick
+    supervisor.tick
+
+    assert_equal %i[first foreign], event_recorder.calls.fetch(0).last[:actor].sort
+  ensure
+    publish_release << true if tick_thread&.alive?
+    stop_flag&.set!
+    requester&.join(1)
+    tick_thread&.join(1)
+    supervisor&.thread&.join(1)
+  end
+
   def test_clean_death_in_stopping_honours_the_queued_intent_and_respawns
     stop_flag = AgentDaemon::ShutdownFlag.new
     supervisor, state_recorder, event_recorder = build_supervisor(
-      "ent-1", ->(_bundle) { RunnerSupervisorStoppableFake.new(stop_flag) }
+      "ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorStoppableFake.new(stop_flag) }
     )
     supervisor.spawn!
     first_thread = supervisor.thread
@@ -335,13 +592,21 @@ class TestRunnerSupervisor < Minitest::Test
     supervisor.tick
 
     assert_equal :restarting, supervisor.state
-    assert_equal [["ent-1", { status: :exited, generation: 1 }]], state_recorder.calls
+    # Twice, and only twice: once on acceptance, once on the confirmed
+    # turnover. The second one is what keeps the entity off `dead` while the
+    # restart delay runs — the entity's own last publish on this generation is
+    # terminal and would otherwise win the equal-generation CAS.
+    assert_equal [
+      ["ent-1", { status: :restart_requested, generation: 1 }],
+      ["ent-1", { status: :restart_requested, generation: 1 }]
+    ], state_recorder.calls
 
     sleep(0.06)
     supervisor.tick
 
     assert_equal :running, supervisor.state
     assert_equal 2, supervisor.generation
+    assert_equal 2, state_recorder.calls.length, "the respawn itself must not publish a third status"
     refute_same first_thread, supervisor.thread
 
     _entity_id, event = event_recorder.calls.last
@@ -353,10 +618,198 @@ class TestRunnerSupervisor < Minitest::Test
     supervisor&.thread&.join(1)
   end
 
+  def test_two_consecutive_restarts_use_fresh_tokens_and_both_complete
+    tokens = []
+    supervisor, _state_recorder, event_recorder = build_supervisor(
+      "ent-1",
+      lambda do |_bundle, cancel_token|
+        tokens << cancel_token
+        RunnerSupervisorStoppableFake.new(cancel_token)
+      end,
+      restart_delay: 0
+    )
+    supervisor.spawn!
+
+    supervisor.request_restart(:first)
+    supervisor.tick
+    supervisor.thread.join(1)
+    supervisor.tick
+    supervisor.tick
+
+    supervisor.request_restart(:second)
+    supervisor.tick
+    supervisor.thread.join(1)
+    supervisor.tick
+    supervisor.tick
+
+    assert_equal 3, supervisor.generation
+    assert_equal 3, tokens.length
+    refute_same tokens[0], tokens[1]
+    refute_same tokens[1], tokens[2]
+    assert_equal [%i[first], %i[second]], event_recorder.calls.map { |_id, event| event[:actor] }
+  ensure
+    supervisor&.cancel_token&.set!
+    supervisor&.thread&.join(1)
+  end
+
+  def test_shutdown_after_reaching_stopping_prevents_terminal_restart_publication
+    shutdown_flag = AgentDaemon::ShutdownFlag.new
+    supervisor, state_recorder = build_supervisor(
+      "ent-1",
+      ->(_bundle, cancel_token) { RunnerSupervisorStoppableFake.new(cancel_token) },
+      shutdown_flag: shutdown_flag,
+      restart_delay: 0
+    )
+    supervisor.spawn!
+    supervisor.request_restart(:manual)
+    supervisor.tick
+    supervisor.thread.join(1)
+
+    shutdown_flag.set!
+    supervisor.tick
+
+    assert_equal :stopping, supervisor.state
+    assert_equal [["ent-1", { status: :restart_requested, generation: 1 }]], state_recorder.calls
+  ensure
+    supervisor&.cancel_token&.set!
+    supervisor&.thread&.join(1)
+  end
+
+  def test_reactor_restart_creates_exactly_one_replacement_generation_and_event
+    stop_flag = AgentDaemon::ShutdownFlag.new
+    factory_calls = 0
+    supervisor, _state_recorder, event_recorder = build_supervisor(
+      "mattermost_reactor",
+      lambda do |_bundle, _cancel_token = nil|
+        factory_calls += 1
+        RunnerSupervisorStoppableFake.new(stop_flag)
+      end,
+      restart_delay: 0
+    )
+    assert supervisor.spawn!
+    first_thread = supervisor.thread
+
+    supervisor.request_restart("console:alice")
+    supervisor.tick
+    stop_flag.set!
+    first_thread.join(1)
+    supervisor.tick
+    supervisor.tick
+
+    assert_equal 2, supervisor.generation
+    assert_equal 2, factory_calls
+    assert_equal 1, event_recorder.calls.size
+    assert_equal :restart, event_recorder.calls.first.last[:type]
+    assert_equal ["console:alice"], event_recorder.calls.first.last[:actor]
+  ensure
+    stop_flag&.set!
+    supervisor&.thread&.join(1)
+  end
+
+  def test_live_runner_cancel_finishes_before_delayed_respawn_with_fresh_token
+    Dir.mktmpdir do |dir|
+      message_dir = File.join(dir, "messages")
+      input_dir = File.join(dir, "inbox")
+      template_path = File.join(dir, "prompt.txt")
+      FileUtils.mkdir_p(message_dir)
+      FileUtils.mkdir_p(input_dir)
+      File.write(template_path, "review {{input_file}}")
+      config = {
+        "name" => "reviewer",
+        "backend" => "claude",
+        "extra_flags" => "",
+        "timeout" => 30,
+        "max_attempts" => 2,
+        "prompt_template" => "prompt.txt",
+        "prompt_template_path" => template_path,
+        "trigger" => {
+          "type" => "file",
+          "input_dir" => input_dir,
+          "archive_dir" => File.join(input_dir, "archive"),
+          "failed_dir" => File.join(input_dir, "failed"),
+          "interval" => 60
+        }
+      }
+      shutdown_flag = AgentDaemon::ShutdownFlag.new
+      recorder = RunnerSupervisorRecordingSink.new
+      sinks_factory = lambda do |generation|
+        stamped = AgentDaemon::Supervisor::GenerationStamp.new(generation, recorder)
+        AgentDaemon::Sinks::Bundle.new(entity_id: "ent-1", state: stamped, event: stamped)
+      end
+      tokens = []
+      factory = lambda do |bundle, cancel_token|
+        tokens << cancel_token
+        runner = AgentDaemon::Runner::File.new(
+          config, message_dir, dir, shutdown_flag,
+          sinks: bundle, cancel_flag: cancel_token
+        )
+        runner.instance_variable_set(:@backend, RunnerSupervisorCancelBackend.new(cancel_token))
+        runner
+      end
+      supervisor = AgentDaemon::Supervisor::RunnerSupervisor.new(
+        "ent-1", entity_factory: factory, shutdown_flag: shutdown_flag,
+        restart_delay: 0.05, sinks_factory: sinks_factory
+      )
+      File.write(File.join(input_dir, "TASK-1.yml"), "body")
+
+      assert supervisor.spawn!
+      100.times do
+        break if recorder.calls.any? { |_id, record| record[:type] == :started }
+
+        sleep(0.01)
+      end
+      assert recorder.calls.any? { |_id, record| record[:type] == :started },
+             "positive control: the live runner must start the work item"
+
+      first_token = supervisor.cancel_token
+      supervisor.request_restart(:console)
+      supervisor.tick
+      assert_equal :stopping, supervisor.state
+      assert first_token.value
+      assert supervisor.thread.join(2), "cancelled runner did not return cooperatively"
+
+      supervisor.tick
+      assert_equal :restarting, supervisor.state
+      refute supervisor.thread.alive?
+      supervisor.tick
+      assert_equal 1, supervisor.generation, "replacement spawned before the restart delay"
+
+      sleep(0.06)
+      supervisor.tick
+
+      assert_equal 2, supervisor.generation
+      assert_equal 2, tokens.length
+      assert_same first_token, tokens.first
+      refute_same tokens.first, tokens.last
+      refute tokens.last.value
+
+      records = recorder.calls.map(&:last)
+      finished_index = records.index do |record|
+        record[:type] == :finished && record[:reason] == :killed && record[:generation] == 1
+      end
+      restart_index = records.index { |record| record[:type] == :restart && record[:generation] == 2 }
+      refute_nil finished_index
+      refute_nil restart_index
+      assert_operator finished_index, :<, restart_index
+      finished = records.fetch(finished_index)
+      assert_equal "TASK-1.yml", finished[:work_item]
+      assert_equal 1, finished[:attempt]
+
+      old_states = records.select { |record| record[:status] && record[:generation] == 1 }
+      assert_equal :restart_requested, old_states.last[:status]
+      restart_requested_index = old_states.index { |record| record[:status] == :restart_requested }
+      refute old_states.drop(restart_requested_index + 1).any? { |record| %i[waiting stopped].include?(record[:status]) }
+    ensure
+      shutdown_flag&.set!
+      supervisor&.cancel_token&.set!
+      supervisor&.thread&.join(2)
+    end
+  end
+
   def test_crash_in_stopping_still_takes_the_crash_path
     crash_flag = AgentDaemon::ShutdownFlag.new
     supervisor, state_recorder = build_supervisor(
-      "ent-1", ->(_bundle) { RunnerSupervisorDeferredCrashFake.new(crash_flag) }
+      "ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorDeferredCrashFake.new(crash_flag) }
     )
     supervisor.spawn!
     first_thread = supervisor.thread
@@ -373,16 +826,100 @@ class TestRunnerSupervisor < Minitest::Test
     supervisor.tick
 
     assert_equal :restarting, supervisor.state
-    assert_equal [["ent-1", { status: :crashed, generation: 1 }]], state_recorder.calls
+    assert_equal [
+      ["ent-1", { status: :restart_requested, generation: 1 }],
+      ["ent-1", { status: :crashed, generation: 1 }]
+    ], state_recorder.calls
   ensure
     crash_flag&.set!
     supervisor&.thread&.join(1)
   end
 
+  def test_manual_and_crash_intents_coalesce_with_the_earliest_request_time
+    crash_flag = AgentDaemon::ShutdownFlag.new
+    requested_at = Time.utc(2026, 8, 15, 12, 0, 0)
+    stopping_at = Time.utc(2026, 8, 15, 12, 0, 0, 500_000)
+    crash_at = Time.utc(2026, 8, 15, 12, 0, 1)
+    delayed_at = Time.utc(2026, 8, 15, 12, 0, 1, 500_000)
+    completed_at = Time.utc(2026, 8, 15, 12, 0, 2)
+    clock = RunnerSupervisorStubClock.new(requested_at)
+    supervisor, _state, event_recorder = build_supervisor(
+      "ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorDeferredCrashFake.new(crash_flag) }, restart_delay: 0, clock: clock
+    )
+    supervisor.spawn!
+
+    supervisor.request_restart(:manual)
+    supervisor.tick
+    clock.now = stopping_at
+    supervisor.request_restart(:manual)
+    crash_flag.set!
+    supervisor.thread.join(2)
+    clock.now = crash_at
+    supervisor.tick
+    clock.now = delayed_at
+    supervisor.request_restart(:operator_b)
+    clock.now = completed_at
+    supervisor.tick
+
+    assert_equal 2, supervisor.generation
+    restart_calls = event_recorder.calls.select { |_entity_id, event| event[:type] == :restart }
+    assert_equal 1, restart_calls.length
+    entity_id, event = restart_calls.first
+    assert_equal "ent-1", entity_id
+    assert_equal 2, event[:generation]
+    assert_equal %i[crash_auto manual operator_b], event[:actor].sort
+    # Millisecond precision is what makes this assertion discriminating: at
+    # whole-second granularity requested_at and stopping_at serialise
+    # identically and the test would pass even if the code took the latest.
+    assert_equal requested_at.iso8601(3), event[:requested_at]
+    refute_equal stopping_at.iso8601(3), event[:requested_at]
+    assert_equal completed_at.iso8601, event[:at]
+  ensure
+    crash_flag&.set!
+    supervisor&.thread&.join(2)
+  end
+
+  def test_failed_replacement_retains_actor_and_request_time_without_consuming_generation
+    calls = 0
+    factory = lambda do |_bundle, _cancel_token = nil|
+      calls += 1
+      raise "cannot construct replacement" if calls == 2
+
+      RunnerSupervisorCleanExitFake.new
+    end
+    requested_at = Time.utc(2026, 8, 15, 13, 0, 0)
+    supervisor, _state, event_recorder = build_supervisor(
+      "ent-1", factory, restart_delay: 0, clock: RunnerSupervisorStubClock.new(requested_at)
+    )
+    supervisor.spawn!
+    supervisor.thread.join(2)
+    supervisor.tick
+    supervisor.request_restart(:manual)
+    supervisor.tick
+
+    supervisor.tick
+
+    assert_equal :restarting, supervisor.state
+    assert_equal 1, supervisor.generation
+    assert_empty event_recorder.calls
+    assert_nil supervisor.cancel_token, "a failed replacement must not retain the dead generation's token"
+
+    supervisor.tick
+
+    assert_equal 2, supervisor.generation
+    refute_nil supervisor.cancel_token
+    refute supervisor.cancel_token.value
+    event = event_recorder.calls.fetch(0).last
+    assert_equal [:manual], event[:actor]
+    assert_equal requested_at.iso8601(3), event[:requested_at]
+  ensure
+    supervisor&.thread&.join(2)
+  end
+
   def test_spawn_is_refused_while_the_current_thread_is_still_alive
     shutdown_flag = AgentDaemon::ShutdownFlag.new
     supervisor, = build_supervisor(
-      "ent-1", ->(_bundle) { RunnerSupervisorLoopingFake.new(shutdown_flag) }, shutdown_flag: shutdown_flag
+      "ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorLoopingFake.new(shutdown_flag) }, shutdown_flag: shutdown_flag
     )
     supervisor.spawn!
     first_thread = supervisor.thread
@@ -397,7 +934,7 @@ class TestRunnerSupervisor < Minitest::Test
 
   def test_raising_factory_is_contained_and_retried_without_burning_a_generation
     attempts = 0
-    factory = lambda do |_bundle|
+    factory = lambda do |_bundle, _cancel_token = nil|
       attempts += 1
       raise "cannot construct" if attempts == 1
 
@@ -420,7 +957,7 @@ class TestRunnerSupervisor < Minitest::Test
   end
 
   def test_request_restart_rejects_nil_actor
-    supervisor, = build_supervisor("ent-1", ->(_bundle) { RunnerSupervisorCleanExitFake.new })
+    supervisor, = build_supervisor("ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCleanExitFake.new })
 
     assert_raises(ArgumentError) { supervisor.request_restart(nil) }
   end
@@ -429,7 +966,7 @@ class TestRunnerSupervisor < Minitest::Test
 
   def test_state_machine_is_kind_agnostic_for_messenger_and_reactor_ids
     ["messenger:wf", "mattermost_reactor"].each do |entity_id|
-      supervisor, state_recorder = build_supervisor(entity_id, ->(_bundle) { RunnerSupervisorCrashingFake.new })
+      supervisor, state_recorder = build_supervisor(entity_id, ->(_bundle, _cancel_token = nil) { RunnerSupervisorCrashingFake.new })
 
       supervisor.spawn!
       supervisor.thread.join(1)
@@ -452,13 +989,14 @@ class TestRunnerSupervisor < Minitest::Test
   def test_shutdown_flag_prevents_respawn_after_delay_expires
     shutdown_flag = AgentDaemon::ShutdownFlag.new
     supervisor, = build_supervisor(
-      "ent-1", ->(_bundle) { RunnerSupervisorCrashingFake.new }, shutdown_flag: shutdown_flag
+      "ent-1", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCrashingFake.new }, shutdown_flag: shutdown_flag
     )
     supervisor.spawn!
     supervisor.thread.join(1)
     supervisor.tick
 
     shutdown_flag.set!
+    supervisor.request_restart(:manual_after_shutdown)
     sleep(0.06)
     supervisor.tick
 
@@ -477,7 +1015,7 @@ class TestRunnerSupervisor < Minitest::Test
   def test_constructor_rejects_nil_entity_id
     assert_raises(ArgumentError) do
       AgentDaemon::Supervisor::RunnerSupervisor.new(
-        nil, entity_factory: ->(_bundle) {}, shutdown_flag: AgentDaemon::ShutdownFlag.new
+        nil, entity_factory: ->(_bundle, _cancel_token = nil) {}, shutdown_flag: AgentDaemon::ShutdownFlag.new
       )
     end
   end
@@ -495,7 +1033,7 @@ class TestRunnerSupervisor < Minitest::Test
 
   def test_ambient_tag_and_generation_bump_across_respawn
     io = capture_log
-    supervisor, = build_supervisor("wf:r", ->(_bundle) { RunnerSupervisorLoggingCrashFake.new })
+    supervisor, = build_supervisor("wf:r", ->(_bundle, _cancel_token = nil) { RunnerSupervisorLoggingCrashFake.new })
 
     supervisor.spawn!
     supervisor.thread.join(1)
@@ -511,7 +1049,7 @@ class TestRunnerSupervisor < Minitest::Test
   def test_ambient_level_gates_the_entitys_own_lines_but_not_the_crash_log
     io = capture_log
     supervisor, = build_supervisor(
-      "wf:r", ->(_bundle) { RunnerSupervisorLoggingCrashFake.new }, log_level: ::Logger::WARN
+      "wf:r", ->(_bundle, _cancel_token = nil) { RunnerSupervisorLoggingCrashFake.new }, log_level: ::Logger::WARN
     )
 
     supervisor.spawn!
@@ -523,7 +1061,7 @@ class TestRunnerSupervisor < Minitest::Test
 
   def test_crash_log_carries_a_single_tag_not_a_double_prefix
     io = capture_log
-    supervisor, = build_supervisor("wf:r", ->(_bundle) { RunnerSupervisorCrashingFake.new })
+    supervisor, = build_supervisor("wf:r", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCrashingFake.new })
 
     supervisor.spawn!
     supervisor.thread.join(1)
@@ -533,7 +1071,7 @@ class TestRunnerSupervisor < Minitest::Test
 
   def test_crash_path_logs_entering_restarting_and_successful_respawn_generation
     io = capture_log
-    supervisor, = build_supervisor("wf:r", ->(_bundle) { RunnerSupervisorCrashingFake.new })
+    supervisor, = build_supervisor("wf:r", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCrashingFake.new })
 
     supervisor.spawn!
     supervisor.thread.join(1)
@@ -549,7 +1087,7 @@ class TestRunnerSupervisor < Minitest::Test
 
   def test_clean_exit_logs_terminal_line
     io = capture_log
-    supervisor, = build_supervisor("wf:r", ->(_bundle) { RunnerSupervisorCleanExitFake.new })
+    supervisor, = build_supervisor("wf:r", ->(_bundle, _cancel_token = nil) { RunnerSupervisorCleanExitFake.new })
 
     supervisor.spawn!
     supervisor.thread.join(1)
@@ -561,7 +1099,7 @@ class TestRunnerSupervisor < Minitest::Test
   def test_stopping_clean_death_logs_exit_and_entering_restarting
     io = capture_log
     stop_flag = AgentDaemon::ShutdownFlag.new
-    supervisor, = build_supervisor("wf:r", ->(_bundle) { RunnerSupervisorStoppableFake.new(stop_flag) })
+    supervisor, = build_supervisor("wf:r", ->(_bundle, _cancel_token = nil) { RunnerSupervisorStoppableFake.new(stop_flag) })
     supervisor.spawn!
     first_thread = supervisor.thread
 
@@ -582,7 +1120,7 @@ class TestRunnerSupervisor < Minitest::Test
   def test_failed_spawn_logs_spawn_failed_and_entering_restarting
     io = capture_log
     attempts = 0
-    factory = lambda do |_bundle|
+    factory = lambda do |_bundle, _cancel_token = nil|
       attempts += 1
       raise "cannot construct" if attempts == 1
 

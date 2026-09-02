@@ -220,12 +220,14 @@ class TestEventBus < Minitest::Test
   # keeps this safe is "do not mutate what the bus hands you": ActivityLog
   # copies it into an Entry Struct and the console only joins it for display.
   def test_records_copies_one_level_deep_so_a_nested_actor_array_is_still_shared
-    @bus.publish("ent-1", { type: :restart, actor: [:crash_auto], generation: 2 })
+    @bus.publish("ent-1", { type: :restart, actor: [:crash_auto], generation: 2,
+                             requested_at: "2026-08-19T10:15:04.221Z" })
 
     @bus.records.first[:actor] << :INJECTED
 
     assert_equal %i[crash_auto INJECTED], @bus.records.first[:actor],
                  "nested values are shared by design; if this ever becomes a deep copy, " \
                  "update EventBus#records' contract comment and ActivityLog's dup caveat"
+    assert_equal "2026-08-19T10:15:04.221Z", @bus.records.first[:requested_at]
   end
 end
