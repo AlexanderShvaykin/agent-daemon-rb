@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.14.1] - 2026-09-03
+
+### Fixed
+- The Messenger now discovers outgoing message files with either the `.yml` or `.yaml` extension, processes the combined queue in lexicographic filename order, and preserves each filename and extension when moving successfully delivered messages to `sent/`.
+
 ## [0.14.0] - 2026-09-02
 
 ### Added
