@@ -194,10 +194,11 @@ Claude failure.
 
 ## Messenger
 
-Polls `message_dir` for `*.yml` files every `messenger.interval` seconds. Each
+Polls `message_dir` for `*.yml` and `*.yaml` files every `messenger.interval`
+seconds, processing the combined queue in lexicographic filename order. Each
 file must contain at least a `message` key. The Messenger delegates delivery to
 a **transport** chosen by `messenger.type`, then moves the file to a `sent/`
-subdirectory on success.
+subdirectory on success without changing its basename or extension.
 
 Three consecutive send failures log a critical warning but do not escalate
 further (there is no meta-notification path for the notifier itself).

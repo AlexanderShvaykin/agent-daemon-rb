@@ -46,7 +46,7 @@ module AgentDaemon
     private
 
     def iterate
-      files = Dir.glob(File.join(to_message_path, "*.yml"))
+      files = Dir.glob(File.join(to_message_path, "*.{yml,yaml}")).sort
       return if files.empty?
 
       Log.info("[Messenger] Found #{files.size} message(s) to send")

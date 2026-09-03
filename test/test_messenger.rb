@@ -102,6 +102,36 @@ class TestMessenger < Minitest::Test
     }.tap { |config| config["alerts"] = alerts if alerts }
   end
 
+  def test_iterate_processes_yml_and_yaml_in_global_filename_order
+    files = {
+      "post-2-result.yml" => "post-2-result.yml",
+      "post-1-ack.yaml" => "post-1-ack.yaml",
+      "reply.yml" => "reply.yml",
+      "reply.yaml" => "reply.yaml"
+    }
+    files.each do |filename, task_key|
+      File.write(
+        File.join(@message_dir, filename),
+        { "task_key" => task_key, "message" => task_key }.to_yaml
+      )
+    end
+    ignored_path = File.join(@message_dir, "post-3.yaml.tmp")
+    File.write(ignored_path, { "task_key" => "ignored" }.to_yaml)
+
+    config = ConfigStub.new(mattermost_config, @message_dir)
+    messenger = AgentDaemon::Messenger.new(config, ShutdownStub.new)
+    transport = TransportStub.new
+    messenger.instance_variable_set(:@transport, transport)
+
+    messenger.send(:iterate)
+
+    expected_order = files.keys.sort
+    assert_equal expected_order, transport.messages.map { |message| message["task_key"] }
+    assert_equal expected_order, Dir.children(File.join(@message_dir, "sent")).sort
+    files.each_key { |filename| refute_path_exists File.join(@message_dir, filename) }
+    assert_path_exists ignored_path
+  end
+
   def test_routes_system_alert_to_configured_user_as_separate_post
     delivered = process(
       mattermost_config("user" => "alexander.shvaykin"),

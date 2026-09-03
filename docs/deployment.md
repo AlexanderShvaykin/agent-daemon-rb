@@ -207,6 +207,6 @@ restarting the service.
 - Service does not start: inspect `journalctl -u agent-daemon@<instance> --since 10m`
 - Prompt template path errors: verify paths are relative to the config file
   directory, not the current shell directory
-- No webhook messages: check for stuck `.yml` files in `message_dir`
+- No webhook messages: check for stuck `.yml` or `.yaml` files in `message_dir`
 - Multiple instances interfere with each other: make sure each config uses a
   unique `message_dir`
