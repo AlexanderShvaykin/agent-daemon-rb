@@ -28,13 +28,30 @@ end
 # `delete_failures` names ids whose first delete attempt raises, so the retry
 # path is exercised without any timing.
 class StubPachcaClient
-  attr_reader :deleted, :fetches
+  attr_reader :deleted, :fetches, :reactions
 
   def initialize(pages, delete_failures: [])
     @pages = pages.dup
     @delete_failures = delete_failures.dup
     @deleted = []
     @fetches = 0
+    @reactions = []
+  end
+
+  def add_reaction(message_id, code:, name: nil)
+    raise "нет такой реакции" if @reaction_failure
+
+    @reactions << [:add, message_id, code, name]
+    true
+  end
+
+  def remove_reaction(message_id, code:, name: nil)
+    @reactions << [:remove, message_id, code, name]
+    true
+  end
+
+  def fail_reactions!
+    @reaction_failure = true
   end
 
   def events(limit: 50)
@@ -103,11 +120,14 @@ class TestRunnerPachca < Minitest::Test
     runner
   end
 
-  def event(id:, user_id: 222, chat_id: CHAT, event_type: "message_new", content: "привет", **payload)
+  # `id` is the EVENT id (a ULID); `message_id` is the id of the message inside
+  # the payload, which is what a reaction attaches to. Two different ids, and
+  # keeping them apart here is the point.
+  def event(id:, message_id: 555, user_id: 222, chat_id: CHAT, event_type: "message_new", content: "привет", **payload)
     {
       "id" => id,
       "event_type" => event_type,
-      "payload" => { "user_id" => user_id, "chat_id" => chat_id, "content" => content }
+      "payload" => { "id" => message_id, "user_id" => user_id, "chat_id" => chat_id, "content" => content }
         .merge(payload.transform_keys(&:to_s))
     }
   end
@@ -115,6 +135,19 @@ class TestRunnerPachca < Minitest::Test
   def fetch(runner) = runner.send(:fetch_work_items)
   def backend(runner) = runner.instance_variable_get(:@backend)
   def settled(runner) = runner.instance_variable_get(:@settled)
+
+  def capture_log
+    prior = AgentDaemon::Log.instance_variable_get(:@logger)
+    io = StringIO.new
+    logger = ::Logger.new(io)
+    logger.level = ::Logger::INFO
+    logger.formatter = proc { |_severity, _datetime, _progname, msg| "#{msg}\n" }
+    AgentDaemon::Log.use(logger)
+    yield
+    io.string
+  ensure
+    AgentDaemon::Log.instance_variable_set(:@logger, prior)
+  end
 
   # --- filtering -----------------------------------------------------------
 
@@ -132,10 +165,30 @@ class TestRunnerPachca < Minitest::Test
     assert_empty fetch(runner)
   end
 
-  def test_messages_from_other_chats_are_skipped
+  def test_messages_from_other_chats_are_skipped_when_chats_is_set
     runner = build_runner(StubPachcaClient.new([[event(id: "01A", chat_id: 999)]]))
 
     assert_empty fetch(runner)
+  end
+
+  # Without a chats list the runner answers wherever the bot was invited, and
+  # that is what makes direct messages work at all: a DM gets its own chat id,
+  # which cannot be listed in advance.
+  def test_without_chats_every_received_chat_is_listened_to
+    events = [event(id: "01A", chat_id: 999), event(id: "01B", chat_id: 12_345)]
+    runner = build_runner(StubPachcaClient.new([events]), trigger_overrides: { "chats" => nil })
+
+    assert_equal %w[01A 01B], fetch(runner).map { |e| e["id"] }
+  end
+
+  # The effective scope is stated on startup rather than left to be inferred
+  # from the config: with neither list set, the right to command the agent is
+  # exactly the right to talk to the bot.
+  def test_the_effective_scope_is_logged_on_startup
+    assert_match(/listening to every chat the bot receives, any author/,
+                 capture_log { build_runner(StubPachcaClient.new([]), trigger_overrides: { "chats" => nil }) })
+    assert_match(/listening to chats 900, authors 42/,
+                 capture_log { build_runner(StubPachcaClient.new([]), trigger_overrides: { "allowed_users" => [42] }) })
   end
 
   def test_other_event_types_are_skipped
@@ -171,6 +224,61 @@ class TestRunnerPachca < Minitest::Test
     runner = build_runner(StubPachcaClient.new([[{ "id" => "01A", "event_type" => "message_new" }]]))
 
     assert_empty fetch(runner)
+  end
+
+  # Verbatim from a live message_new, which is where the two surprises below
+  # come from: chat_id is the THREAD's chat, and the thread object carries no
+  # id of its own.
+  def threaded_event
+    {
+      "id" => "01M1RWHTDFM26GDFQQ8B8R1GDT",
+      "event_type" => "message_new",
+      "payload" => {
+        "event" => "new", "type" => "message",
+        "chat_id" => 43_358_443, "user_id" => 222, "id" => 1_067_135_135,
+        "created_at" => "2026-09-05T13:36:27.000Z", "parent_message_id" => nil,
+        "content" => "test", "entity_type" => "thread", "entity_id" => 33_177_699,
+        "thread" => { "message_id" => 1_067_133_444, "message_chat_id" => 43_358_437 },
+        "url" => "https://app.pachca.com/chats?thread_message_id=1067133444"
+      }
+    }
+  end
+
+  # An operator lists the chat id they can actually see, which for a threaded
+  # message is thread.message_chat_id — chat_id belongs to the thread itself.
+  # Matching only chat_id would silently drop every threaded message in a
+  # chat the operator did list.
+  def test_a_thread_matches_the_chat_it_hangs_in
+    runner = build_runner(StubPachcaClient.new([[threaded_event]]), trigger_overrides: { "chats" => [43_358_437] })
+
+    refute_empty fetch(runner)
+  end
+
+  def test_a_thread_also_matches_its_own_chat_id
+    runner = build_runner(StubPachcaClient.new([[threaded_event]]), trigger_overrides: { "chats" => [43_358_443] })
+
+    refute_empty fetch(runner)
+  end
+
+  def test_an_unrelated_chat_still_does_not_match
+    runner = build_runner(StubPachcaClient.new([[threaded_event]]), trigger_overrides: { "chats" => [999] })
+
+    assert_empty fetch(runner)
+  end
+
+  # Replying into the originating thread means echoing entity_type/entity_id
+  # back to POST /messages; the thread object holds only the message it hangs
+  # off of, and no id of its own.
+  def test_a_threaded_event_exposes_the_real_reply_target
+    runner = build_runner(StubPachcaClient.new([[threaded_event]]), trigger_overrides: { "chats" => nil })
+    vars = runner.send(:event_variables, threaded_event)
+
+    assert_equal "thread", vars["entity_type"]
+    assert_equal 33_177_699, vars["entity_id"]
+    assert_equal 1_067_133_444, vars["thread_message_id"]
+    assert_equal 43_358_437, vars["thread_chat_id"]
+    assert_equal "test", vars["message"]
+    refute_nil vars["url"]
   end
 
   # --- prompt --------------------------------------------------------------
@@ -257,5 +365,146 @@ class TestRunnerPachca < Minitest::Test
 
     assert_equal 17, runner.instance_variable_get(:@backoff)
     assert_equal 0, runner.instance_variable_get(:@consecutive_errors)
+  end
+
+  # --- acknowledging what is ignored ---------------------------------------
+
+  # Every answer the agent posts comes back as an event authored by the bot.
+  # The author gate drops it, and if nothing cleared it the history would only
+  # grow — until `limit` of them push real questions off the page and the
+  # runner goes deaf. Observed live: one such event was already sitting there.
+  def test_the_bots_own_message_is_acknowledged_not_just_skipped
+    client = StubPachcaClient.new([[event(id: "01A", user_id: BOT)]])
+    runner = build_runner(client)
+
+    assert_empty fetch(runner)
+    assert_equal %w[01A], client.deleted
+  end
+
+  def test_an_event_of_an_unwatched_type_is_acknowledged
+    client = StubPachcaClient.new([[event(id: "01A", event_type: "reaction_new")]])
+
+    assert_empty fetch(build_runner(client))
+    assert_equal %w[01A], client.deleted
+  end
+
+  def test_an_event_from_an_unlisted_chat_is_acknowledged
+    client = StubPachcaClient.new([[event(id: "01A", chat_id: 999)]])
+
+    assert_empty fetch(build_runner(client))
+    assert_equal %w[01A], client.deleted
+  end
+
+  def test_an_event_from_an_unauthorized_author_is_acknowledged
+    client = StubPachcaClient.new([[event(id: "01A", user_id: 333)]])
+    runner = build_runner(client, trigger_overrides: { "allowed_users" => [222] })
+
+    assert_empty fetch(runner)
+    assert_equal %w[01A], client.deleted
+  end
+
+  # Acknowledging what is ignored must not touch what is not.
+  def test_a_wanted_event_survives_a_page_full_of_ignored_ones
+    events = [event(id: "01A", user_id: BOT), event(id: "01B"), event(id: "01C", event_type: "reaction_new")]
+    client = StubPachcaClient.new([events])
+
+    assert_equal %w[01B], fetch(build_runner(client)).map { |e| e["id"] }
+    assert_equal %w[01A 01C], client.deleted.sort
+  end
+
+  # --- thinking indicator --------------------------------------------------
+
+  # A run takes minutes. Without this the person who asked sees nothing at all
+  # until the answer lands; Pachca renders a live timer for a reaction named
+  # agent-thinking, which is the native version of that acknowledgement.
+  def test_the_indicator_goes_on_before_the_run_and_off_after_it
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    runner = build_runner(client)
+
+    runner.send(:iterate)
+
+    assert_equal %i[add remove], client.reactions.map(&:first)
+    assert_equal %w[agent-thinking agent-thinking], client.reactions.first.last(2)
+  end
+
+  # Checked against the live API: colons around the name make Pachca resolve it
+  # as a custom emoji id and answer 404, even though colons are exactly the form
+  # it returns for stock shortcodes.
+  def test_a_custom_reaction_is_named_bare_in_both_fields
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    build_runner(client).send(:iterate)
+
+    _, _, code, name = client.reactions.first
+    assert_equal "agent-thinking", code
+    assert_equal "agent-thinking", name
+  end
+
+  # A stock emoji is the glyph alone; the API fills the name in itself, and
+  # sending one would be the same mistake in reverse.
+  def test_a_stock_emoji_is_sent_as_the_glyph_without_a_name
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    runner = build_runner(client, trigger_overrides: { "thinking_reaction" => "👀" })
+
+    runner.send(:iterate)
+
+    _, _, code, name = client.reactions.first
+    assert_equal "👀", code
+    assert_nil name
+  end
+
+  def test_the_indicator_is_attached_to_the_message_not_the_event
+    client = StubPachcaClient.new([[event(id: "01A", message_id: 555)]])
+    build_runner(client).send(:iterate)
+
+    assert_equal [555, 555], client.reactions.map { |r| r[1] }
+  end
+
+  # Below max_attempts the question is still being worked on, so the indicator
+  # stays up across the retry rather than flickering.
+  def test_a_retry_keeps_the_indicator_up_and_does_not_re_add_it
+    events = [event(id: "01A", message_id: 555)]
+    client = StubPachcaClient.new([events, events])
+    runner = build_runner(client, reasons: %i[failed ok])
+
+    2.times { runner.send(:iterate) }
+
+    assert_equal %i[add remove], client.reactions.map(&:first)
+  end
+
+  # Shutdown rolled the attempt back, so the question is unanswered — but the
+  # timer must not sit there over a process that is gone.
+  def test_a_killed_run_takes_the_indicator_down
+    client = StubPachcaClient.new([[event(id: "01A", message_id: 555)]])
+    runner = build_runner(client, reasons: [:killed])
+
+    runner.send(:iterate)
+
+    assert_equal %i[add remove], client.reactions.map(&:first)
+  end
+
+  # The custom reaction has to be created by hand in Pachca. When it is not,
+  # one warning is worth more than one per message forever — and the run must
+  # not fail over a courtesy.
+  def test_a_missing_reaction_disables_the_indicator_once_and_never_fails_a_run
+    events = [event(id: "01A", message_id: 555)]
+    client = StubPachcaClient.new([events, [event(id: "01B", message_id: 556)]])
+    client.fail_reactions!
+    runner = build_runner(client)
+
+    log = capture_log { 2.times { runner.send(:iterate) } }
+
+    assert_equal 1, log.scan(/thinking indicator off/).size
+    assert_match(/Create a custom reaction named "agent-thinking"/, log)
+    assert_equal 2, backend(runner).prompts.size, "the runs must still happen"
+    assert_equal %w[01A 01B], client.deleted
+  end
+
+  def test_the_indicator_can_be_turned_off_in_config
+    client = StubPachcaClient.new([[event(id: "01A", message_id: 555)]])
+    runner = build_runner(client, trigger_overrides: { "thinking_reaction" => nil })
+
+    runner.send(:iterate)
+
+    assert_empty client.reactions
   end
 end

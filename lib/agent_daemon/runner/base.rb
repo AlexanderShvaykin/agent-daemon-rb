@@ -130,6 +130,7 @@ module AgentDaemon
 
         @sinks.publish_event(type: :started, work_item: key, attempt: attempt_no, at: Time.now.utc.iso8601)
         @sinks.publish_state(status: :in_progress, work_item: key, attempt: attempt_no)
+        before_attempt(item)
         result = @backend.run(prompt)
 
         case result.reason
@@ -172,6 +173,13 @@ module AgentDaemon
       def render_prompt(_item)
         raise NotImplementedError, "#{self.class}#render_prompt"
       end
+
+      # Called once per attempt, immediately before the backend runs — the
+      # point where a subclass can tell the source it was heard. A run takes
+      # minutes, so for a chat trigger this is the difference between a person
+      # seeing an acknowledgement and seeing silence. Must be cheap and must
+      # not raise: it sits directly in front of the agent invocation.
+      def before_attempt(_item); end
 
       def after_success(_item); end
       def after_failure(_item); end

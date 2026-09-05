@@ -87,12 +87,16 @@ class TestConfigPachcaTrigger < Minitest::Test
     assert_match(/trigger\.bot_user_id is required/, error_for({"bot_user_id" => "111"}))
   end
 
-  def test_chats_must_be_present_and_non_empty
-    assert_match(/trigger\.chats must be a non-empty Array/, error_for({"chats" => []}))
-    assert_match(/trigger\.chats must be a non-empty Array/, error_for(remove: %w[chats]))
+  # Optional, unlike the mattermost trigger's channels: the history only ever
+  # holds what the bot itself received, so its chat memberships are already the
+  # scope. Requiring it would also lock out direct messages outright, since a DM
+  # gets its own chat id that cannot be known in advance.
+  def test_chats_may_be_omitted_entirely
+    assert_nil load(remove: %w[chats]).runners.first.dig("trigger", "chats")
   end
 
-  def test_chats_must_hold_integer_ids_not_names
+  def test_chats_is_still_validated_when_present
+    assert_match(/trigger\.chats must be a non-empty Array/, error_for({"chats" => []}))
     assert_match(/trigger\.chats must be a non-empty Array/, error_for({"chats" => %w[general]}))
   end
 

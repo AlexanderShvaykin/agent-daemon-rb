@@ -46,14 +46,66 @@ module AgentDaemon
         true
       end
 
+      # Post one message. `entity_type` is "discussion" (a chat or channel),
+      # "thread", or "user" — the last one addresses a person directly and
+      # opens the conversation on first contact, so a DM needs no channel
+      # created first. `parent_message_id` threads the post as a reply.
+      #
+      # The API nests everything under a "message" object; a flat body is
+      # rejected as a validation error, not silently ignored.
+      def create_message(entity_type:, entity_id:, content:, parent_message_id: nil)
+        message = {
+          "entity_type" => entity_type,
+          "entity_id" => entity_id,
+          "content" => content.to_s
+        }
+        message["parent_message_id"] = parent_message_id if parent_message_id
+
+        post("/messages", "message" => message)
+      end
+
+      # The thread hanging off a message, created if it is not there yet. This
+      # is what answering "in a thread" requires when the question was a plain
+      # channel message: such a message has no thread of its own, so posting
+      # back with its entity pair lands in the channel, not under it.
+      # Idempotent — an existing thread is returned rather than duplicated.
+      def create_thread(message_id)
+        body = post("/messages/#{Integer(message_id)}/thread", nil)
+        body["data"] || body
+      end
+
+      # Put a reaction on a message. `code` is the emoji itself for a stock
+      # one; a custom reaction is identified by `name` (":agent-thinking:"),
+      # which is what the agent-thinking indicator uses — Pachca renders a live
+      # timer instead of a counter for a reaction by that name.
+      def add_reaction(message_id, code:, name: nil)
+        body = { "code" => code }
+        body["name"] = name if name
+        post("/messages/#{Integer(message_id)}/reactions", body)
+      end
+
+      def remove_reaction(message_id, code:, name: nil)
+        body = { "code" => code }
+        body["name"] = name if name
+        delete("/messages/#{Integer(message_id)}/reactions", body)
+      end
+
       private
 
       def get(path)
         request(Net::HTTP::Get.new(API_PREFIX + path))
       end
 
-      def delete(path)
-        request(Net::HTTP::Delete.new(API_PREFIX + path), allow_not_found: true)
+      def delete(path, body = nil)
+        req = Net::HTTP::Delete.new(API_PREFIX + path)
+        req.body = JSON.generate(body) if body
+        request(req, allow_not_found: true)
+      end
+
+      def post(path, body)
+        req = Net::HTTP::Post.new(API_PREFIX + path)
+        req.body = JSON.generate(body) if body
+        request(req)
       end
 
       def request(req, allow_not_found: false)

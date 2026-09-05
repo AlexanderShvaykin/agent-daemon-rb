@@ -51,7 +51,7 @@ module AgentDaemon
 
     VALID_TRIGGER_TYPES   = %w[tracker file mattermost pachca].freeze
     VALID_BACKENDS        = %w[claude opencode].freeze
-    VALID_MESSENGER_TYPES = %w[webhook mattermost].freeze
+    VALID_MESSENGER_TYPES = %w[webhook mattermost pachca].freeze
     MATTERMOST_REQUIRED   = %w[base_url token team default_channel].freeze
 
     attr_reader :data, :config_dir, :config_path
@@ -247,6 +247,7 @@ module AgentDaemon
         return ["messenger.type must be one of #{VALID_MESSENGER_TYPES.join(', ')} (got #{type.inspect})"]
       end
 
+      return validate_pachca_messenger(messenger).concat(validate_alerts(messenger, type)) if type == "pachca"
       return validate_alerts(messenger, type) unless type == "mattermost"
 
       errors = MATTERMOST_REQUIRED.filter_map do |key|
@@ -255,6 +256,22 @@ module AgentDaemon
         "messenger.#{key} is required when messenger.type is mattermost"
       end
       errors.concat(validate_alerts(messenger, type))
+    end
+
+    # Pachca addresses everything by numeric id, so default_chat_id is an
+    # Integer rather than a name — there is no name resolution to fall back on,
+    # and a SYSTEM:<runner> error carries no routing fields of its own.
+    def validate_pachca_messenger(messenger)
+      errors = []
+
+      unless messenger["token"].is_a?(String) && !messenger["token"].empty?
+        errors << "messenger.token is required when messenger.type is pachca (String)"
+      end
+      unless positive_integer?(messenger["default_chat_id"])
+        errors << "messenger.default_chat_id is required when messenger.type is pachca (positive Integer chat id, not a name)"
+      end
+
+      errors
     end
 
     def validate_alerts(messenger, type)
@@ -475,9 +492,16 @@ module AgentDaemon
         unless positive_integer?(trigger["bot_user_id"])
           errors << "runner #{runner_label.inspect}: trigger.bot_user_id is required (positive Integer) — without it the runner re-ingests its own replies and loops"
         end
-        chats = trigger["chats"]
-        unless chats.is_a?(Array) && !chats.empty? && chats.all? { |chat| positive_integer?(chat) }
-          errors << "runner #{runner_label.inspect}: trigger.chats must be a non-empty Array of positive Integer chat ids"
+        # Optional, unlike the mattermost trigger's channels. The history only
+        # ever holds what the bot itself received, so the chats it was invited
+        # to are already the scope; naming them here narrows it further. Making
+        # it mandatory would also lock out direct messages outright, since a DM
+        # gets its own chat id that cannot be known in advance.
+        if trigger.key?("chats")
+          chats = trigger["chats"]
+          unless chats.is_a?(Array) && !chats.empty? && chats.all? { |chat| positive_integer?(chat) }
+            errors << "runner #{runner_label.inspect}: trigger.chats must be a non-empty Array of positive Integer chat ids when present"
+          end
         end
         if trigger.key?("allowed_users")
           allowed = trigger["allowed_users"]

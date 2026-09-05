@@ -15,6 +15,12 @@ module AgentDaemon
       case messenger_config["type"]
       when "mattermost"
         Config::MATTERMOST_REQUIRED.all? { |key| !messenger_config[key].to_s.empty? }
+      when "pachca"
+        # Config validation already guarantees both, so this only ever answers
+        # true for a config that loaded — it exists so the case is exhaustive
+        # rather than falling through to the webhook_url check, which a pachca
+        # messenger never sets.
+        !messenger_config["token"].to_s.empty? && !messenger_config["default_chat_id"].to_s.empty?
       else
         !messenger_config["webhook_url"].to_s.empty?
       end

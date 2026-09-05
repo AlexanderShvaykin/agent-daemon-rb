@@ -87,4 +87,8 @@ class FakeServerError < Net::HTTPServerError
 
   def code = "503"
   def body = "unavailable"
+  # Net::HTTPResponse#[] reads a header hash these fakes never build, so a
+  # transport that inspects one (Content-Type, Retry-After) would blow up on
+  # the fixture rather than on its own logic.
+  def [](_name) = nil
 end
