@@ -154,6 +154,56 @@ runners:
   #   message_dir: to_message   # where the reply YAML is written (default to_message)
   #   # output_dir: to_message  # set if the agent writes other message files
 
+  # Example 5: a Pachca bot answering questions.
+  #
+  # A poller, not a listener: Pachca has no realtime API, and its event history
+  # needs no public URL at all — enable "save event history" on the bot and
+  # leave its Webhook URL empty. Reading plus deleting makes that history a
+  # queue with an explicit ack, so nothing is answered twice.
+  #
+  # - name: qa
+  #   backend: claude
+  #   trigger:
+  #     type: pachca
+  #     token: <%= secret('PACHCA_BOT_TOKEN') %>
+  #     # Required, and not just bookkeeping: the agent replies into the chat it
+  #     # reads, so without its own id it re-ingests its own answers and loops.
+  #     bot_user_id: 111
+  #     # Optional. Absent means every chat the bot receives, which is what lets
+  #     # direct messages work at all (a DM's chat id cannot be known upfront).
+  #     # A listed chat also matches its threads, whose own chat_id differs.
+  #     # chats: [900, 901]
+  #     # Optional allowlist of author user ids. While it is empty, the right to
+  #     # command the agent is the right to talk to the bot.
+  #     # allowed_users: [42]
+  #     # Pachca renders a live timer for a reaction named agent-thinking, which
+  #     # is the acknowledgement a run lasting minutes needs. Create the custom
+  #     # reaction first; set to null to switch the indicator off.
+  #     # thinking_reaction: agent-thinking
+  #     # How many earlier thread messages to put in front of the question, as
+  #     # {{thread_context}}. Threads only: a reply there is routinely
+  #     # unreadable on its own, while a question asked in a channel carries
+  #     # its own context and recent channel chatter would be noise. 0 is off.
+  #     # 50 is the default and what one request returns; above that the client
+  #     # pages through the cursor, one request per 50, capped at 500. The
+  #     # default stays at one request because most threads never reach it.
+  #     # context_messages: 50
+  #     # event_types: [message_new]   # default
+  #     # interval: 5                  # poll interval, seconds (default 5)
+  #     # jitter: 1                    # random 0..jitter s per cycle (default 1)
+  #   prompt_template: prompts/qa.txt
+  #
+  # The prompt gets the payload flattened: {{message}}, {{sender_id}},
+  # {{chat_id}}, {{message_id}}, {{entity_type}}, {{entity_id}},
+  # {{parent_message_id}}, {{thread_message_id}}, {{thread_chat_id}},
+  # {{event_id}}, {{created_at}}, {{url}}, plus {{thread_context}} — the thread
+  # so far as a transcript, the agent's own lines labelled "bot".
+  #
+  # To answer in the originating thread the reply YAML echoes entity_type and
+  # entity_id straight back, plus reply_to_message_id so a question asked in a
+  # channel gets a thread created for it. The transport picks between the two;
+  # a prompt cannot be trusted to branch on where the question came from.
+
 # Messenger thread — picks up YAML files from message_dir and delivers them
 # via the configured transport. Select the transport with `type` (default
 # "webhook"). The thread only starts when the selected transport is fully
@@ -181,6 +231,20 @@ messenger:
   # token: <%= secret('MM_BOT_TOKEN') %>      # bot access token
   # team: your-team-slug                      # channel names resolve within this team
   # default_channel: alerts                   # fallback for unaddressed messages
+
+  # --- pachca transport ---
+  # Everything is addressed by numeric id, so there is no name resolution and
+  # nothing to cache — and a direct message needs no channel opened first.
+  # A message YAML picks its destination by precedence: entity_id (with an
+  # optional entity_type, which is how the pachca trigger answers in-thread) ->
+  # user (DM) -> chat_id -> default_chat_id. An optional parent_message_id
+  # threads the post.
+  # type: pachca
+  # token: <%= secret('PACHCA_BOT_TOKEN') %>  # bot access token
+  # # base_url: "https://api.pachca.com"      # default
+  # default_chat_id: 900                      # numeric id, not a name: where an
+  #                                           # unaddressed message goes, which
+  #                                           # includes SYSTEM:<runner> errors
 
 logging:
   level: info

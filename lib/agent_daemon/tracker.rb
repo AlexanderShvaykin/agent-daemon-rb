@@ -10,12 +10,9 @@ module AgentDaemon
     DEFAULT_BACKOFF  = 60
 
     # Raised on an HTTP 429, carrying how long to wait before polling again.
-    class RateLimitError < StandardError
-      attr_reader :retry_after
-
+    class RateLimitError < AgentDaemon::RateLimitError
       def initialize(retry_after)
-        @retry_after = retry_after
-        super("Tracker API 429: rate limited, retry after #{retry_after}s")
+        super(retry_after, "Tracker API 429: rate limited, retry after #{retry_after}s")
       end
     end
 

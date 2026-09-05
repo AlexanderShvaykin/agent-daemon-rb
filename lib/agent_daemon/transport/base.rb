@@ -2,7 +2,7 @@
 
 module AgentDaemon
   module Transport
-    VALID_TYPES = %w[webhook mattermost].freeze
+    VALID_TYPES = %w[webhook mattermost pachca].freeze
 
     # Dispatch on messenger_config["type"] (default "webhook"), mirroring
     # Backend.for. An unknown type raises ArgumentError listing valid values.
@@ -13,6 +13,8 @@ module AgentDaemon
         Webhook.new(messenger_config)
       when "mattermost"
         Mattermost.new(messenger_config)
+      when "pachca"
+        Pachca.new(messenger_config)
       else
         raise ArgumentError, "Unsupported messenger type #{type.inspect}. Valid values: #{VALID_TYPES.join(', ')}"
       end
