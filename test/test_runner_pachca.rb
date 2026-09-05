@@ -59,14 +59,21 @@ class StubPachcaClient
     (@pages.shift || []).sort_by { |event| event["id"].to_s }
   end
 
-  attr_writer :history, :history_error
-  attr_reader :message_queries
+  attr_writer :history, :history_error, :root, :root_error
+  attr_reader :message_queries, :message_gets
 
   def messages(chat_id:, limit: 20)
     raise @history_error if @history_error
 
     (@message_queries ||= []) << [chat_id, limit]
     Array(@history)
+  end
+
+  def message(id)
+    raise @root_error if @root_error
+
+    (@message_gets ||= []) << id
+    @root
   end
 
   def delete_event(id)
@@ -379,9 +386,10 @@ class TestRunnerPachca < Minitest::Test
 
   # --- thread context ------------------------------------------------------
 
-  def thread_event(message_id: 555, chat_id: 43_358_443)
+  def thread_event(message_id: 555, chat_id: 43_358_443, root_id: 1_067_133_444)
     event(id: "01A", message_id: message_id, chat_id: chat_id,
-          entity_type: "thread", entity_id: 33_177_699, content: "а почему?")
+          entity_type: "thread", entity_id: 33_177_699, content: "а почему?",
+          thread: { "message_id" => root_id, "message_chat_id" => 43_358_437 })
   end
 
   def history_of(*rows)
@@ -397,6 +405,55 @@ class TestRunnerPachca < Minitest::Test
     context = runner.send(:thread_context, thread_event)
 
     assert_equal "222: деплой сломался\nbot: починил", context
+  end
+
+  # The message a thread hangs off lives in the parent chat, so listing the
+  # thread returns every reply and not the question that started it. Observed
+  # live: an agent following up inside a thread it had opened saw only its own
+  # answer and said the context was incomplete.
+  def test_the_message_the_thread_hangs_off_comes_first
+    client = StubPachcaClient.new([[thread_event]])
+    client.root = { "id" => 1_067_133_444, "user_id" => 222, "content" => "как успехи на сервере?" }
+    client.history = history_of([BOT, "всё поднялось"])
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    context = runner.send(:thread_context, thread_event)
+
+    assert_equal "222: как успехи на сервере?\nbot: всё поднялось", context
+    assert_equal [1_067_133_444], client.message_gets
+  end
+
+  # A standalone thread hangs off nothing and reports message_id as nil.
+  def test_a_standalone_thread_asks_for_no_root_message
+    client = StubPachcaClient.new([[thread_event(root_id: nil)]])
+    client.history = history_of([222, "первое"])
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    assert_equal "222: первое", runner.send(:thread_context, thread_event(root_id: nil))
+    assert_nil client.message_gets
+  end
+
+  # A listing that happens to include the root must not show it twice.
+  def test_the_root_message_is_not_repeated
+    client = StubPachcaClient.new([[thread_event]])
+    client.root = { "id" => 1_067_133_444, "user_id" => 222, "content" => "вопрос" }
+    client.history = [{ "id" => 1_067_133_444, "user_id" => 222, "content" => "вопрос" },
+                      { "id" => 900, "user_id" => BOT, "content" => "ответ" }]
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    assert_equal "222: вопрос\nbot: ответ", runner.send(:thread_context, thread_event)
+  end
+
+  # Losing the root is worth a warning, not the rest of the context.
+  def test_a_failed_root_fetch_still_yields_the_thread
+    client = StubPachcaClient.new([[thread_event]])
+    client.root_error = "boom"
+    client.history = history_of([BOT, "ответ"])
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    log = capture_log { assert_equal "bot: ответ", runner.send(:thread_context, thread_event) }
+
+    assert_match(/could not read the message this thread hangs off/, log)
   end
 
   # The question is already in {{message}}; repeating it wastes tokens and
