@@ -14,4 +14,7 @@ tmp/
 .codex/
 .opencode/
 .pi/
+.idea/
 openspec/
+logs/
+.DS_Store
