@@ -131,14 +131,34 @@ module AgentDaemon
         @sinks.publish_event(type: :started, work_item: key, attempt: attempt_no, at: Time.now.utc.iso8601)
         @sinks.publish_state(status: :in_progress, work_item: key, attempt: attempt_no)
         before_attempt(item)
+        files_before = expects_message_file? ? message_file_names : nil
         result = @backend.run(prompt)
 
         case result.reason
         when :ok
-          @attempts.delete(key)
-          Log.info("[#{log_tag}] #{key} done: #{result.stdout.lines.first&.strip}")
-          Log.debug("[#{log_tag}] Full output:\n#{result.stdout}")
-          after_success(item)
+          # A zero exit code is not the same as work done. Agent CLIs report
+          # success for plenty of runs that produced nothing: an
+          # unauthenticated `claude -p` prints "Not logged in" and exits 0, a
+          # sandbox that refused the write leaves the agent politely explaining
+          # it could not save the file, a message_dir that does not exist does
+          # the same. For a trigger that archives on success the damage is at
+          # least visible; for one that acknowledges by deleting, the work item
+          # is gone and nobody learns a question went unanswered.
+          #
+          # So when a reply was expected and none appeared, this is a failure:
+          # attempt counted, work item kept, next cycle retries.
+          if files_before && (message_file_names - files_before).empty?
+            Log.error("[#{log_tag}] #{key} exited 0 but wrote no message " \
+                      "(attempt #{attempt_no}/#{@max_attempts}): #{result.stdout.lines.last&.strip}")
+            Log.debug("[#{log_tag}] Full output:\n#{result.stdout}")
+            create_error_message("no_message", work_item: key, error_text: result.stdout) if attempt_no >= @max_attempts
+            after_failure(item)
+          else
+            @attempts.delete(key)
+            Log.info("[#{log_tag}] #{key} done: #{result.stdout.lines.first&.strip}")
+            Log.debug("[#{log_tag}] Full output:\n#{result.stdout}")
+            after_success(item)
+          end
         when :timeout
           Log.error("[#{log_tag}] CLI timeout for #{key} (attempt #{attempt_no}/#{@max_attempts})")
           create_error_message("timeout", work_item: key) if attempt_no >= @max_attempts
@@ -172,6 +192,31 @@ module AgentDaemon
 
       def render_prompt(_item)
         raise NotImplementedError, "#{self.class}#render_prompt"
+      end
+
+      # Whether a run that leaves no message file behind should count as a
+      # failure. Off by default: a runner whose agent is expected to act rather
+      # than write — move a ticket, start a detached job — has no artefact to
+      # look for, and demanding one would turn working setups into failing ones.
+      #
+      # A trigger that acknowledges by deleting the work item turns this on,
+      # because there a silent no-op is unrecoverable.
+      def expects_message_file?
+        false
+      end
+
+      # Names of message files, including ones the Messenger has already moved
+      # to sent/. Both directories are counted because the Messenger polls the
+      # same directory: a reply written near the end of a run can be picked up
+      # before this check runs, and missing it would mean answering twice.
+      def message_file_names
+        return [] if @message_dir.nil?
+
+        [@message_dir, ::File.join(@message_dir, "sent")]
+          .flat_map { |dir| Dir.glob(::File.join(dir, "*.{yml,yaml}")) }
+          .map { |path| ::File.basename(path) }
+      rescue SystemCallError
+        []
       end
 
       # Called once per attempt, immediately before the backend runs — the
