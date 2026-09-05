@@ -515,6 +515,16 @@ module AgentDaemon
             errors << "runner #{runner_label.inspect}: trigger.event_types must be a non-empty Array of non-empty Strings"
           end
         end
+        # Bounded because reaching past one page costs a request per 50, all of
+        # them in front of an agent that has not started yet.
+        if trigger.key?("context_messages")
+          count = trigger["context_messages"]
+          max = Runner::Pachca::MAX_CONTEXT_MESSAGES
+          unless count.is_a?(Integer) && !count.negative? && count <= max
+            errors << "runner #{runner_label.inspect}: trigger.context_messages must be an Integer between 0 and #{max} " \
+                      "(0 disables thread context; anything above #{Pachca::Client::MAX_PAGE} is paged, one request per #{Pachca::Client::MAX_PAGE})"
+          end
+        end
         unless trigger["interval"].is_a?(Integer) && trigger["interval"] > 0
           errors << "runner #{runner_label.inspect}: trigger.interval must be a positive Integer"
         end

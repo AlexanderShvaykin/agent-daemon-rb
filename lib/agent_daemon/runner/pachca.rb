@@ -28,6 +28,22 @@ module AgentDaemon
       # indicator for the process rather than warning on every message.
       DEFAULT_THINKING_REACTION = "agent-thinking"
 
+      # How many earlier messages of the thread to put in front of the
+      # question. Only threads: a reply there is routinely unreadable on its
+      # own ("а почему?"), while a question asked in a channel carries its own
+      # context and the last N unrelated channel messages would be noise.
+      # 0 turns it off.
+      #
+      # The default is what one request returns; the client pages past it on
+      # request. The default stays at one request on purpose — most threads
+      # never reach it, so raising it would buy nothing and cost a round trip
+      # in front of every question. The ceiling is where paging stops being
+      # worth its latency: ten requests before the agent starts, and a
+      # transcript already far longer than any thread a person will read.
+      DEFAULT_CONTEXT_MESSAGES = 50
+      MAX_CONTEXT_MESSAGES     = 500
+      THREAD_ENTITY_TYPE       = "thread"
+
       def initialize(runner_config, message_dir, project_path, shutdown_flag, sinks: nil, cancel_flag: nil)
         super
         trigger = runner_config.fetch("trigger")
@@ -39,6 +55,7 @@ module AgentDaemon
         @limit         = trigger.fetch("limit", ::AgentDaemon::Pachca::Client::DEFAULT_LIMIT)
         @settled       = Set.new
 
+        @context_messages  = trigger.fetch("context_messages", DEFAULT_CONTEXT_MESSAGES).to_i
         @thinking_reaction = trigger.fetch("thinking_reaction", DEFAULT_THINKING_REACTION)
         @thinking          = Set.new
         @thinking_off      = false
@@ -96,7 +113,47 @@ module AgentDaemon
       end
 
       def render_prompt(event)
-        @prompt_template.render(base_template_variables.merge(event_variables(event)))
+        variables = base_template_variables
+                    .merge(event_variables(event))
+                    .merge("thread_context" => thread_context(event))
+        @prompt_template.render(variables)
+      end
+
+      # The thread so far, as a transcript, oldest first. Empty for a question
+      # asked outside a thread, and empty — with a warning, never a failure —
+      # when the fetch does not come back: an answer written without the
+      # earlier messages is worse than one written with them, but far better
+      # than no answer at all.
+      def thread_context(event)
+        payload = event["payload"] || {}
+        return "" unless @context_messages.positive?
+        return "" unless payload["entity_type"] == THREAD_ENTITY_TYPE
+
+        chat_id = payload["chat_id"]
+        return "" if chat_id.nil?
+
+        transcript(@client.messages(chat_id: chat_id, limit: @context_messages), skip: payload["id"])
+      rescue => e
+        Log.warn("[#{log_tag}] could not read thread context: #{e.message}; answering without it")
+        ""
+      end
+
+      # The question itself is already in {{message}}, so it is dropped here
+      # rather than repeated. The bot's own lines are labelled: without that a
+      # model reads the whole thread as other people talking and loses track of
+      # what it already said.
+      def transcript(messages, skip:)
+        messages
+          .reject { |message| message["id"] == skip }
+          .map { |message| "#{author_label(message["user_id"])}: #{message["content"]}" }
+          .join("\n")
+      end
+
+      # Ids for people, a fixed label for the bot. Resolving names would cost a
+      # lookup per author, and the model needs to tell its own lines from
+      # everyone else's, not to know who everyone is.
+      def author_label(user_id)
+        user_id.to_i == @bot_user_id ? "bot" : user_id.to_s
       end
 
       # Tell the chat the question was heard, before the agent spends minutes

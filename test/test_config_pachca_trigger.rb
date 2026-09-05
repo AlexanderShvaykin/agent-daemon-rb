@@ -106,6 +106,23 @@ class TestConfigPachcaTrigger < Minitest::Test
     assert_match(/trigger\.allowed_users must be a non-empty Array/, error_for({"allowed_users" => []}))
   end
 
+  # Above one page the client walks the cursor, so more than 50 is allowed —
+  # but bounded, because every extra page is a request made in front of an
+  # agent that has not started yet.
+  def test_context_messages_allows_paging_but_stays_bounded
+    assert_equal 200, load({"context_messages" => 200}).runners.first.dig("trigger", "context_messages")
+    assert_equal 0, load({"context_messages" => 0}).runners.first.dig("trigger", "context_messages")
+
+    message = error_for({"context_messages" => 5000})
+    assert_match(/between 0 and 500/, message)
+    assert_match(/one request per 50/, message)
+  end
+
+  def test_context_messages_rejects_nonsense
+    assert_match(/between 0 and 500/, error_for({"context_messages" => -1}))
+    assert_match(/between 0 and 500/, error_for({"context_messages" => "20"}))
+  end
+
   def test_event_types_is_optional_but_validated_when_present
     assert_equal %w[button_click], load({"event_types" => %w[button_click]}).runners.first.dig("trigger", "event_types")
     assert_match(/trigger\.event_types must be a non-empty Array/, error_for({"event_types" => [""]}))

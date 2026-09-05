@@ -21,6 +21,11 @@ module AgentDaemon
       DEFAULT_BACKOFF  = 60
       DEFAULT_LIMIT    = 50
 
+      # The most any single list request returns (the API's own cap), and the
+      # most pages #messages will walk before giving up on a chat.
+      MAX_PAGE  = 50
+      MAX_PAGES = 20
+
       def initialize(config)
         @token           = config.fetch("token")
         @base_url        = URI(config.fetch("base_url", DEFAULT_BASE_URL))
@@ -64,6 +69,47 @@ module AgentDaemon
         post("/messages", "message" => message)
       end
 
+      # The most recent messages of a chat, oldest first — the order a
+      # transcript is read in, which is not the order the API returns them.
+      #
+      # `chat_id` accepts a thread's own chat as readily as a channel's, which
+      # is what makes this usable for thread context: a message posted in a
+      # thread carries that thread's chat in its chat_id.
+      #
+      # One request returns at most MAX_PAGE, so a larger `limit` is walked
+      # back through the cursor. Paging runs newest-first and stops as soon as
+      # `limit` is reached, so asking for more than the chat holds costs one
+      # extra request, not a scan.
+      def messages(chat_id:, limit: MAX_PAGE)
+        wanted = Integer(limit)
+        return [] unless wanted.positive?
+
+        collected = []
+        cursor = nil
+        pages = 0
+
+        while collected.size < wanted
+          body = get(messages_path(chat_id, [wanted - collected.size, MAX_PAGE].min, cursor))
+          page = Array(body["data"])
+          collected.concat(page)
+
+          paginate = body["meta"].is_a?(Hash) ? body["meta"]["paginate"] : nil
+          next_cursor = paginate.is_a?(Hash) ? paginate["next_page"] : nil
+
+          # Four ways to be done, and the last two are guards rather than
+          # conditions: a server that keeps handing back the same cursor, or
+          # never stops offering a next page, must not spin this loop forever
+          # in front of an agent that has not started yet.
+          break if page.empty?
+          break if next_cursor.nil? || next_cursor == cursor
+          break if (pages += 1) >= MAX_PAGES
+
+          cursor = next_cursor
+        end
+
+        collected.sort_by { |message| message["id"].to_i }
+      end
+
       # The thread hanging off a message, created if it is not there yet. This
       # is what answering "in a thread" requires when the question was a plain
       # channel message: such a message has no thread of its own, so posting
@@ -91,6 +137,14 @@ module AgentDaemon
       end
 
       private
+
+      # The cursor is opaque and base64, so it carries "=" and "+" and has to
+      # be escaped rather than pasted into the query.
+      def messages_path(chat_id, limit, cursor)
+        path = "/messages?chat_id=#{Integer(chat_id)}&sort=id&order=desc&limit=#{Integer(limit)}"
+        path += "&cursor=#{URI.encode_www_form_component(cursor)}" if cursor
+        path
+      end
 
       def get(path)
         request(Net::HTTP::Get.new(API_PREFIX + path))

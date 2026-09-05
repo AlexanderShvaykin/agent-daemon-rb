@@ -59,6 +59,16 @@ class StubPachcaClient
     (@pages.shift || []).sort_by { |event| event["id"].to_s }
   end
 
+  attr_writer :history, :history_error
+  attr_reader :message_queries
+
+  def messages(chat_id:, limit: 20)
+    raise @history_error if @history_error
+
+    (@message_queries ||= []) << [chat_id, limit]
+    Array(@history)
+  end
+
   def delete_event(id)
     if @delete_failures.delete(id)
       raise "boom"
@@ -365,6 +375,91 @@ class TestRunnerPachca < Minitest::Test
 
     assert_equal 17, runner.instance_variable_get(:@backoff)
     assert_equal 0, runner.instance_variable_get(:@consecutive_errors)
+  end
+
+  # --- thread context ------------------------------------------------------
+
+  def thread_event(message_id: 555, chat_id: 43_358_443)
+    event(id: "01A", message_id: message_id, chat_id: chat_id,
+          entity_type: "thread", entity_id: 33_177_699, content: "а почему?")
+  end
+
+  def history_of(*rows)
+    rows.each_with_index.map { |(user_id, text), i| { "id" => 100 + i, "user_id" => user_id, "content" => text } }
+  end
+
+  # "а почему?" in a thread is unreadable without what came before it.
+  def test_a_threaded_question_gets_the_thread_transcript
+    client = StubPachcaClient.new([[thread_event]])
+    client.history = history_of([222, "деплой сломался"], [BOT, "починил"])
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    context = runner.send(:thread_context, thread_event)
+
+    assert_equal "222: деплой сломался\nbot: починил", context
+  end
+
+  # The question is already in {{message}}; repeating it wastes tokens and
+  # reads as if it were asked twice.
+  def test_the_question_itself_is_left_out_of_the_transcript
+    client = StubPachcaClient.new([[thread_event]])
+    client.history = history_of([222, "раньше"]) + [{ "id" => 555, "user_id" => 222, "content" => "а почему?" }]
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    refute_includes runner.send(:thread_context, thread_event), "а почему?"
+  end
+
+  # A question asked in a channel carries its own context; the last N unrelated
+  # channel messages would be noise, and a fetch that buys noise is not worth
+  # making.
+  def test_a_channel_question_pulls_no_context
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    runner = build_runner(client)
+
+    assert_equal "", runner.send(:thread_context, event(id: "01A"))
+    assert_nil client.message_queries
+  end
+
+  def test_the_thread_chat_and_limit_are_what_gets_queried
+    client = StubPachcaClient.new([[thread_event]])
+    client.history = []
+    runner = build_runner(client, trigger_overrides: { "chats" => nil, "context_messages" => 5 })
+
+    runner.send(:thread_context, thread_event)
+
+    assert_equal [[43_358_443, 5]], client.message_queries
+  end
+
+  def test_context_can_be_switched_off
+    client = StubPachcaClient.new([[thread_event]])
+    runner = build_runner(client, trigger_overrides: { "chats" => nil, "context_messages" => 0 })
+
+    assert_equal "", runner.send(:thread_context, thread_event)
+    assert_nil client.message_queries
+  end
+
+  # An answer written without the earlier messages is worse than one written
+  # with them, and far better than no answer at all.
+  def test_a_failed_context_fetch_warns_but_still_answers
+    client = StubPachcaClient.new([[thread_event]])
+    client.history_error = "boom"
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    log = capture_log { runner.send(:iterate) }
+
+    assert_match(/could not read thread context/, log)
+    assert_equal 1, backend(runner).prompts.size
+  end
+
+  def test_the_transcript_reaches_the_prompt
+    File.write(@template_path, "было:\n{{thread_context}}\nспросили: {{message}}")
+    client = StubPachcaClient.new([[thread_event]])
+    client.history = history_of([222, "деплой сломался"])
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    runner.send(:iterate)
+
+    assert_equal "было:\n222: деплой сломался\nспросили: а почему?", backend(runner).prompts.first
   end
 
   # --- acknowledging what is ignored ---------------------------------------

@@ -180,6 +180,14 @@ runners:
   #     # is the acknowledgement a run lasting minutes needs. Create the custom
   #     # reaction first; set to null to switch the indicator off.
   #     # thinking_reaction: agent-thinking
+  #     # How many earlier thread messages to put in front of the question, as
+  #     # {{thread_context}}. Threads only: a reply there is routinely
+  #     # unreadable on its own, while a question asked in a channel carries
+  #     # its own context and recent channel chatter would be noise. 0 is off.
+  #     # 50 is the default and what one request returns; above that the client
+  #     # pages through the cursor, one request per 50, capped at 500. The
+  #     # default stays at one request because most threads never reach it.
+  #     # context_messages: 50
   #     # event_types: [message_new]   # default
   #     # interval: 5                  # poll interval, seconds (default 5)
   #     # jitter: 1                    # random 0..jitter s per cycle (default 1)
@@ -188,8 +196,13 @@ runners:
   # The prompt gets the payload flattened: {{message}}, {{sender_id}},
   # {{chat_id}}, {{message_id}}, {{entity_type}}, {{entity_id}},
   # {{parent_message_id}}, {{thread_message_id}}, {{thread_chat_id}},
-  # {{event_id}}, {{created_at}}, {{url}}. To answer in the originating thread
-  # the reply YAML echoes entity_type + entity_id straight back.
+  # {{event_id}}, {{created_at}}, {{url}}, plus {{thread_context}} — the thread
+  # so far as a transcript, the agent's own lines labelled "bot".
+  #
+  # To answer in the originating thread the reply YAML echoes entity_type and
+  # entity_id straight back, plus reply_to_message_id so a question asked in a
+  # channel gets a thread created for it. The transport picks between the two;
+  # a prompt cannot be trusted to branch on where the question came from.
 
 # Messenger thread — picks up YAML files from message_dir and delivers them
 # via the configured transport. Select the transport with `type` (default

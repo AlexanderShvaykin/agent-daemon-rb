@@ -73,6 +73,100 @@ class TestPachcaClient < Minitest::Test
     assert_empty stub_net_http(fake) { client.events }
   end
 
+  # --- messages -------------------------------------------------------------
+
+  # Newest first from the API, oldest first out of here: a transcript is read
+  # forwards.
+  def test_messages_come_back_oldest_first
+    fake = FakeHttp.new do |_req|
+      json("data" => [{ "id" => 3 }, { "id" => 2 }, { "id" => 1 }], "meta" => { "paginate" => {} })
+    end
+
+    assert_equal [1, 2, 3], stub_net_http(fake) { client.messages(chat_id: 900) }.map { |m| m["id"] }
+  end
+
+  def test_a_limit_within_one_page_makes_one_request
+    fake = FakeHttp.new { |_req| json("data" => [{ "id" => 1 }], "meta" => { "paginate" => {} }) }
+
+    stub_net_http(fake) { client.messages(chat_id: 900, limit: 10) }
+
+    assert_equal 1, fake.requests.size
+    assert_includes fake.requests.first.path, "chat_id=900&sort=id&order=desc&limit=10"
+  end
+
+  # One request returns at most 50, so a bigger limit is walked back through
+  # the cursor — which is opaque base64 and has to be escaped, not pasted in.
+  def test_a_larger_limit_pages_through_the_cursor
+    pages = [
+      { "data" => Array.new(50) { |i| { "id" => 100 - i } }, "meta" => { "paginate" => { "next_page" => "cur/sor+1=" } } },
+      { "data" => Array.new(50) { |i| { "id" => 50 - i } }, "meta" => { "paginate" => { "next_page" => nil } } }
+    ]
+    fake = FakeHttp.new { |_req| json(pages.shift) }
+
+    result = stub_net_http(fake) { client.messages(chat_id: 900, limit: 120) }
+
+    assert_equal 2, fake.requests.size
+    assert_includes fake.requests.first.path, "limit=50"
+    refute_includes fake.requests.first.path, "cursor="
+    assert_includes fake.requests.last.path, "cursor=cur%2Fsor%2B1%3D"
+    assert_equal 100, result.size
+    assert_equal 1, result.first["id"], "oldest first across pages"
+  end
+
+  # Asking for more than the chat holds costs one extra request, not a scan.
+  def test_paging_stops_when_a_page_comes_back_empty
+    pages = [
+      { "data" => Array.new(50) { |i| { "id" => 50 - i } }, "meta" => { "paginate" => { "next_page" => "c2" } } },
+      { "data" => [], "meta" => { "paginate" => { "next_page" => "c3" } } }
+    ]
+    fake = FakeHttp.new { |_req| json(pages.shift || { "data" => [] }) }
+
+    assert_equal 50, stub_net_http(fake) { client.messages(chat_id: 900, limit: 500) }.size
+    assert_equal 2, fake.requests.size
+  end
+
+  # The last page is a full one with no cursor: nothing left to ask for.
+  def test_paging_stops_when_there_is_no_next_cursor
+    fake = FakeHttp.new do |_req|
+      json("data" => Array.new(50) { |i| { "id" => 50 - i } }, "meta" => { "paginate" => { "next_page" => nil } })
+    end
+
+    stub_net_http(fake) { client.messages(chat_id: 900, limit: 500) }
+
+    assert_equal 1, fake.requests.size
+  end
+
+  # A server that keeps handing back the same cursor must not spin this loop
+  # in front of an agent that has not started yet.
+  def test_a_repeated_cursor_does_not_loop_forever
+    fake = FakeHttp.new do |_req|
+      json("data" => Array.new(50) { |i| { "id" => 50 - i } }, "meta" => { "paginate" => { "next_page" => "same" } })
+    end
+
+    stub_net_http(fake) { client.messages(chat_id: 900, limit: 500) }
+
+    assert_equal 2, fake.requests.size, "the second page repeats the cursor and ends it"
+  end
+
+  # Nor must one that always offers a fresh cursor.
+  def test_an_endless_cursor_is_capped_by_max_pages
+    n = 0
+    fake = FakeHttp.new do |_req|
+      n += 1
+      json("data" => Array.new(50) { |i| { "id" => (n * 100) - i } }, "meta" => { "paginate" => { "next_page" => "c#{n}" } })
+    end
+
+    stub_net_http(fake) { client.messages(chat_id: 900, limit: 100_000) }
+
+    assert_equal AgentDaemon::Pachca::Client::MAX_PAGES, fake.requests.size
+  end
+
+  def test_a_zero_limit_asks_for_nothing
+    fake = FakeHttp.new { |_req| flunk("must not be called") }
+
+    assert_empty stub_net_http(fake) { client.messages(chat_id: 900, limit: 0) }
+  end
+
   def test_delete_event_issues_a_delete_for_the_escaped_id
     fake = FakeHttp.new { |_req| FakeSuccess.new("") }
 

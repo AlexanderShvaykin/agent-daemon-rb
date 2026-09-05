@@ -76,6 +76,11 @@ string. Each returned issue becomes a work item keyed by its issue key.
 Polls `input_dir` for `*.yml` files. On success the file moves to
 `archive_dir`; after exhausting `max_attempts` it moves to `failed_dir`.
 
+Three of the four triggers are pollers; `mattermost` is the only push one, and
+it costs a WebSocket client, a shared reactor thread and two gems to be so. A
+trigger is only worth building as a listener when the service has a realtime
+API and the latency actually matters.
+
 ### Runner::Mattermost
 
 A `mattermost` runner turns Mattermost @-mentions — and, when configured,
@@ -128,6 +133,72 @@ The reply path is the ordinary Messenger contract: the prompt instructs the
 agent to write a message YAML into `message_dir` with `channel_id` and `root_id`
 copied from the work-item, which the `mattermost` transport posts verbatim into
 the originating thread (see [Transports](#transports)).
+
+### Runner::Pachca
+
+Turns questions asked of a Pachca bot into agent runs. A plain poller — the
+same shape as `Runner::Tracker`, not the listener/reactor split Mattermost
+needs — because Pachca offers exactly two ways to receive events, outgoing
+webhooks and an event history endpoint, and **no realtime API**. The history
+needs no public URL at all: enabling "save event history" on the bot works
+with an empty Webhook URL, so the daemon stays a purely outbound client and
+the core acquires no HTTP server and no new dependency.
+
+`GET /webhooks/events` plus `DELETE /webhooks/events/{id}` make the history a
+queue with an explicit ack, which lands on `Runner::Base`'s existing hooks
+without a new abstraction:
+
+| Hook               | Pachca                     | `Runner::File` equivalent |
+|--------------------|----------------------------|---------------------------|
+| `fetch_work_items` | read the history           | glob `input_dir`          |
+| `after_success`    | delete the event           | move to `archive_dir`     |
+| `after_failure`    | nothing; the next poll retries | leave it in `input_dir` |
+| `after_exhausted`  | delete, with a log line    | move to `failed_dir`      |
+
+Three invariants are worth stating, because each fixes a failure that is hard
+to read from the symptom:
+
+- **`trigger.bot_user_id` is required.** The agent replies into the chat it
+  reads, so without its own id it re-ingests its own answers as new questions
+  and loops on itself.
+- **An event the runner decides *not* to act on is deleted too.** Otherwise the
+  history only grows — every answer comes back as an event authored by the bot,
+  the author gate drops it, and nothing clears it, until `limit` of them push
+  real questions off the first page and the runner goes deaf. This is also why
+  one bot token must belong to exactly one runner; a second would find its
+  events already deleted (sharing is unworkable anyway, since both would answer
+  every question).
+- **A page is filtered against a snapshot of the acknowledged set taken before
+  pending deletes are retried.** Filtering against the live set reopens the hole
+  it exists to close: a delete that succeeds on this poll empties the set, and a
+  history that has not caught up would serve the event again.
+
+`trigger.chats` is optional, unlike the Mattermost trigger's `channels`: the
+history only holds what the bot received, so its chat memberships are already
+the scope and a list only narrows it — and requiring one would lock out direct
+messages, whose chat id cannot be known in advance. A listed chat also matches
+its threads, whose own `chat_id` is the thread's, not the parent's. The
+effective scope is logged in one line at startup, since with neither `chats`
+nor `allowed_users` set the right to command the agent is the right to talk to
+the bot.
+
+Before each attempt the runner adds a reaction to the question
+(`trigger.thinking_reaction`, default `agent-thinking`), for which Pachca
+renders a live timer; it is removed on success, exhaustion or a killed run.
+This is what `Runner::Base#before_attempt` exists for — the only hook that
+fires *before* the backend, because a run takes minutes and a chat needs an
+acknowledgement sooner than that. The indicator never fails a run: the first
+failure switches it off for the process with one explanatory line, the likely
+cause being that nobody created the custom reaction.
+
+For a question asked **in a thread**, the runner also fetches the thread so far
+(`trigger.context_messages`, default 50, 0 disables) and exposes it as
+`{{thread_context}}` — a reply there ("а почему?") is routinely unreadable on
+its own. Threads only: a question asked in a channel carries its own context,
+and recent unrelated channel messages would be noise. One request returns at
+most 50; a larger value is paged through the cursor, one request per 50, capped
+at 500. A failed fetch warns and answers without the context rather than
+failing the run.
 
 ## Backends
 
@@ -229,6 +300,21 @@ valid values. Adding a transport means a new `transport/<name>.rb` plus a
   set). The `channel_id`/`root_id` pair is what the mattermost *trigger*
   consumer copies from a mention work-item so the agent's answer lands back in
   the originating thread. stdlib only (`Net::HTTP`, `json`, `uri`).
+- **`pachca`** (`transport/pachca.rb`): posts via `POST /messages` with one bot
+  token. Half the mattermost transport is a cache of name-to-id lookups; none
+  of that exists here, because Pachca addresses everything by numeric id — the
+  trigger already hands those ids to the agent — and a direct message needs no
+  channel opened first (`entity_type: "user"` creates the conversation on first
+  contact). Destination by precedence: a `thread` entity pair → a
+  `reply_to_message_id` → any other `entity_id` → `user` (DM) → `chat_id` →
+  `default_chat_id`. The first two exist because answering "in the thread"
+  means two different calls depending on where the question was asked: a
+  message posted in a channel has no thread of its own, so its thread is
+  created first (`POST /messages/{id}/thread`, idempotent) and answered in. A
+  prompt cannot be trusted to branch on that, so the reply YAML states all
+  three fields unconditionally and the transport decides. `default_chat_id` is
+  a numeric id, not a name — there is no name resolution to fall back on.
+  stdlib only.
 
 ### Message routing
 
@@ -248,6 +334,24 @@ Specifying both `channel` and `user` is an error — the `mattermost` transport
 raises rather than silently picking one. The `webhook` transport ignores all of
 these routing fields (a webhook is a single fixed destination).
 
+The `pachca` transport reads its own set, all numeric:
+
+- `entity_type` + `entity_id` — the pair the pachca trigger surfaces. With
+  `entity_type: thread` the answer goes straight into that thread.
+- `reply_to_message_id: <id>` — answer in the thread of that message, creating
+  it if the message has none. This is what turns a question asked in a channel
+  into a threaded reply.
+- `user: <id>` — send a direct message.
+- `chat_id: <id>` — post to that chat.
+- `parent_message_id: <id>` — optional, threads the post as a reply.
+- none of the above — post to `messenger.default_chat_id`, where
+  `SYSTEM:<runner>` errors land.
+
+Both `user` and `chat_id` is an error, as is `entity_type` without an
+`entity_id` — the latter is most likely a reply whose id never got substituted,
+and sending it to the default chat would drop the answer in the wrong place
+rather than fail loudly.
+
 ## Prompt Templates
 
 `PromptTemplate` loads a text file and substitutes `{{variable}}` placeholders
@@ -263,8 +367,17 @@ at render time. Available variables:
   - Mattermost: `{{input_file}}` plus the captured work-item fields
     `{{message}}`, `{{channel_id}}`, `{{root_id}}`, `{{sender}}`,
     `{{channel_name}}`, `{{post_id}}`.
+  - Pachca: the event payload flattened — `{{message}}`, `{{sender_id}}`,
+    `{{chat_id}}`, `{{message_id}}`, `{{entity_type}}`, `{{entity_id}}`,
+    `{{parent_message_id}}`, `{{thread_message_id}}`, `{{thread_chat_id}}`,
+    `{{event_id}}`, `{{created_at}}`, `{{url}}` — plus `{{thread_context}}`,
+    the thread so far as a transcript with the agent's own lines labelled
+    `bot`. There is no thread id among them: a thread's own id is `entity_id`
+    when `entity_type` is `thread`, and the payload's `thread` object carries
+    only the message the thread hangs off of and that message's chat.
 
-Undefined variables remain literal and produce a log warning.
+Undefined variables remain literal and produce a log warning. A variable whose
+value is nil renders empty instead — the key exists, so it is substituted.
 
 When the agent writes a message YAML into `message_dir`, the prompt template
 should teach it the contract: a required `message` key plus, for the
@@ -300,6 +413,15 @@ without it. `channels` may be empty
 only with a valid `direct_users` allowlist, which configures a direct-message-
 only runner. Otherwise, `channels` remains required for non-DM posts.
 
+A Pachca runner requires only `trigger.token` and `trigger.bot_user_id`. All of
+its ids are Integers rather than names, which matters when they come from the
+environment: `secret('KEY')` yields a quoted JSON string and would fail
+validation, so numeric keys have to be interpolated as raw `ENV` values.
+`chats`, `allowed_users`, `event_types`, `thinking_reaction` and
+`context_messages` are optional and validated only when present;
+`context_messages` is bounded at 500 because everything above one page of 50 is
+another request made in front of an agent that has not started yet.
+
 ### Operator descriptions (`description` / `support`)
 
 Both keys are optional and accepted at two levels: the top of a workflow config
@@ -330,6 +452,10 @@ resolution as the file trigger; when those keys are omitted they default to
 `mentions/<runner-name>/inbox`, `mentions/<runner-name>/done`, and
 `mentions/<runner-name>/failed` (each then resolved relative to `project_path`).
 
+A `pachca` trigger resolves no work dirs at all: it acknowledges an event by
+deleting it from Pachca's own history, so there is no inbox, done or failed
+directory to place.
+
 ### Validation
 
 Config loading fails immediately with descriptive errors when:
@@ -337,9 +463,12 @@ Config loading fails immediately with descriptive errors when:
 - `runners` is missing, not a list, or empty.
 - Runner names are duplicated.
 - A runner is missing `name`, `prompt_template`, or `trigger`.
-- `trigger.type` is not `tracker`, `file`, or `mattermost`.
+- `trigger.type` is not `tracker`, `file`, `mattermost`, or `pachca`.
 - Trigger-specific required keys are missing (e.g. a `mattermost` trigger
-  requires `base_url`, `token`, `team`, and a non-empty `channels` list).
+  requires `base_url`, `token`, `team`, and a non-empty `channels` list; a
+  `pachca` trigger requires `token` and a positive Integer `bot_user_id`).
+- `messenger.type` is not `webhook`, `mattermost`, or `pachca`, or a `pachca`
+  messenger is missing `token` or a positive Integer `default_chat_id`.
 - A prompt template file does not exist on disk.
 - A runner's optional `fallback_agent` is not a Hash with exactly a non-blank
   String `command` and an `args` Array containing only Strings.

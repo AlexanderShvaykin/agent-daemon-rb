@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.15.0] - 2026-09-05
+
+### Added
+- `pachca` trigger: a poller over a Pachca bot's event history. Pachca offers only outgoing webhooks and this history endpoint — there is no realtime API — and the history needs no public URL (the bot's "save event history" setting works with an empty Webhook URL), so the daemon stays a purely outbound client and the core gains no HTTP server and no new dependency. Reading plus deleting makes the history a queue with an explicit ack, which lands on `Runner::Base`'s existing hooks unchanged.
+- `pachca` transport: `POST /messages` with one bot token. No name-to-id cache and no channel to open first, because Pachca addresses everything by numeric id and a direct message creates its conversation on first contact. Destination by precedence: a `thread` entity pair → `reply_to_message_id` → any other `entity_id` → `user` → `chat_id` → `default_chat_id`.
+- Answering "in the thread" is two different calls depending on where the question was asked: a message posted in a channel has no thread of its own, so its thread is created (idempotently) and answered in. The reply YAML states all three routing fields unconditionally and the transport decides — a prompt cannot be trusted to branch on that.
+- `Runner::Base#before_attempt`, the first hook that fires *before* the backend rather than after it. `Runner::Pachca` uses it to add an `agent-thinking` reaction, for which Pachca renders a live timer; a run takes minutes, and a chat needs an acknowledgement sooner than that.
+- Thread context: for a question asked in a thread, the last `context_messages` messages (default 50) are fetched and exposed as `{{thread_context}}`, the agent's own lines labelled `bot`. A reply in a thread is routinely unreadable on its own. Threads only — a question asked in a channel carries its own context. Above one page of 50 the client pages through the cursor, capped at 500.
+
+### Changed
+- `RateLimitError` moves up to `AgentDaemon` so every polling client can raise the kind `Runner::Base` already treats as pacing rather than failure. `Tracker::RateLimitError` remains as a subclass; existing configs, rescues and tests are unaffected.
+
+### Security
+- A `pachca` runner requires `trigger.bot_user_id`. The agent replies into the chat it reads, so without its own id it re-ingests its own answers as new questions and loops.
+- An event the runner decides not to act on is deleted too. Otherwise every answer comes back as an event authored by the bot, the author gate drops it, nothing clears it, and once `limit` of them accumulate real questions are pushed off the first page and the runner goes deaf. One bot token must therefore belong to exactly one runner.
+- `trigger.allowed_users` gates authors by id. While it is empty the right to command the agent is the right to talk to the bot; the effective scope is logged in one line at startup rather than left to be inferred from the config.
+
 ## [0.14.1] - 2026-09-03
 
 ### Fixed
