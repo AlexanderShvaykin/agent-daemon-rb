@@ -110,6 +110,14 @@ module AgentDaemon
         collected.sort_by { |message| message["id"].to_i }
       end
 
+      # One message by id. Used for the message a thread hangs off: that one
+      # lives in the parent chat, not in the thread, so listing the thread
+      # returns everything except the question that started it.
+      def message(id)
+        body = get("/messages/#{Integer(id)}")
+        body["data"] || body
+      end
+
       # The thread hanging off a message, created if it is not there yet. This
       # is what answering "in a thread" requires when the question was a plain
       # channel message: such a message has no thread of its own, so posting

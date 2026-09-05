@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.15.1] - 2026-09-05
+
+### Fixed
+- Thread context now includes the message the thread hangs off. That message lives in the parent chat, not in the thread, so listing the thread returned every reply and not the question that started it — the one message that made the rest make sense. Found in use: an agent asked to follow up inside a thread it had opened saw only its own answer and reported the context as incomplete. A standalone thread reports no such message and is unaffected; a failed fetch warns and keeps the rest of the transcript.
+
 ## [0.15.0] - 2026-09-05
 
 ### Added

@@ -132,18 +132,41 @@ module AgentDaemon
         chat_id = payload["chat_id"]
         return "" if chat_id.nil?
 
-        transcript(@client.messages(chat_id: chat_id, limit: @context_messages), skip: payload["id"])
+        messages = @client.messages(chat_id: chat_id, limit: @context_messages)
+        transcript([root_message(payload), *messages].compact, skip: payload["id"])
       rescue => e
         Log.warn("[#{log_tag}] could not read thread context: #{e.message}; answering without it")
         ""
+      end
+
+      # The message a thread hangs off lives in the PARENT chat, not in the
+      # thread, so listing the thread returns every reply and not the question
+      # that started it. Observed live: an agent asked to follow up inside a
+      # thread it had opened saw only its own answer and reported the context
+      # as incomplete — the one message that made the rest make sense was the
+      # one missing.
+      #
+      # A standalone thread has no such message and reports message_id as nil,
+      # which is exactly the case this returns nothing for.
+      def root_message(payload)
+        id = payload.dig("thread", "message_id")
+        return nil if id.nil?
+
+        @client.message(id)
+      rescue => e
+        Log.warn("[#{log_tag}] could not read the message this thread hangs off: #{e.message}")
+        nil
       end
 
       # The question itself is already in {{message}}, so it is dropped here
       # rather than repeated. The bot's own lines are labelled: without that a
       # model reads the whole thread as other people talking and loses track of
       # what it already said.
+      # uniq because the root message is prepended separately: a thread whose
+      # listing happens to include it would otherwise show it twice.
       def transcript(messages, skip:)
         messages
+          .uniq { |message| message["id"] }
           .reject { |message| message["id"] == skip }
           .map { |message| "#{author_label(message["user_id"])}: #{message["content"]}" }
           .join("\n")
