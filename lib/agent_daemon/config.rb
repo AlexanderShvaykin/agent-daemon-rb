@@ -50,7 +50,7 @@ module AgentDaemon
     RUNBOOK_SCHEMES = %w[http https].freeze
 
     VALID_TRIGGER_TYPES   = %w[tracker file mattermost pachca].freeze
-    VALID_BACKENDS        = %w[claude opencode].freeze
+    VALID_BACKENDS        = %w[claude opencode codex].freeze
     VALID_MESSENGER_TYPES = %w[webhook mattermost pachca].freeze
     MATTERMOST_REQUIRED   = %w[base_url token team default_channel].freeze
 
@@ -337,6 +337,7 @@ module AgentDaemon
       end
 
       errors.concat(validate_claude(label, runner["claude"]))
+      errors.concat(validate_codex(label, runner["codex"]))
       errors.concat(validate_fallback_agent(label, runner["fallback_agent"])) if runner.key?("fallback_agent")
       errors.concat(validate_trigger(label, runner["trigger"]))
       errors.concat(validate_documentation(runner["description"], runner["support"],
@@ -406,9 +407,46 @@ module AgentDaemon
       ["runner #{runner_label.inspect}: claude.model must be a non-empty String (got #{model.inspect})"]
     end
 
+    # Same shape and same rule as claude: an absent model lets the CLI pick.
+    # Validated here rather than at command-build time, unlike opencode.model —
+    # a config problem should surface at load, not hours later on the first
+    # question.
+    def validate_codex(runner_label, codex)
+      return [] if codex.nil?
+
+      unless codex.is_a?(Hash)
+        return ["runner #{runner_label.inspect}: codex must be a Hash (got #{codex.inspect})"]
+      end
+
+      errors = []
+      model = codex["model"]
+      unless model.nil? || (model.is_a?(String) && !model.empty?)
+        errors << "runner #{runner_label.inspect}: codex.model must be a non-empty String (got #{model.inspect})"
+      end
+
+      flags = codex["extra_flags"]
+      unless flags.nil? || flags.is_a?(String)
+        errors << "runner #{runner_label.inspect}: codex.extra_flags must be a String (got #{flags.inspect})"
+      end
+
+      errors
+    end
+
+    # Two forms, on purpose. A backend named by String inherits the flags that
+    # backend builds for itself; the {command, args} Hash inherits nothing and
+    # is the escape hatch for a CLI the gem does not know.
     def validate_fallback_agent(runner_label, fallback_agent)
+      if fallback_agent.is_a?(String)
+        return [] if VALID_BACKENDS.include?(fallback_agent)
+
+        return ["runner #{runner_label.inspect}: fallback_agent names an unknown backend " \
+                "#{fallback_agent.inspect} (known: #{VALID_BACKENDS.join(', ')}); " \
+                "for an arbitrary CLI use the {command, args} form"]
+      end
+
       unless fallback_agent.is_a?(Hash)
-        return ["runner #{runner_label.inspect}: fallback_agent must be a Hash (got #{fallback_agent.inspect})"]
+        return ["runner #{runner_label.inspect}: fallback_agent must be a backend name (String) " \
+                "or a Hash of {command, args} (got #{fallback_agent.inspect})"]
       end
 
       errors = []

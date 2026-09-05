@@ -12,18 +12,56 @@ module AgentDaemon
     # Grace period between SIGTERM and SIGKILL when killing process group.
     TERM_GRACE_SECONDS = 2
 
+    BACKENDS = {
+      "claude" => -> { Claude },
+      "opencode" => -> { OpenCode },
+      "codex" => -> { Codex }
+    }.freeze
+
+    VALID_NAMES = BACKENDS.keys.freeze
+
+    # Picks the backend class for a runner, honouring an operator-selected
+    # fallback.
+    #
+    # Exact FALLBACK_AGENT=1 swaps in `fallback_agent`; every other value, and
+    # a runner without the key, keeps the configured backend. The switch is
+    # process-wide on purpose — it exists for the case where one account's
+    # quota is exhausted and every runner has to move at once.
+    #
+    # `fallback_agent` takes either form:
+    #
+    #   fallback_agent: claude                        # another backend by name
+    #   fallback_agent: {command: omp, args: [...]}   # an arbitrary CLI
+    #
+    # The named form matters because the arbitrary-CLI form inherits none of
+    # the flags a backend builds for itself. Writing "claude" as a raw command
+    # means restating --add-dir, --model, --agent, --output-format and
+    # --dangerously-skip-permissions by hand, and getting one of them wrong is
+    # a fallback that fails exactly when it is needed.
     def self.for(runner_config, shutdown_flag, message_dir:, project_path:, sinks: nil, cancel_flag: nil)
       name = runner_config.fetch("backend", "claude")
-      case name
-      when "claude"
-        klass = ENV["FALLBACK_AGENT"] == "1" && runner_config["fallback_agent"] ? ConfiguredAgent : Claude
-        klass.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path, sinks: sinks, cancel_flag: cancel_flag)
-      when "opencode"
-        OpenCode.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path, sinks: sinks, cancel_flag: cancel_flag)
-      else
-        raise ArgumentError, "Unsupported backend #{name.inspect} in runner #{runner_config['name'].inspect}. Valid values: claude, opencode"
+      unless BACKENDS.key?(name)
+        raise ArgumentError, "Unsupported backend #{name.inspect} in runner #{runner_config['name'].inspect}. " \
+                             "Valid values: #{VALID_NAMES.join(', ')}"
+      end
+
+      klass = fallback_class(runner_config) || BACKENDS.fetch(name).call
+      klass.new(runner_config, shutdown_flag, message_dir: message_dir, project_path: project_path,
+                                              sinks: sinks, cancel_flag: cancel_flag)
+    end
+
+    # The fallback applies to every backend, not just claude: whichever agent a
+    # runner normally uses, it is the one that can run out of quota.
+    def self.fallback_class(runner_config)
+      return nil unless ENV["FALLBACK_AGENT"] == "1"
+
+      fallback = runner_config["fallback_agent"]
+      case fallback
+      when String then BACKENDS[fallback]&.call
+      when Hash then ConfiguredAgent
       end
     end
+    private_class_method :fallback_class
 
     class Base
       def initialize(runner_config, shutdown_flag, message_dir:, project_path:, sinks: nil, cancel_flag: nil)

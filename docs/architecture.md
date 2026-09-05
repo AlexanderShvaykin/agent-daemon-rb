@@ -203,11 +203,29 @@ failing the run.
 ## Backends
 
 `Backend.for(runner_config, ...)` is a factory that returns the correct
-subclass based on the `backend` key (`"claude"` or `"opencode"`). For a Claude
-runner with a valid `fallback_agent` block, exact `FALLBACK_AGENT=1` selects
-`Backend::ConfiguredAgent` when the backend is constructed. Every other
-environment value, a missing block, or an OpenCode runner preserves the normal
-selection. Runner logs name the effective backend command.
+subclass based on the `backend` key (`"claude"`, `"opencode"` or `"codex"`).
+Runner logs name the effective backend command.
+
+Exact `FALLBACK_AGENT=1` swaps in the runner's `fallback_agent` when the backend
+is constructed; every other environment value, and a runner without the key,
+keeps the configured backend. The switch applies to **every** backend — whichever
+agent a runner normally uses is the one whose quota can run out — and is
+process-wide on purpose, because it exists for the case where one account's
+quota is exhausted and all runners have to move at once.
+
+`fallback_agent` takes either form:
+
+```yaml
+fallback_agent: claude                       # another backend, by name
+fallback_agent: {command: omp, args: [...]}  # an arbitrary CLI
+```
+
+The named form exists because the Hash form inherits none of the flags a backend
+builds for itself. Writing `claude` as a raw command means restating `--add-dir`,
+`--model`, `--agent`, `--output-format` and `--dangerously-skip-permissions` by
+hand, and getting one of them wrong produces a fallback that fails exactly when
+it is needed. A name that matches no backend is a config error, and the message
+points at the `{command, args}` form.
 
 ### Backend::Base
 
@@ -243,6 +261,30 @@ Builds: `cd <project_path> && opencode run <prompt> [--agent <agent>] --model <m
 `--agent` follows the same rule as `Backend::Claude`. Requires
 `opencode.model` in the runner config; unlike `claude.model` it is checked at
 command-build time and raises `ArgumentError`, not at config load.
+
+### Backend::Codex
+
+Builds: `cd <project_path> && codex exec [--model <model>] --sandbox workspace-write [--add-dir <dirs>] --skip-git-repo-check --color never <prompt>`
+
+`codex.model` is optional and validated at config load (like `claude.model`,
+unlike `opencode.model`). `codex.extra_flags` is appended after the runner's
+general `extra_flags`. The prompt goes last, as `codex exec [OPTIONS] [PROMPT]`
+requires.
+
+The sandbox choice is the one decision worth stating out loud. The agent's
+entire output is a message YAML written into `message_dir`, so under the
+safer-sounding `read-only` sandbox a run would finish *successfully* having
+written nothing — and a trigger that acknowledges on success would then discard
+the work item. A default that loses work silently is worse than one that grants
+writes inside the working tree, so `workspace-write` is fixed in the class and
+every directory the runner writes to (`message_dir`, `output_dir`) is named with
+`--add-dir`; both routinely sit outside `project_path`.
+
+Codex's `--dangerously-bypass-approvals-and-sandbox` is **not** the counterpart
+of Claude's `--dangerously-skip-permissions`. Claude has no sandbox to disable,
+so the flags only look alike: copying it across would not equalise behaviour, it
+would remove a protection Claude never had. Operators who want it can pass it
+through `codex.extra_flags`.
 
 ### Backend::ConfiguredAgent
 
