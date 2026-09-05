@@ -94,7 +94,7 @@ module AgentDaemon
         items = fetch_work_items
         @consecutive_errors = 0
         items
-      rescue AgentDaemon::Tracker::RateLimitError => e
+      rescue AgentDaemon::RateLimitError => e
         # A throttle is the server pacing us, not a trigger failure: back off for
         # the suggested duration without touching the consecutive-error counter,
         # so it never escalates to a SYSTEM:<runner> message.

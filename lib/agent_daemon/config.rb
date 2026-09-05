@@ -38,6 +38,7 @@ module AgentDaemon
     TRACKER_TRIGGER_DEFAULTS    = { "interval" => 60, "jitter" => 5 }.freeze
     FILE_TRIGGER_DEFAULTS       = { "interval" => 10, "jitter" => 5 }.freeze
     MATTERMOST_TRIGGER_DEFAULTS = { "interval" => 2, "jitter" => 0 }.freeze
+    PACHCA_TRIGGER_DEFAULTS     = { "interval" => 5, "jitter" => 1 }.freeze
 
     # The whole `support:` vocabulary, at both the config and the runner level.
     # Closed on purpose: a typo'd key would otherwise vanish silently and the
@@ -48,7 +49,7 @@ module AgentDaemon
     # is rejected at load rather than turned into a javascript:/data: link.
     RUNBOOK_SCHEMES = %w[http https].freeze
 
-    VALID_TRIGGER_TYPES   = %w[tracker file mattermost].freeze
+    VALID_TRIGGER_TYPES   = %w[tracker file mattermost pachca].freeze
     VALID_BACKENDS        = %w[claude opencode].freeze
     VALID_MESSENGER_TYPES = %w[webhook mattermost].freeze
     MATTERMOST_REQUIRED   = %w[base_url token team default_channel].freeze
@@ -179,6 +180,10 @@ module AgentDaemon
         trigger["archive_dir"] ||= "mentions/#{name}/done"
         trigger["failed_dir"]  ||= "mentions/#{name}/failed"
         resolve_trigger_dirs(trigger)
+      when "pachca"
+        # No work dirs: the poller acknowledges an event by deleting it from
+        # Pachca's own history, so there is no inbox/done/failed to resolve.
+        deep_merge(PACHCA_TRIGGER_DEFAULTS, raw_trigger)
       else
         raw_trigger
       end
@@ -461,9 +466,41 @@ module AgentDaemon
         unless trigger["interval"].is_a?(Integer) && trigger["interval"] > 0
           errors << "runner #{runner_label.inspect}: trigger.interval must be a positive Integer"
         end
+      when "pachca"
+        unless trigger["token"].is_a?(String) && !trigger["token"].empty?
+          errors << "runner #{runner_label.inspect}: trigger.token is required (String)"
+        end
+        # Required, not optional: the agent replies into the same chat it reads,
+        # so without its own id every answer is re-ingested as a new question.
+        unless positive_integer?(trigger["bot_user_id"])
+          errors << "runner #{runner_label.inspect}: trigger.bot_user_id is required (positive Integer) — without it the runner re-ingests its own replies and loops"
+        end
+        chats = trigger["chats"]
+        unless chats.is_a?(Array) && !chats.empty? && chats.all? { |chat| positive_integer?(chat) }
+          errors << "runner #{runner_label.inspect}: trigger.chats must be a non-empty Array of positive Integer chat ids"
+        end
+        if trigger.key?("allowed_users")
+          allowed = trigger["allowed_users"]
+          unless allowed.is_a?(Array) && !allowed.empty? && allowed.all? { |user| positive_integer?(user) }
+            errors << "runner #{runner_label.inspect}: trigger.allowed_users must be a non-empty Array of positive Integer user ids"
+          end
+        end
+        if trigger.key?("event_types")
+          types = trigger["event_types"]
+          unless types.is_a?(Array) && !types.empty? && types.all? { |name| name.is_a?(String) && !name.empty? }
+            errors << "runner #{runner_label.inspect}: trigger.event_types must be a non-empty Array of non-empty Strings"
+          end
+        end
+        unless trigger["interval"].is_a?(Integer) && trigger["interval"] > 0
+          errors << "runner #{runner_label.inspect}: trigger.interval must be a positive Integer"
+        end
       end
 
       errors
+    end
+
+    def positive_integer?(value)
+      value.is_a?(Integer) && value.positive?
     end
 
     def deep_merge(base, override)

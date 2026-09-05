@@ -84,6 +84,8 @@ module AgentDaemon
         -> { Runner::File.new(runner_config, message_dir, project_path, @shutdown_flag) }
       when "mattermost"
         -> { Runner::Mattermost.new(runner_config, message_dir, project_path, @shutdown_flag) }
+      when "pachca"
+        -> { Runner::Pachca.new(runner_config, message_dir, project_path, @shutdown_flag) }
       else
         raise ArgumentError, "Unknown trigger type #{type.inspect} in runner #{runner_config['name'].inspect}"
       end
