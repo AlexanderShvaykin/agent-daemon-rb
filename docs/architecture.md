@@ -63,8 +63,18 @@ Key extension points (subclasses must implement):
 | `work_item_key`    | Unique string key for attempt tracking |
 | `render_prompt`    | Build the prompt string for the agent  |
 
-Optional hooks: `after_success`, `after_failure`, `after_killed`,
-`after_exhausted`.
+Optional hooks: `before_attempt`, `after_success`, `after_failure`,
+`after_killed`, `after_exhausted`.
+
+A subclass may also override `expects_message_file?` (default `false`). When it
+returns true, a run that exits 0 without leaving a new file in `message_dir` is
+treated as a failure rather than a success. Agent CLIs report success for plenty
+of runs that produced nothing — an unauthenticated `claude -p` prints "Not
+logged in" and exits 0, a sandbox that refused the write leaves the agent
+explaining it could not save the file — and for a trigger that acknowledges by
+discarding the work item, that silently loses it. Off by default because a
+runner whose agent is expected to *act* rather than write has no artefact to
+look for.
 
 ### Runner::Tracker
 
@@ -154,6 +164,11 @@ without a new abstraction:
 | `after_success`    | delete the event           | move to `archive_dir`     |
 | `after_failure`    | nothing; the next poll retries | leave it in `input_dir` |
 | `after_exhausted`  | delete, with a log line    | move to `failed_dir`      |
+
+It also sets `expects_message_file?`, so a run that exits 0 without writing an
+answer counts as a failure. Acknowledging here means deleting the event, and a
+silent no-op would therefore destroy the question rather than leave it somewhere
+visible.
 
 Three invariants are worth stating, because each fixes a failure that is hard
 to read from the symptom:

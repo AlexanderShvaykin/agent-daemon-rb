@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.18.0] - 2026-09-08
+
+### Fixed
+- A run that exits 0 without writing anything is no longer treated as a success. Agent CLIs report success for plenty of runs that produced nothing: an unauthenticated `claude -p` prints "Not logged in" and exits 0, a sandbox that refused the write leaves the agent explaining it could not save the file, a `message_dir` that does not exist does the same. For `Runner::File` that meant archiving an unprocessed work item — bad, but visible. For `Runner::Pachca`, which acknowledges by deleting the event from Pachca's history, it meant the question was gone and nobody learned it went unanswered. Found in use, on a real question.
+- A runner that expects a reply now says so through `expects_message_file?` (default `false`), and a run leaving no new file in `message_dir` counts as a failure: attempt counted, work item kept, next cycle retries, exhaustion still reported through the usual `SYSTEM:<runner>` path. Opt-in because a runner whose agent is expected to act rather than write has no artefact to look for, and demanding one would turn working setups into failing ones.
+
 ## [0.17.0] - 2026-09-07
 
 ### Added
