@@ -255,6 +255,51 @@ The return path already existed: a reply YAML naming local paths in `files` is
 uploaded by the pachca transport and attached to the message. So an agent can
 take a picture, change it, and send it back.
 
+### Runner::GitHub
+
+Turns "@bot, take a look" on a pull request into an agent run: the agent reads
+the diff and posts the review itself, through whatever CLI the operator gave it.
+
+A poller over the notification inbox, not a webhook receiver. GitHub's
+notifications are already a queue — `GET /notifications?participating=true`
+plus `PATCH /notifications/threads/{id}` is read-plus-ack — so the daemon needs
+no public URL and stays an outbound client, the same shape as `Runner::Pachca`.
+`participating=true` narrows the inbox to threads this account was mentioned in
+or asked to review.
+
+Three gates, cheapest first: the notification's `reason` must be in
+`trigger.reasons` (default `mention`, `review_requested`), its subject must be
+a `PullRequest`, and its repository must be in `trigger.repos`. Only then is the
+comment behind it fetched — that costs a request — to check its author against
+`trigger.allowed_users`. A notification whose comment cannot be read is **not**
+acted on: without knowing who asked, the gate cannot be applied at all, and
+acting anyway would make the allowlist decorative.
+
+All three lists are optional and all three only narrow. Without them the runner
+acts on every pull-request mention this account receives, from anyone who can
+comment — a wider boundary than a chat reply, because the agent answers
+*publicly under this account*. So the effective scope is logged in one line at
+startup rather than left to be inferred from the config.
+
+A notification the runner declines to act on is marked read too. The inbox keeps
+returning unread threads, so leaving them would mean re-examining the same
+notifications on every poll forever — and eventually re-fetching their comments.
+
+The review goes to the pull request, not to `message_dir`, so the runner sets
+`expects_message_file?` and the prompt asks the agent to also write a one-line
+report. Marking a notification read is a destructive ack: a run that exits 0
+having posted nothing would lose the request silently, which is exactly what
+that check exists to catch. The report doubles as a chat notification that a
+review landed.
+
+Prompt variables: `{{repo}}`, `{{pr_number}}`, `{{pr_url}}`, `{{pr_title}}`,
+`{{summoned_by}}`, `{{request}}` (the comment body), `{{reason}}`,
+`{{notification_id}}`, `{{updated_at}}`.
+
+GitHub signals a primary rate limit with **403 plus `X-RateLimit-Remaining: 0`**,
+not with 429; the client recognises that and raises `RateLimitError` so it
+becomes a backoff rather than a trigger error that escalates. An ordinary 403 —
+permissions, a blocked token — stays an error.
 ## Backends
 
 `Backend.for(runner_config, ...)` is a factory that returns the correct
@@ -583,9 +628,9 @@ resolution as the file trigger; when those keys are omitted they default to
 `mentions/<runner-name>/inbox`, `mentions/<runner-name>/done`, and
 `mentions/<runner-name>/failed` (each then resolved relative to `project_path`).
 
-A `pachca` trigger resolves no work dirs at all: it acknowledges an event by
-deleting it from Pachca's own history, so there is no inbox, done or failed
-directory to place.
+Neither a `pachca` nor a `github` trigger resolves work dirs at all: they
+acknowledge by deleting an event from Pachca's history and by marking a GitHub
+notification read, so there is no inbox, done or failed directory to place.
 
 ### Validation
 
@@ -594,10 +639,12 @@ Config loading fails immediately with descriptive errors when:
 - `runners` is missing, not a list, or empty.
 - Runner names are duplicated.
 - A runner is missing `name`, `prompt_template`, or `trigger`.
-- `trigger.type` is not `tracker`, `file`, `mattermost`, or `pachca`.
+- `trigger.type` is not `tracker`, `file`, `mattermost`, `pachca`, or `github`.
 - Trigger-specific required keys are missing (e.g. a `mattermost` trigger
   requires `base_url`, `token`, `team`, and a non-empty `channels` list; a
-  `pachca` trigger requires `token` and a positive Integer `bot_user_id`).
+  `pachca` trigger requires `token` and a positive Integer `bot_user_id`; a
+  `github` trigger requires only `token`, since its `repos`, `allowed_users`
+  and `reasons` lists all merely narrow).
 - `messenger.type` is not `webhook`, `mattermost`, or `pachca`, or a `pachca`
   messenger is missing `token` or a positive Integer `default_chat_id`.
 - A prompt template file does not exist on disk.

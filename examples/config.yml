@@ -215,6 +215,38 @@ runners:
   # channel gets a thread created for it. The transport picks between the two;
   # a prompt cannot be trusted to branch on where the question came from.
 
+  # Example 6: reviewing a pull request when summoned on GitHub.
+  #
+  # A poller over the notification inbox: GitHub's notifications are already a
+  # queue (read, then mark the thread read), so no webhook and no public URL.
+  # The agent posts the review itself with whatever CLI it has — the daemon
+  # only decides when to wake it and who is allowed to ask.
+  #
+  # - name: review
+  #   backend: claude
+  #   trigger:
+  #     type: github
+  #     token: <%= secret('GITHUB_TOKEN') %>
+  #     # All three lists are optional and all three only NARROW. Without them
+  #     # the runner acts on every pull-request mention this account receives,
+  #     # from anyone who can comment — and the agent answers publicly under
+  #     # this account, which is a wider boundary than a chat reply.
+  #     repos: [acme/app, acme/api]
+  #     allowed_users: [alice, bob]
+  #     # reasons: [mention, review_requested]   # default
+  #     # interval: 60   # slower than a chat trigger: nobody waits seconds for
+  #     # jitter: 5      # a review, and polling spends GitHub rate limit
+  #   prompt_template: prompts/review.txt
+  #
+  # The prompt gets {{repo}}, {{pr_number}}, {{pr_url}}, {{pr_title}},
+  # {{summoned_by}}, {{request}}, {{reason}}, {{notification_id}} and
+  # {{updated_at}}.
+  #
+  # Ask the agent to write a one-line report into message_dir after posting the
+  # review. Marking a notification read is a destructive ack, so a run that
+  # exits 0 having posted nothing would lose the request — the report is what
+  # tells the runner the work happened, and it doubles as a chat notification.
+
 # Messenger thread — picks up YAML files from message_dir and delivers them
 # via the configured transport. Select the transport with `type` (default
 # "webhook"). The thread only starts when the selected transport is fully
