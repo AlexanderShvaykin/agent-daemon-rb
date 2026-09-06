@@ -595,6 +595,36 @@ class TestRunnerPachca < Minitest::Test
     assert_equal %w[01A], client.deleted
   end
 
+  # Prompts name the reply after the work item ("write your answer to
+  # <event id>.yml"), so a second run on the same item writes a name that is
+  # already sitting in sent/ from the first. Comparing names alone called that
+  # run silent and retried an answer the person had already received — observed
+  # live on a GitHub review summoned twice on one pull request.
+  def test_a_reply_reusing_a_delivered_filename_still_counts
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    runner = build_runner(client, writes: false)
+    sent = File.join(@message_dir, "sent")
+    FileUtils.mkdir_p(sent)
+    delivered = File.join(sent, "01A.yml")
+    File.write(delivered, "message: первый ответ\n")
+    # Явно в прошлое: иначе на файловой системе с секундной гранулярностью обе
+    # записи попали бы в одну метку и тест мигал бы.
+    File.utime(Time.now - 60, Time.now - 60, delivered)
+
+    backend = runner.instance_variable_get(:@backend)
+    message_dir = @message_dir
+    backend.define_singleton_method(:run) do |prompt|
+      @prompts << prompt
+      File.write(File.join(message_dir, "01A.yml"), "message: второй ответ\n")
+      AgentDaemon::Backend::Result.new(true, "stdout", "stderr", :ok)
+    end
+
+    log = capture_log { runner.send(:iterate) }
+
+    assert_equal %w[01A], client.deleted
+    refute_match(/wrote no message/, log)
+  end
+
   # --- acknowledging what is ignored ---------------------------------------
 
   # Every answer the agent posts comes back as an event authored by the bot.

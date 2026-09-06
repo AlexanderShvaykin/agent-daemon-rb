@@ -131,7 +131,7 @@ module AgentDaemon
         @sinks.publish_event(type: :started, work_item: key, attempt: attempt_no, at: Time.now.utc.iso8601)
         @sinks.publish_state(status: :in_progress, work_item: key, attempt: attempt_no)
         before_attempt(item)
-        files_before = expects_message_file? ? message_file_names : nil
+        files_before = expects_message_file? ? message_file_snapshot : nil
         result = @backend.run(prompt)
 
         case result.reason
@@ -147,7 +147,7 @@ module AgentDaemon
           #
           # So when a reply was expected and none appeared, this is a failure:
           # attempt counted, work item kept, next cycle retries.
-          if files_before && (message_file_names - files_before).empty?
+          if files_before && !wrote_message?(files_before)
             Log.error("[#{log_tag}] #{key} exited 0 but wrote no message " \
                       "(attempt #{attempt_no}/#{@max_attempts}): #{result.stdout.lines.last&.strip}")
             Log.debug("[#{log_tag}] Full output:\n#{result.stdout}")
@@ -205,18 +205,48 @@ module AgentDaemon
         false
       end
 
-      # Names of message files, including ones the Messenger has already moved
-      # to sent/. Both directories are counted because the Messenger polls the
-      # same directory: a reply written near the end of a run can be picked up
-      # before this check runs, and missing it would mean answering twice.
-      def message_file_names
-        return [] if @message_dir.nil?
+      # Message files as name => mtime, including ones the Messenger has
+      # already moved to sent/. Both directories are counted because the
+      # Messenger polls the same directory: a reply written near the end of a
+      # run can be picked up before this check runs, and missing it would mean
+      # answering twice.
+      #
+      # Keyed by name but compared by mtime, because names repeat. A prompt
+      # naturally derives the filename from the work item ("write your answer
+      # to <event id>.yml"), so a retry — or a second summons on the same PR,
+      # which GitHub reports under the notification id it used before — writes
+      # the name that is already sitting in sent/ from the previous run. Names
+      # alone would call that run silent and retry an answer already delivered.
+      def message_file_snapshot
+        return {} if @message_dir.nil?
 
         [@message_dir, ::File.join(@message_dir, "sent")]
           .flat_map { |dir| Dir.glob(::File.join(dir, "*.{yml,yaml}")) }
-          .map { |path| ::File.basename(path) }
+          .each_with_object({}) do |path, snapshot|
+            name = ::File.basename(path)
+            # The Messenger may move a file out from under the glob; that file
+            # is a delivered reply either way, so skip it rather than lose the
+            # whole snapshot to one race.
+            mtime = begin
+              ::File.mtime(path)
+            rescue SystemCallError
+              next
+            end
+            # The same name can sit in both directories at once — a fresh reply
+            # in the queue beside the delivered one it replaces. Keep the later
+            # of the two: the question is when this name was last written, and
+            # taking whichever the glob happened to yield second would hide the
+            # new file behind the old one's timestamp.
+            snapshot[name] = mtime if snapshot[name].nil? || mtime > snapshot[name]
+          end
       rescue SystemCallError
-        []
+        {}
+      end
+
+      # Whether the run left a reply behind: a file that was not there before,
+      # or one whose name was there but has been written again since.
+      def wrote_message?(before)
+        message_file_snapshot.any? { |name, mtime| before[name].nil? || mtime > before[name] }
       end
 
       # Called once per attempt, immediately before the backend runs — the

@@ -69,6 +69,30 @@ class TestBackendExecute < Minitest::Test
     assert_includes result.stdout, "ok"
   end
 
+  # Chunks arrive from read_nonblock as ASCII-8BIT, so a buffer stayed UTF-8
+  # only as long as the agent spoke ASCII. The moment it did not, the Result
+  # came back binary and interpolating it raised Encoding::CompatibilityError —
+  # killing the runner thread at the point where it was reporting a failure.
+  def test_output_comes_back_as_utf8
+    result = @backend.call("echo 'ответ агента'", timeout: 5)
+
+    assert_equal Encoding::UTF_8, result.stdout.encoding
+    assert_includes result.stdout, "ответ агента"
+    assert result.stdout.valid_encoding?
+    # The thing that actually broke: this used to raise.
+    assert_includes "ошибка: #{result.stdout}", "ответ агента"
+  end
+
+  # A 4096-byte read can land mid-character, so the tail of a chunk is
+  # genuinely invalid UTF-8. A diagnostic message is not worth raising over.
+  def test_invalid_bytes_are_scrubbed_rather_than_raised
+    result = @backend.call("printf 'a\\xff\\xfeb'", timeout: 5)
+
+    assert result.stdout.valid_encoding?
+    assert_includes result.stdout, "a"
+    assert_includes result.stdout, "b"
+  end
+
   def test_failed_command
     result = @backend.call("exit 7", timeout: 5)
     assert_equal :failed, result.reason

@@ -76,6 +76,14 @@ discarding the work item, that silently loses it. Off by default because a
 runner whose agent is expected to *act* rather than write has no artefact to
 look for.
 
+The check snapshots `message_dir` *and* `sent/` as name → mtime, and counts a
+run when some name is new or has been written again. Both halves are load
+bearing. `sent/` is included because the Messenger polls the same directory and
+may deliver a reply before the run finishes; without it the runner would answer
+twice. Mtimes are compared rather than names because names repeat — a prompt
+naturally derives the filename from the work item, so a retry, or a second
+summons on the same item, writes the name already sitting in `sent/`.
+
 ### Runner::Tracker
 
 Polls Yandex Tracker via `POST /v2/issues/_search` with a raw JQL `query`
