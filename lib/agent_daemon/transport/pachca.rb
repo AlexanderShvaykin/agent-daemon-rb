@@ -38,11 +38,42 @@ module AgentDaemon
           entity_type: entity_type,
           entity_id: entity_id,
           content: message_data["message"],
-          parent_message_id: integer(message_data["parent_message_id"])
+          parent_message_id: integer(message_data["parent_message_id"]),
+          files: uploaded(message_data["files"])
         )
       end
 
       private
+
+      # A reply may carry files the agent produced — a chart, a log, a diff.
+      # The YAML names local paths; a message references uploaded keys, and an
+      # upload only becomes visible through the message that follows it, so the
+      # transfer happens here at delivery rather than when the agent wrote the
+      # file.
+      #
+      # An entry is a path, or a Hash with "path" plus an optional "name" (what
+      # the chat displays) and "file_type" ("image" renders inline, "file"
+      # attaches). A path that cannot be read raises, exactly like a
+      # half-written destination does: when the file *is* the answer, sending
+      # the text without it would look like a complete reply.
+      def uploaded(files)
+        entries = files.is_a?(Array) ? files : [files].compact
+        return nil if entries.empty?
+
+        entries.map do |entry|
+          case entry
+          when String
+            @client.upload(entry)
+          when Hash
+            path = entry["path"]
+            raise "message file entry #{entry.inspect} has no \"path\"" unless presence(path)
+
+            @client.upload(path, name: presence(entry["name"]), file_type: presence(entry["file_type"]))
+          else
+            raise "message file entry #{entry.inspect} is neither a path nor a Hash with \"path\""
+          end
+        end
+      end
 
       def destination(message_data)
         entity_id = integer(message_data["entity_id"])
