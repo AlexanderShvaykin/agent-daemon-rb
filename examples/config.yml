@@ -253,6 +253,38 @@ runners:
   # exits 0 having posted nothing would lose the request — the report is what
   # tells the runner the work happened, and it doubles as a chat notification.
 
+  # Example 7: answering a mention on a Basecamp card, to-do or message.
+  #
+  # A poller over the notification inbox, like the github trigger, but it goes
+  # through the `basecamp` CLI rather than HTTP. Basecamp is OAuth 2.1 and the
+  # CLI keeps and refreshes the credential, so there is no token key here: log
+  # in once on the host with `basecamp auth login`. A missing binary or a failed
+  # login shows up on the first poll, not at config load.
+  #
+  # - name: tasks
+  #   backend: claude
+  #   trigger:
+  #     type: basecamp
+  #     # Both lists are optional and both only NARROW. Without them the runner
+  #     # acts on every mention this account receives, from anyone in any project.
+  #     # Projects are matched by name, so a rename narrows the scope to nothing.
+  #     projects: [Website, Mobile app]
+  #     # Numeric person ids or display names, never email addresses: Basecamp
+  #     # masks those in API responses, so an address would silently match nobody.
+  #     allowed_users: [1001, Jane Doe]
+  #     # kinds: [Mention]    # default; product announcements share the inbox
+  #     # interval: 60
+  #     # jitter: 5
+  #   prompt_template: prompts/tasks.txt
+  #
+  # The prompt gets {{kind}}, {{project}}, {{title}}, {{request}},
+  # {{summoned_by}}, {{summoned_by_id}}, {{bucket_id}}, {{recording_id}},
+  # {{url}}, {{notification_id}} and {{created_at}}.
+  #
+  # Ask the agent to write a one-line report into message_dir after commenting.
+  # Marking a notification read is a destructive ack, so a run that exits 0
+  # having posted nothing would lose the request.
+
 # Messenger thread — picks up YAML files from message_dir and delivers them
 # via the configured transport. Select the transport with `type` (default
 # "webhook"). The thread only starts when the selected transport is fully

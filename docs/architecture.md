@@ -310,6 +310,64 @@ GitHub signals a primary rate limit with **403 plus `X-RateLimit-Remaining: 0`**
 not with 429; the client recognises that and raises `RateLimitError` so it
 becomes a backoff rather than a trigger error that escalates. An ordinary 403 —
 permissions, a blocked token — stays an error.
+
+### Runner::Basecamp
+
+Turns "@agent, have a look" on a Basecamp card, to-do or message into an agent
+run. The agent reads the recording and answers with a comment of its own.
+
+Structurally identical to `Runner::GitHub`: a poller over the notification
+inbox, where listing plus marking read is an explicit ack and no public URL is
+needed. 37signals' own connector takes the other road — webhooks, and a tunnel
+to reach the machine — which buys latency at the price of an address on the
+internet.
+
+**Assignments were the obvious queue and are the wrong one.** A to-do assigned
+to the agent has no ack short of completing or unassigning it, both of which
+change somebody's board; and an assignment records what to do but never who
+asked, so the allowlist every other trigger enforces would have had nothing to
+check. A mention carries its author.
+
+**This trigger reaches Basecamp through the `basecamp` CLI, not over HTTP** —
+the one place the triggers differ from each other. Basecamp is OAuth 2.1: no
+personal access token exists, an access token lives two weeks, and holding one
+means holding a refresh token and writing the rotated result back somewhere.
+This daemon owns no store, so an HTTP client would have had to invent one. The
+CLI refreshes on its own and the agent needs it installed anyway to answer, so
+the credential has exactly one keeper. No dependency comes with it — `Open3`
+and `JSON` are stdlib — but a binary must exist on the host, and a missing one
+is reported as plainly as a failed login. Consequently `trigger` has **no
+token key**, and a misconfigured host fails on the first poll rather than at
+config load.
+
+Gates, cheapest first: the notification's `type` must be in `trigger.kinds`
+(default `Mention` — Basecamp's own product announcements arrive in the same
+inbox), its `bucket_name` must be in `trigger.projects`, and its author must be
+in `trigger.allowed_users`. `allowed_users` matches a numeric person id or a
+display name, never an email address: Basecamp masks those in API responses for
+everyone but the authenticated user, so a list of addresses would silently match
+nobody. Projects are matched by **name** because that is all a notification
+carries — the bucket id appears only inside its URLs — so a rename narrows the
+scope to nothing, which is the safe direction to fail but worth knowing when a
+runner goes quiet.
+
+Both lists are optional and both only narrow; the effective scope is logged in
+one line at startup. A notification the runner declines to act on is marked read
+too, for the same reason as in `Runner::GitHub`.
+
+The answer goes to Basecamp, so the runner sets `expects_message_file?` and the
+prompt asks for a one-line report as well; marking read is destructive, and a
+run that exits 0 having posted nothing would lose the request silently.
+
+Prompt variables: `{{kind}}`, `{{project}}`, `{{title}}`, `{{request}}` (the
+notification's plain-text excerpt — the comment body itself is HTML in which an
+@-mention is a multi-line `<bc-attachment>` blob), `{{summoned_by}}`,
+`{{summoned_by_id}}`, `{{bucket_id}}`, `{{recording_id}}`, `{{url}}`,
+`{{notification_id}}`, `{{created_at}}`. The two ids are parsed out of
+`subscription_url`, the one field that spells both plainly; `app_url` would need
+a different pattern per recording type, since cards live under `card_tables`
+and to-dos do not.
+
 ## Backends
 
 `Backend.for(runner_config, ...)` is a factory that returns the correct
