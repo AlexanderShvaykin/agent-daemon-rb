@@ -132,7 +132,7 @@ module AgentDaemon
         @sinks.publish_state(status: :in_progress, work_item: key, attempt: attempt_no)
         before_attempt(item)
         files_before = expects_message_file? ? message_file_snapshot : nil
-        result = @backend.run(prompt)
+        result = @backend.run(prompt, images: run_images(item))
 
         case result.reason
         when :ok
@@ -255,6 +255,13 @@ module AgentDaemon
       # seeing an acknowledgement and seeing silence. Must be cheap and must
       # not raise: it sits directly in front of the agent invocation.
       def before_attempt(_item); end
+
+      # Local paths to images this work item carries, handed to the backend
+      # beside the prompt. Empty by default: a picture only reaches the model
+      # through a CLI flag, and most triggers have nothing to show.
+      def run_images(_item)
+        []
+      end
 
       def after_success(_item); end
       def after_failure(_item); end

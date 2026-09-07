@@ -19,7 +19,7 @@ module AgentDaemon
 
       private
 
-      def build_command(prompt)
+      def build_command(prompt, images: [])
         model = @runner_config.dig("codex", "model")
         flags = combined_extra_flags
 
@@ -36,6 +36,10 @@ module AgentDaemon
         # Output is captured, not shown: escape codes would only make the log
         # unreadable.
         cmd << " --color never"
+        # The only way to put a picture in front of the model: opened through
+        # the shell it would be bytes. Repeated once per file, and before the
+        # prompt, which has to stay last.
+        images.each { |path| cmd << " --image #{path.shellescape}" }
         cmd << " #{flags}" unless flags.empty?
         # The prompt goes last: `codex exec [OPTIONS] [PROMPT]`.
         cmd << " #{prompt.shellescape}"

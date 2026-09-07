@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "fileutils"
 require "set"
 
 require_relative "base"
@@ -20,6 +21,16 @@ module AgentDaemon
     # than the log line the retry produces.
     class Pachca < Base
       DEFAULT_EVENT_TYPES = %w[message_new].freeze
+
+      # file_type as Pachca spells it for a picture. The other values are
+      # "file", "audio" and "voice"; only this one is worth putting in front
+      # of the model, and only this one it can look at.
+      IMAGE_TYPE = "image"
+
+      # Enough for a screenshot or a log, small enough that a stray archive
+      # cannot fill the disk while an operator is asleep. A file over the cap
+      # is skipped with a warning, not truncated: half a PNG is not a picture.
+      DEFAULT_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
       # Pachca renders a live timer instead of a reaction counter when the
       # reaction is named agent-thinking, which is exactly the "I heard you"
@@ -58,6 +69,11 @@ module AgentDaemon
         @context_messages  = trigger.fetch("context_messages", DEFAULT_CONTEXT_MESSAGES).to_i
         @thinking_reaction = trigger.fetch("thinking_reaction", DEFAULT_THINKING_REACTION)
         @thinking          = Set.new
+        @download_attachments  = trigger.fetch("attachments", true)
+        @max_attachment_bytes  = trigger.fetch("max_attachment_bytes", DEFAULT_MAX_ATTACHMENT_BYTES).to_i
+        # Memoised per event: the summary is built for the prompt and the image
+        # list for the backend, and neither should re-download the file.
+        @attachments           = {}
         @thinking_off      = false
 
         Log.info("[#{log_tag}] listening to #{scope_description}")
@@ -261,6 +277,7 @@ module AgentDaemon
         payload = event["payload"] || {}
 
         {
+          "files"             => attachment_summary(event),
           "event_id"          => event["id"],
           "event_type"        => event["event_type"],
           "message"           => payload["content"],
@@ -275,6 +292,86 @@ module AgentDaemon
           "created_at"        => payload["created_at"],
           "url"               => payload["url"]
         }
+      end
+
+      # --- attachments ---------------------------------------------------
+
+      # Pachca's event payload never carries the files: its own documentation
+      # says so outright — "по payload нельзя определить, есть ли у сообщения
+      # вложение". So finding out costs one GET /messages/{id} per item the
+      # runner decided to act on, which is cheap (reads are rate-limited at
+      # ~10/s) and only happens for real questions.
+      #
+      # Downloaded by the daemon rather than left to the agent, for two
+      # reasons: a picture has to exist as a file before the backend can name
+      # it on the command line, and an agent told to fetch a URL may simply
+      # not bother.
+      #
+      # Failures here never sink the run. An answer written without the
+      # screenshot is worse than one written with it, and far better than none.
+      def attachments(event)
+        return @attachments[event["id"]] if @attachments.key?(event["id"])
+
+        @attachments[event["id"]] = fetch_attachments(event)
+      end
+
+      def fetch_attachments(event)
+        message_id = event.dig("payload", "id")
+        return [] if message_id.nil? || !@download_attachments
+
+        files = Array(@client.message(message_id)["files"])
+        return [] if files.empty?
+
+        files.filter_map { |file| download(file, event["id"]) }
+      rescue ::AgentDaemon::RateLimitError
+        raise
+      rescue => e
+        Log.warn("[#{log_tag}] could not read attachments of #{message_id}: #{e.message}")
+        []
+      end
+
+      def download(file, event_id)
+        url = file["url"].to_s
+        return nil if url.empty?
+
+        # Under message_dir because that is the one directory the agent is
+        # already allowed to write to — the gem passes it to the sandbox as
+        # --add-dir. A subdirectory is safe: the Messenger only ever globs
+        # *.yml at the top level.
+        dir = ::File.join(@message_dir, "attachments", event_id.to_s)
+        FileUtils.mkdir_p(dir)
+        path = ::File.join(dir, safe_name(file["name"], file["id"]))
+
+        body = @client.fetch_file(url, limit: @max_attachment_bytes)
+        return nil if body.nil?
+
+        ::File.binwrite(path, body)
+        { "path" => path, "name" => file["name"], "type" => file["file_type"] }
+      rescue => e
+        Log.warn("[#{log_tag}] could not download #{file['name'].inspect}: #{e.message}")
+        nil
+      end
+
+      # The name comes from whoever sent the message, so it decides only the
+      # basename and never the directory.
+      def safe_name(name, id)
+        base = ::File.basename(name.to_s.strip)
+        base = "attachment-#{id}" if base.empty? || base.start_with?(".")
+        base.gsub(%r{[/\\\0]}, "_")
+      end
+
+      # What the prompt shows: names and local paths, so the agent can open a
+      # log or a CSV itself. Images are also handed to the backend separately —
+      # reading a PNG through the shell yields bytes, not a picture.
+      def attachment_summary(event)
+        downloaded = attachments(event)
+        return "" if downloaded.empty?
+
+        downloaded.map { |file| "- #{file['name']} (#{file['type']}): #{file['path']}" }.join("\n")
+      end
+
+      def run_images(event)
+        attachments(event).select { |file| file["type"] == IMAGE_TYPE }.map { |file| file["path"] }
       end
 
       def start_thinking(event)

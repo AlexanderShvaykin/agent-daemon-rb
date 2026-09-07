@@ -88,7 +88,7 @@ class RunnerSupervisorCancelBackend
     @cancel_token = cancel_token
   end
 
-  def run(_prompt)
+  def run(_prompt, images: [])
     sleep(0.01) until @cancel_token.value
     AgentDaemon::Backend::Result.new(false, "", "", :killed)
   end

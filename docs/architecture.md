@@ -223,6 +223,38 @@ most 50; a larger value is paged through the cursor, one request per 50, capped
 at 500. A failed fetch warns and answers without the context rather than
 failing the run.
 
+### Attachments (pachca)
+
+A message can carry files, and the runner puts them in front of the agent: every
+file as a local path in `{{files}}`, images additionally on the backend's command
+line through `Backend#run(images:)` — `--image` for codex. Beside the prompt
+rather than inside it, because a picture cannot be described into one: an agent
+that opens a PNG through the shell reads bytes.
+
+Finding out costs one `GET /messages/{id}` per acted-on item. Pachca's event
+payload never carries the files, and its documentation says so outright — *"по
+payload нельзя определить, есть ли у сообщения вложение"* — so there is no
+cheaper test than asking. Only items that passed the gates pay it, and message
+reads are rate-limited at ~10/s.
+
+The daemon downloads rather than leaving it to the agent, for two reasons: the
+file has to exist before the backend can name it on the command line, and an
+agent told to fetch a URL may simply not bother. Files land under
+`<message_dir>/attachments/<event id>/` — the one directory the sandbox is
+already given, and a subdirectory the Messenger's top-level `*.yml` glob ignores.
+Names come from whoever sent the message, so they decide the basename and nothing
+above it.
+
+Nothing here can sink a run. An oversized file
+(`trigger.max_attachment_bytes`, 25 MB by default), a refusal from storage, a
+message that cannot be read — each is logged and the answer goes on without it,
+because an answer written without the screenshot beats no answer at all.
+`trigger.attachments: false` turns the whole thing off.
+
+The return path already existed: a reply YAML naming local paths in `files` is
+uploaded by the pachca transport and attached to the message. So an agent can
+take a picture, change it, and send it back.
+
 ## Backends
 
 `Backend.for(runner_config, ...)` is a factory that returns the correct
