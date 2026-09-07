@@ -53,7 +53,7 @@ tracker:
 runners:
   # --- Example 1: Tracker runner (polls Yandex Tracker via JQL) ---
   - name: triage
-    backend: claude            # "claude" (default) or "opencode"
+    backend: claude            # "claude" (default), "opencode" or "codex"
     agent: task-analyst        # --agent flag passed to the CLI
     # agent: null              # pass no --agent at all (both backends)
     # claude:                  # optional, "claude" backend only
@@ -62,9 +62,20 @@ runners:
     # backend construction time, exact FALLBACK_AGENT=1 selects this command;
     # every other value keeps Claude. Each token and the final rendered prompt
     # are shell-escaped independently. Ignored for OpenCode runners.
+    # Either another backend by name — which keeps that backend building its
+    # own flags — or an arbitrary CLI as {command, args}, which inherits none
+    # of them and must restate everything it needs.
+    # fallback_agent: codex
     # fallback_agent:
     #   command: omp
     #   args: [--print, --auto-approve, --model, gpt-5.3-codex]
+    #
+    # The codex backend runs `codex exec` sandboxed to workspace-write, plus an
+    # --add-dir for each directory the runner writes to. read-only would mean a
+    # run that finishes successfully having written no reply at all.
+    # codex:
+    #   model: gpt-5.3-codex
+    #   extra_flags: ""
     # Same optional, human-only pair as at the top of this file, scoped to this
     # one runner. Shown in the console next to this runner's name; note that
     # every runner key is also a prompt variable, so `{{description}}` works in

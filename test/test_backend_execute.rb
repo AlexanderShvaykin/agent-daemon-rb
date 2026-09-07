@@ -517,25 +517,101 @@ class TestBackendFactory < Minitest::Test
     assert_instance_of AgentDaemon::Backend::Claude, factory_backend("backend" => "claude")
   end
 
-  def test_factory_ignores_fallback_for_opencode
+  # The fallback used to apply to claude runners alone. Whichever agent a
+  # runner normally uses is the one whose quota can run out, so the switch now
+  # reaches every backend.
+  def test_the_fallback_applies_to_every_backend
     ENV["FALLBACK_AGENT"] = "1"
 
     backend = factory_backend("backend" => "opencode", "fallback_agent" => fallback_config)
 
-    assert_instance_of AgentDaemon::Backend::OpenCode, backend
+    assert_instance_of AgentDaemon::Backend::ConfiguredAgent, backend
   end
 
-  def test_only_configured_claude_runners_select_fallback
+  def test_only_runners_that_configured_a_fallback_select_one
     ENV["FALLBACK_AGENT"] = "1"
 
     backends = [
       factory_backend("name" => "configured", "backend" => "claude", "fallback_agent" => fallback_config),
       factory_backend("name" => "primary", "backend" => "claude"),
-      factory_backend("name" => "opencode", "backend" => "opencode", "fallback_agent" => fallback_config)
+      factory_backend("name" => "opencode", "backend" => "opencode")
     ]
 
     assert_equal [AgentDaemon::Backend::ConfiguredAgent, AgentDaemon::Backend::Claude,
                   AgentDaemon::Backend::OpenCode], backends.map(&:class)
+  end
+
+  # Naming a backend instead of a command is what makes the switch usable in
+  # both directions: written as a raw command, a claude fallback would have to
+  # restate every flag Backend::Claude builds for itself, and one of them being
+  # wrong is a fallback that fails exactly when it is needed.
+  def test_a_fallback_may_name_another_backend
+    ENV["FALLBACK_AGENT"] = "1"
+
+    assert_instance_of AgentDaemon::Backend::Claude,
+                       factory_backend("backend" => "codex", "fallback_agent" => "claude")
+    assert_instance_of AgentDaemon::Backend::Codex,
+                       factory_backend("backend" => "claude", "fallback_agent" => "codex")
+  end
+
+  def test_a_named_fallback_is_ignored_without_the_switch
+    ENV.delete("FALLBACK_AGENT")
+
+    assert_instance_of AgentDaemon::Backend::Codex,
+                       factory_backend("backend" => "codex", "fallback_agent" => "claude")
+  end
+
+  def test_codex_is_selectable_as_a_backend
+    assert_instance_of AgentDaemon::Backend::Codex, factory_backend("backend" => "codex")
+  end
+
+  def codex_command(**config)
+    factory_backend(**{ "backend" => "codex" }.merge(config)).send(:build_command, "спроси")
+  end
+
+  # workspace-write is not a detail: the agent's whole output is a message YAML
+  # written into message_dir. Under read-only the run would finish successfully
+  # having written nothing, and a trigger that acknowledges on success would
+  # discard the work item — a default that loses questions silently.
+  def test_codex_runs_with_a_writable_workspace
+    assert_includes codex_command, "--sandbox workspace-write"
+  end
+
+  # message_dir and output_dir routinely sit outside project_path, and the
+  # sandbox has to be told about them by name.
+  def test_codex_makes_the_message_and_output_dirs_writable
+    command = codex_command("output_dir" => "/tmp/out")
+
+    assert_includes command, "--add-dir /tmp/msg"
+    assert_includes command, "--add-dir /tmp/out"
+  end
+
+  def test_codex_puts_the_prompt_last_and_escapes_it
+    assert_match(/codex exec .* спроси\z/, codex_command.gsub("\\", ""))
+  end
+
+  def test_codex_model_is_optional
+    refute_includes codex_command, "--model"
+    assert_includes codex_command("codex" => { "model" => "gpt-5.3-codex" }), "--model gpt-5.3-codex"
+  end
+
+  # project_path is frequently just a working directory, and codex refuses to
+  # run outside a git repository unless told otherwise.
+  def test_codex_does_not_require_a_git_repository
+    assert_includes codex_command, "--skip-git-repo-check"
+  end
+
+  # Output is captured for the log, never shown to anyone: escape codes would
+  # only make it unreadable.
+  def test_codex_output_is_uncoloured
+    assert_includes codex_command, "--color never"
+  end
+
+  def test_codex_takes_extra_flags_from_both_places
+    command = codex_command("extra_flags" => "--general", "codex" => { "extra_flags" => "--specific" })
+
+    assert_includes command, "--general"
+    assert_includes command, "--specific"
   end
 
   def test_configured_agent_shell_escapes_each_token_and_appends_prompt_last

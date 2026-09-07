@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.16.0] - 2026-09-05
+
+### Added
+- `codex` backend: OpenAI's Codex CLI as a first-class option alongside `claude` and `opencode`, selected the same way (`backend: codex`, with an optional `codex.model` and `codex.extra_flags`). It runs `codex exec` with `--sandbox workspace-write` plus an `--add-dir` for every directory the runner writes to. That sandbox choice is deliberate and stated in the class: the agent's whole output is a message YAML written into `message_dir`, so under the safer-sounding read-only sandbox a run would finish successfully having written nothing — and a trigger that acknowledges on success would then discard the work item. Codex's `--dangerously-bypass-approvals-and-sandbox` is *not* the counterpart of Claude's `--dangerously-skip-permissions`: Claude has no sandbox to disable, so copying the flag across would not equalise behaviour but remove a protection. Operators who want it can pass it through `codex.extra_flags`.
+- `fallback_agent` now accepts a backend name as well as a `{command, args}` Hash: `fallback_agent: claude`. The Hash form inherits none of the flags a backend builds for itself, so writing a known agent as a raw command means restating `--add-dir`, `--model`, `--agent`, `--output-format` and `--dangerously-skip-permissions` by hand — and getting one wrong yields a fallback that fails exactly when it is needed. Naming the backend keeps its own command-building.
+
+### Changed
+- The `FALLBACK_AGENT=1` switch applies to every backend, not just `claude`. Whichever agent a runner normally uses is the one whose quota can run out. Runners without a `fallback_agent` are unaffected, and the switch remains process-wide by design — it exists for the case where one account's quota is exhausted and every runner has to move at once.
+- `codex.model` is validated at config load, like `claude.model` and unlike `opencode.model`, so a typo surfaces on startup rather than hours later on the first work item.
 ## [0.15.1] - 2026-09-05
 
 ### Fixed

@@ -418,13 +418,58 @@ class TestConfigRunners < Minitest::Test
     end
   end
 
-  def test_rejects_non_hash_fallback_agent
+  # A String is now a backend name, so "omp" is not rejected for its type but
+  # for naming nothing — and the error says which form an arbitrary CLI needs.
+  def test_rejects_a_fallback_naming_an_unknown_backend
     Dir.mktmpdir do |dir|
       project_path = with_project(dir)
       path = write_config(dir, base_config(project_path, [tracker_runner("fallback_agent" => "omp")]))
 
       err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
-      assert_includes err.message, 'runner "default": fallback_agent must be a Hash'
+      assert_includes err.message, 'fallback_agent names an unknown backend "omp"'
+      assert_includes err.message, "{command, args}"
+    end
+  end
+
+  def test_accepts_a_fallback_naming_a_backend
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      path = write_config(dir, base_config(project_path, [tracker_runner("fallback_agent" => "codex")]))
+
+      assert_equal "codex", AgentDaemon::Config.new(path).runners.first["fallback_agent"]
+    end
+  end
+
+  def test_rejects_a_fallback_that_is_neither_a_name_nor_a_command
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      path = write_config(dir, base_config(project_path, [tracker_runner("fallback_agent" => 42)]))
+
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      assert_includes err.message, "fallback_agent must be a backend name (String) or a Hash"
+    end
+  end
+
+  def test_accepts_codex_as_a_backend
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runner = tracker_runner("backend" => "codex", "codex" => { "model" => "gpt-5.3-codex" })
+      path = write_config(dir, base_config(project_path, [runner]))
+
+      assert_equal "codex", AgentDaemon::Config.new(path).runners.first["backend"]
+    end
+  end
+
+  # Unlike opencode.model, which is only checked when the command is built, a
+  # codex problem surfaces at load rather than hours later on the first question.
+  def test_rejects_a_blank_codex_model
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runner = tracker_runner("backend" => "codex", "codex" => { "model" => "" })
+      path = write_config(dir, base_config(project_path, [runner]))
+
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      assert_includes err.message, "codex.model must be a non-empty String"
     end
   end
 
