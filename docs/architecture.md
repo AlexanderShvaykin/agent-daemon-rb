@@ -356,7 +356,8 @@ valid values. Adding a transport means a new `transport/<name>.rb` plus a
   prompt cannot be trusted to branch on that, so the reply YAML states all
   three fields unconditionally and the transport decides. `default_chat_id` is
   a numeric id, not a name — there is no name resolution to fall back on.
-  stdlib only.
+  A reply may also carry `files:` (local paths), which the transport uploads
+  before posting — see *Attaching files* below. stdlib only.
 
 ### Message routing
 
@@ -386,6 +387,7 @@ The `pachca` transport reads its own set, all numeric:
 - `user: <id>` — send a direct message.
 - `chat_id: <id>` — post to that chat.
 - `parent_message_id: <id>` — optional, threads the post as a reply.
+- `files:` — optional, local paths to attach (see below).
 - none of the above — post to `messenger.default_chat_id`, where
   `SYSTEM:<runner>` errors land.
 
@@ -393,6 +395,38 @@ Both `user` and `chat_id` is an error, as is `entity_type` without an
 `entity_id` — the latter is most likely a reply whose id never got substituted,
 and sending it to the default chat would drop the answer in the wrong place
 rather than fail loudly.
+
+### Attaching files (pachca)
+
+A reply may carry files the agent produced. The YAML names **local paths** —
+the agent knows nothing about uploads:
+
+```yaml
+message: "График за неделю"
+entity_type: thread
+entity_id: 33177699
+files:
+  - /srv/agent/outputs/chart.png
+  - path: /srv/agent/outputs/run.log
+    name: "Лог прогона.txt"     # what the chat displays; defaults to the basename
+    file_type: file             # "image" renders inline, "file" attaches
+```
+
+An entry is a path or a Hash with `path` plus optional `name`/`file_type`; a
+lone entry need not be a list. `file_type` defaults to `image` for the usual
+image extensions and `file` otherwise — Pachca never infers it from the bytes,
+so a screenshot sent as `file` arrives as a download link.
+
+The transport does the transfer at delivery time, because an upload is an
+orphan object on the storage until a message references its key: `POST
+/uploads` returns presigned S3 form fields, the bytes go straight to the
+storage host (no bearer token — the signature is the authorization, and the
+`file` part must come last), and the returned key goes into `POST /messages`.
+A path that cannot be read raises, exactly like a half-written destination
+does: when the file *is* the answer, sending the text without it would look
+like a complete reply. The Messenger leaves such a YAML in place and retries it
+on the next poll, so a permanently bad path is a repeating failure, not a
+silently truncated answer.
 
 ## Prompt Templates
 

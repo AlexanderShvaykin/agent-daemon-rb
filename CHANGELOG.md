@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.17.0] - 2026-09-07
+
+### Added
+- The `pachca` transport attaches files. A reply YAML may carry `files:` — local paths, or a Hash with `path` plus an optional `name` (what the chat displays) and `file_type` (`image` renders inline, `file` attaches) — and the transport uploads each one before posting. The agent writes a path and nothing else: the three-step dance is the daemon's, not the prompt's.
+- Uploading is three requests, and the middle one is not Pachca's: `POST /uploads` returns presigned S3 form fields, the bytes go to the storage host directly (no bearer token there — the signature is the authorization) and the returned key is what the message references. The signed policy fixes the field set and their order, and the storage stops reading the form at the `file` part, so the multipart body is assembled by hand rather than through `Net::HTTP#set_form`, which promises no order. The body is binary throughout: a PNG does not survive a transcode.
+- The transfer happens at delivery rather than when the agent writes the file, because an upload is an orphan object on the storage until a message references its key — there is nothing to leak and nothing to clean up if the run fails before writing its YAML. A path that cannot be read raises, exactly like a half-written destination does: when the file *is* the answer, sending the text without it would look like a complete reply. `file_type` defaults from the extension because Pachca never infers it from the bytes — a screenshot sent as `file` arrives as a download link.
+
 ## [0.16.0] - 2026-09-05
 
 ### Added

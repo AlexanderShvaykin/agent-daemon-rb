@@ -2,6 +2,7 @@
 
 require "net/http"
 require "json"
+require "securerandom"
 require "uri"
 
 module AgentDaemon
@@ -25,6 +26,18 @@ module AgentDaemon
       # most pages #messages will walk before giving up on a chat.
       MAX_PAGE  = 50
       MAX_PAGES = 20
+
+      # The signed form fields POST /uploads hands back, named here because the
+      # S3 policy signs an exact set: an unknown extra field is rejected, and
+      # the file part has to come last (the storage stops reading the form
+      # there). "key" and "file" are appended by #store, in that order.
+      SIGNATURE_FIELDS = %w[Content-Disposition acl policy x-amz-credential
+                            x-amz-algorithm x-amz-date x-amz-signature].freeze
+
+      # What Pachca renders inline rather than as an attachment. The API takes
+      # the distinction as a given ("image" or "file") and never infers it from
+      # the bytes, so a screenshot posted as "file" arrives as a download link.
+      IMAGE_EXTENSIONS = %w[.png .jpg .jpeg .gif .webp .bmp .heic .heif].freeze
 
       def initialize(config)
         @token           = config.fetch("token")
@@ -58,15 +71,48 @@ module AgentDaemon
       #
       # The API nests everything under a "message" object; a flat body is
       # rejected as a validation error, not silently ignored.
-      def create_message(entity_type:, entity_id:, content:, parent_message_id: nil)
+      #
+      # `files` are descriptors from #upload, not paths: an upload is an orphan
+      # object on the storage until a message references its key, and only this
+      # call makes it visible to anyone.
+      def create_message(entity_type:, entity_id:, content:, parent_message_id: nil, files: nil)
         message = {
           "entity_type" => entity_type,
           "entity_id" => entity_id,
           "content" => content.to_s
         }
         message["parent_message_id"] = parent_message_id if parent_message_id
+        message["files"] = files if files && !files.empty?
 
         post("/messages", "message" => message)
+      end
+
+      # Upload one local file and return the descriptor a message carries in
+      # its "files" array: {"key", "name", "file_type", "size"}.
+      #
+      # Three steps, and the middle one is not Pachca's: POST /uploads signs an
+      # S3 form, the bytes go straight to the storage host (no bearer token
+      # there — the signature is the authorization), and the key comes back
+      # here for #create_message to reference. The file is read into memory,
+      # which is what the daemon's own traffic looks like — a chart, a log, a
+      # screenshot the agent just produced.
+      def upload(path, name: nil, file_type: nil)
+        full_path = File.expand_path(path.to_s)
+        raise "Pachca upload: #{full_path} is not a readable file" unless File.file?(full_path) && File.readable?(full_path)
+
+        display_name = presence(name) || File.basename(full_path)
+        signature = post("/uploads", {})
+        # The signed key is a template — the policy fixes the directory and
+        # leaves the basename to us.
+        key = signature.fetch("key").sub("${filename}", display_name)
+        store(signature, key, full_path, display_name)
+
+        {
+          "key" => key,
+          "name" => display_name,
+          "file_type" => presence(file_type) || file_type_for(display_name),
+          "size" => File.size(full_path)
+        }
       end
 
       # The most recent messages of a chat, oldest first — the order a
@@ -145,6 +191,65 @@ module AgentDaemon
       end
 
       private
+
+      def presence(value)
+        value.strip if value.is_a?(String) && !value.strip.empty?
+      end
+
+      def file_type_for(name)
+        IMAGE_EXTENSIONS.include?(File.extname(name).downcase) ? "image" : "file"
+      end
+
+      # POST the bytes to the storage host the signature names. Everything about
+      # this request is unlike the rest of the client — another host, no bearer
+      # token, no JSON — so it builds its own request rather than going through
+      # #request, and the body is assembled by hand: a signed multipart form
+      # tolerates no reordering, and Net::HTTP's own #set_form gives no
+      # guarantee worth relying on here.
+      def store(signature, key, path, name)
+        fields = SIGNATURE_FIELDS.filter_map { |field| [field, signature[field]] if signature.key?(field) }
+        fields << ["key", key]
+
+        url = URI(signature.fetch("direct_url"))
+        boundary = "AgentDaemon-#{SecureRandom.hex(16)}"
+
+        req = Net::HTTP::Post.new(url.request_uri)
+        req["Content-Type"] = "multipart/form-data; boundary=#{boundary}"
+        req.body = multipart_body(fields, boundary, name, File.binread(path))
+
+        response = storage_http(url).request(req)
+        return if response.is_a?(Net::HTTPSuccess)
+
+        raise "Pachca upload to #{url.host} returned #{response.code}: #{response.body.to_s.strip.slice(0, 500)}"
+      end
+
+      # Binary throughout: the parts are joined to file bytes, and a UTF-8
+      # header string would push the whole body through a transcode that a PNG
+      # does not survive.
+      def multipart_body(fields, boundary, filename, bytes)
+        body = String.new(encoding: Encoding::BINARY)
+
+        fields.each do |name, value|
+          body << "--#{boundary}\r\nContent-Disposition: form-data; name=\"#{name}\"\r\n\r\n#{value}\r\n".b
+        end
+        body << "--#{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"#{filename}\"\r\n" \
+                "Content-Type: application/octet-stream\r\n\r\n".b
+        body << bytes.b
+        body << "\r\n--#{boundary}--\r\n".b
+      end
+
+      # Kept per host: the storage is a different origin from the API, and its
+      # read timeout is an upload's, not a JSON round trip's.
+      def storage_http(url)
+        @storage_http ||= {}
+        @storage_http[[url.host, url.port]] ||= begin
+          h = Net::HTTP.new(url.host, url.port)
+          h.use_ssl = url.scheme == "https"
+          h.open_timeout = 15
+          h.read_timeout = 120
+          h
+        end
+      end
 
       # The cursor is opaque and base64, so it carries "=" and "+" and has to
       # be escaped rather than pasted into the query.

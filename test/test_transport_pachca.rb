@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "tmpdir"
 
 class TestTransportPachca < Minitest::Test
   CONFIG = { "type" => "pachca", "token" => "tok", "default_chat_id" => 500 }.freeze
@@ -130,6 +131,87 @@ class TestTransportPachca < Minitest::Test
     assert_equal 1, fake.requests.size
     assert_equal "/api/shared/v1/messages", fake.requests.first.path
     assert_equal "thread", created(fake)["entity_type"]
+  end
+
+  # --- files ---------------------------------------------------------------
+
+  UPLOAD_SIGNATURE = {
+    "policy" => "eyJleHBpcmF0aW9u", "x-amz-signature" => "cd7cec6b",
+    "key" => "attaches/files/825566/dd9698fc/${filename}",
+    "direct_url" => "https://pachca-prod-uploads.s3.storage.selcloud.ru"
+  }.freeze
+
+  # /uploads and /messages both live under the API path, so the leg is told
+  # apart by the endpoint rather than by the host.
+  def deliver_with_files(message_data)
+    fake = FakeHttp.new do |req|
+      case req.path
+      when "/api/shared/v1/uploads" then FakeSuccess.new(JSON.generate(UPLOAD_SIGNATURE))
+      when "/api/shared/v1/messages" then FakeSuccess.new(JSON.generate("data" => { "id" => 1 }))
+      else FakeSuccess.new("")
+      end
+    end
+
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "chart.png")
+      File.binwrite(path, "\x89PNG binary".b)
+      stub_net_http(fake) { transport.deliver(message_data.call(path)) }
+    end
+
+    fake
+  end
+
+  def posted_message(fake)
+    JSON.parse(fake.requests.find { |req| req.path == "/api/shared/v1/messages" }.body).fetch("message")
+  end
+
+  def test_a_file_path_is_uploaded_and_referenced_by_the_message
+    fake = deliver_with_files(->(path) { { "message" => "график", "chat_id" => 900, "files" => [path] } })
+
+    assert_equal ["/api/shared/v1/uploads", "/", "/api/shared/v1/messages"], fake.requests.map(&:path)
+    assert_equal([{ "key" => "attaches/files/825566/dd9698fc/chart.png", "name" => "chart.png",
+                    "file_type" => "image", "size" => 11 }], posted_message(fake)["files"])
+    assert_equal "график", posted_message(fake)["content"]
+  end
+
+  # One file need not be written as a list, and the Hash form renames it.
+  def test_a_single_hash_entry_carries_a_display_name_and_file_type
+    fake = deliver_with_files(lambda do |path|
+      { "message" => "лог", "chat_id" => 900,
+        "files" => { "path" => path, "name" => "Отчёт за вчера.png", "file_type" => "file" } }
+    end)
+
+    assert_equal([{ "key" => "attaches/files/825566/dd9698fc/Отчёт за вчера.png",
+                    "name" => "Отчёт за вчера.png", "file_type" => "file", "size" => 11 }],
+                 posted_message(fake)["files"])
+  end
+
+  def test_a_message_without_files_posts_exactly_one_request_and_no_files_key
+    fake = deliver("message" => "текст", "chat_id" => 900)
+
+    assert_equal 1, fake.requests.size
+    refute_includes created(fake), "files"
+  end
+
+  def test_an_unreadable_path_raises_rather_than_sending_the_text_alone
+    fake = FakeHttp.new { |_req| FakeSuccess.new(JSON.generate("data" => { "id" => 1 })) }
+
+    error = assert_raises(RuntimeError) do
+      stub_net_http(fake) { transport.deliver("message" => "график", "chat_id" => 900, "files" => ["/nope/x.png"]) }
+    end
+
+    assert_match(%r{/nope/x\.png is not a readable file}, error.message)
+    assert_empty fake.requests
+  end
+
+  def test_a_file_entry_without_a_path_raises
+    fake = FakeHttp.new { |_req| FakeSuccess.new(JSON.generate("data" => { "id" => 1 })) }
+
+    error = assert_raises(RuntimeError) do
+      stub_net_http(fake) { transport.deliver("message" => "график", "chat_id" => 900, "files" => [{ "name" => "chart.png" }]) }
+    end
+
+    assert_match(/has no "path"/, error.message)
   end
 
   def test_the_factory_dispatches_on_the_type

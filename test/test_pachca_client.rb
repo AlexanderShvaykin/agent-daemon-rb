@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "tmpdir"
 
 class FakeNotFound < Net::HTTPNotFound
   def initialize = nil
@@ -247,5 +248,140 @@ class TestPachcaClient < Minitest::Test
 
     error = assert_raises(RuntimeError) { stub_net_http(fake) { client.events } }
     assert_match(/\{not json/, error.message)
+  end
+
+  # --- uploads -------------------------------------------------------------
+
+  SIGNATURE = {
+    "Content-Disposition" => "attachment",
+    "acl" => "private",
+    "policy" => "eyJleHBpcmF0aW9u",
+    "x-amz-credential" => "7085e6/20260907/ru-1a/s3/aws4_request",
+    "x-amz-algorithm" => "AWS4-HMAC-SHA256",
+    "x-amz-date" => "20260907T131043Z",
+    "x-amz-signature" => "cd7cec6b",
+    "key" => "attaches/files/825566/dd9698fc/${filename}",
+    "direct_url" => "https://pachca-prod-uploads.s3.storage.selcloud.ru"
+  }.freeze
+
+  # The storage answers 204 with an empty body, which is why the second leg is
+  # checked for Net::HTTPSuccess rather than a 201.
+  class FakeNoContent < Net::HTTPSuccess
+    def initialize = nil
+    def code = "204"
+    def body = ""
+  end
+
+  def with_file(basename, bytes = "\x89PNG\r\n\x1a\n binary".b)
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, basename)
+      File.binwrite(path, bytes)
+      yield path
+    end
+  end
+
+  def upload_fake
+    FakeHttp.new do |req|
+      req.path.start_with?("/api/") ? json(SIGNATURE) : FakeNoContent.new
+    end
+  end
+
+  def test_upload_signs_then_stores_and_returns_the_message_descriptor
+    fake = upload_fake
+
+    descriptor = with_file("chart.png") { |path| stub_net_http(fake) { client.upload(path) } }
+
+    assert_equal "POST", fake.requests.first.method
+    assert_equal "/api/shared/v1/uploads", fake.requests.first.path
+    assert_equal({ "key" => "attaches/files/825566/dd9698fc/chart.png", "name" => "chart.png",
+                   "file_type" => "image", "size" => 15 }, descriptor)
+  end
+
+  # The signed policy fixes both the field set and their order, and S3 stops
+  # reading the form at the file part — so "file" last is a protocol
+  # requirement, not a style choice.
+  def test_the_stored_form_carries_the_signed_fields_in_order_with_the_file_last
+    fake = upload_fake
+
+    with_file("chart.png") { |path| stub_net_http(fake) { client.upload(path) } }
+
+    stored = fake.requests.last
+    assert_equal "/", stored.path
+    assert_nil stored["Authorization"]
+    assert_match(%r{\Amultipart/form-data; boundary=AgentDaemon-\h{32}\z}, stored["Content-Type"])
+
+    # "; name=" so the file part contributes "file" and not its filename too.
+    names = stored.body.scan(/; name="([^"]+)"/).flatten
+    assert_equal ["Content-Disposition", "acl", "policy", "x-amz-credential", "x-amz-algorithm",
+                  "x-amz-date", "x-amz-signature", "key", "file"], names
+    assert_includes stored.body, "attaches/files/825566/dd9698fc/chart.png"
+    assert_includes stored.body, "filename=\"chart.png\""
+  end
+
+  # A PNG does not survive a transcode, so the assembled body stays binary.
+  def test_the_stored_body_keeps_the_bytes_intact
+    fake = upload_fake
+    bytes = "\x89PNG\r\n\x1a\n\xFF\xFE".b
+
+    with_file("shot.png", bytes) { |path| stub_net_http(fake) { client.upload(path) } }
+
+    body = fake.requests.last.body
+    assert_equal Encoding::BINARY, body.encoding
+    assert_includes body, bytes
+  end
+
+  def test_upload_names_the_file_type_from_the_extension
+    fake = upload_fake
+
+    log = with_file("run.log") { |path| stub_net_http(fake) { client.upload(path) } }
+
+    assert_equal "file", log["file_type"]
+  end
+
+  def test_an_explicit_name_and_file_type_win_over_the_inferred_ones
+    fake = upload_fake
+
+    descriptor = with_file("tmp1234.png") do |path|
+      stub_net_http(fake) { client.upload(path, name: "Отчёт.png", file_type: "file") }
+    end
+
+    assert_equal "Отчёт.png", descriptor["name"]
+    assert_equal "file", descriptor["file_type"]
+    assert_equal "attaches/files/825566/dd9698fc/Отчёт.png", descriptor["key"]
+  end
+
+  def test_a_missing_file_raises_before_any_request_is_made
+    fake = upload_fake
+
+    error = assert_raises(RuntimeError) { stub_net_http(fake) { client.upload("/nope/missing.png") } }
+
+    assert_match(%r{/nope/missing\.png is not a readable file}, error.message)
+    assert_empty fake.requests
+  end
+
+  def test_a_storage_failure_raises_with_the_status_and_body
+    fake = FakeHttp.new do |req|
+      req.path.start_with?("/api/") ? json(SIGNATURE) : FakeServerError.new
+    end
+
+    error = assert_raises(RuntimeError) do
+      with_file("chart.png") { |path| stub_net_http(fake) { client.upload(path) } }
+    end
+
+    assert_match(/upload to pachca-prod-uploads\.s3\.storage\.selcloud\.ru returned 503: unavailable/, error.message)
+  end
+
+  def test_create_message_carries_file_descriptors_and_omits_an_empty_list
+    fake = FakeHttp.new { |_req| json("data" => { "id" => 1 }) }
+    files = [{ "key" => "attaches/files/1/2/chart.png", "name" => "chart.png",
+               "file_type" => "image", "size" => 17 }]
+
+    stub_net_http(fake) do
+      client.create_message(entity_type: "discussion", entity_id: 900, content: "с файлом", files: files)
+      client.create_message(entity_type: "discussion", entity_id: 900, content: "без файлов", files: [])
+    end
+
+    assert_equal files, JSON.parse(fake.requests.first.body).dig("message", "files")
+    refute_includes JSON.parse(fake.requests.last.body).fetch("message"), "files"
   end
 end
