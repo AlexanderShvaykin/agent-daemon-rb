@@ -32,6 +32,16 @@ module AgentDaemon
       # is skipped with a warning, not truncated: half a PNG is not a picture.
       DEFAULT_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
+      # Per run, across the question and the thread behind it. A thread of
+      # fifty messages each with a screenshot would otherwise be fifty
+      # downloads before the agent says a word.
+      DEFAULT_MAX_ATTACHMENTS = 10
+
+      # How many pictures reach the model. A picture is expensive in a way a
+      # line of text is not, so the rest are named in the transcript with their
+      # paths and the agent can say which one it needs.
+      DEFAULT_MAX_IMAGES = 4
+
       # Pachca renders a live timer instead of a reaction counter when the
       # reaction is named agent-thinking, which is exactly the "I heard you"
       # signal a run lasting minutes needs. It only appears once an operator
@@ -74,6 +84,12 @@ module AgentDaemon
         # Memoised per event: the summary is built for the prompt and the image
         # list for the backend, and neither should re-download the file.
         @attachments           = {}
+        # Per run, reset in render_prompt: files by message id, and the
+        # download budget they share.
+        @by_message            = {}
+        @downloads             = 0
+        @max_attachments       = trigger.fetch("max_attachments", DEFAULT_MAX_ATTACHMENTS).to_i
+        @max_images            = trigger.fetch("max_images", DEFAULT_MAX_IMAGES).to_i
         @thinking_off      = false
 
         Log.info("[#{log_tag}] listening to #{scope_description}")
@@ -138,6 +154,11 @@ module AgentDaemon
       end
 
       def render_prompt(event)
+        # Per run: a lifetime budget would leave the tenth question with
+        # nothing, spent by the first nine.
+        @by_message = {}
+        @downloads  = 0
+
         variables = base_template_variables
                     .merge(event_variables(event))
                     .merge("thread_context" => thread_context(event))
@@ -193,8 +214,19 @@ module AgentDaemon
         messages
           .uniq { |message| message["id"] }
           .reject { |message| message["id"] == skip }
-          .map { |message| "#{author_label(message["user_id"])}: #{message["content"]}" }
+          .map { |message| transcript_line(message) }
           .join("\n")
+      end
+
+      # An earlier message's files are named on its own line, so "что тут не
+      # так?" three replies below a screenshot has something to point at. That
+      # is the common shape — more common than a file on the question itself.
+      def transcript_line(message)
+        line = "#{author_label(message["user_id"])}: #{message["content"]}"
+        files = attachments_of(message)
+        return line if files.empty?
+
+        "#{line} [#{files.map { |file| "#{file["name"]}: #{file["path"]}" }.join(", ")}]"
       end
 
       # Ids for people, a fixed label for the bot. Resolving names would cost a
@@ -319,10 +351,7 @@ module AgentDaemon
         message_id = event.dig("payload", "id")
         return [] if message_id.nil? || !@download_attachments
 
-        files = Array(@client.message(message_id)["files"])
-        return [] if files.empty?
-
-        files.filter_map { |file| download(file, event["id"]) }
+        attachments_of(@client.message(message_id))
       rescue ::AgentDaemon::RateLimitError
         raise
       rescue => e
@@ -330,7 +359,30 @@ module AgentDaemon
         []
       end
 
-      def download(file, event_id)
+      # Files of one message, downloaded once. Thread messages arrive from the
+      # context fetch already carrying their `files`, so an old screenshot
+      # costs no request at all — only the question itself does, because its
+      # event payload has no files to carry.
+      #
+      # @downloads is the whole run's budget. A thread of fifty messages each
+      # with a screenshot would otherwise be fifty downloads before the agent
+      # says a word; past the cap, files are named in the transcript but not
+      # fetched.
+      def attachments_of(message)
+        id = message["id"]
+        return [] if id.nil? || !@download_attachments
+        return @by_message[id] if @by_message.key?(id)
+
+        @by_message[id] = Array(message["files"]).filter_map do |file|
+          next nil if @downloads >= @max_attachments
+
+          downloaded = download(file, id)
+          @downloads += 1 if downloaded
+          downloaded
+        end
+      end
+
+      def download(file, message_id)
         url = file["url"].to_s
         return nil if url.empty?
 
@@ -338,7 +390,7 @@ module AgentDaemon
         # already allowed to write to — the gem passes it to the sandbox as
         # --add-dir. A subdirectory is safe: the Messenger only ever globs
         # *.yml at the top level.
-        dir = ::File.join(@message_dir, "attachments", event_id.to_s)
+        dir = ::File.join(@message_dir, "attachments", message_id.to_s)
         FileUtils.mkdir_p(dir)
         path = ::File.join(dir, safe_name(file["name"], file["id"]))
 
@@ -370,8 +422,28 @@ module AgentDaemon
         downloaded.map { |file| "- #{file['name']} (#{file['type']}): #{file['path']}" }.join("\n")
       end
 
+      # Everything downloaded this run, thread included — render_prompt has
+      # already walked the transcript by the time process_item asks for images.
+      #
+      # Newest first and capped, because a picture is expensive in a way a line
+      # of text is not: a thread with a dozen screenshots would spend most of
+      # the context on the oldest of them. What does not fit is still named in
+      # the transcript with its path, so the agent can say which one it needs.
       def run_images(event)
-        attachments(event).select { |file| file["type"] == IMAGE_TYPE }.map { |file| file["path"] }
+        own = images_among(attachments(event))
+        return own.last(@max_images).map { |file| file["path"] } if own.size >= @max_images
+
+        # Everything else downloaded this run — render_prompt has already walked
+        # the transcript by the time process_item asks. Newest first, and the
+        # question's own files last of all: they are the ones being asked about.
+        message_id = event.dig("payload", "id")
+        earlier = images_among(@by_message.reject { |id, _| id == message_id }.values.flatten)
+
+        (earlier.last(@max_images - own.size) + own).map { |file| file["path"] }
+      end
+
+      def images_among(files)
+        files.select { |file| file["type"] == IMAGE_TYPE }
       end
 
       def start_thinking(event)

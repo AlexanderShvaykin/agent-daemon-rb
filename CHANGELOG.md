@@ -12,6 +12,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Attachments cost one `GET /messages/{id}` per acted-on item, because Pachca's event payload never carries them — its documentation says so outright ("по payload нельзя определить, есть ли у сообщения вложение"). Only items that passed the gates pay it, and message reads are rate-limited at ~10/s.
 - The daemon downloads rather than leaving it to the agent, for two reasons: the file must exist before the backend can name it on the command line, and an agent told to fetch a URL may simply not bother. Files land under `<message_dir>/attachments/<event id>/` — the one directory the sandbox is already given, and a subdirectory the Messenger's top-level `*.yml` glob ignores.
 - Failures never sink a run: an oversized file (`trigger.max_attachment_bytes`, 25 MB by default), a refusal from storage, or a missing message is logged and the answer goes on without it. `trigger.attachments: false` turns the whole thing off. Filenames come from whoever sent the message, so they decide the basename and nothing above it.
+### Fixed
+
+- Attachments on earlier thread messages are seen too. Only the triggering message's files were downloaded, so the ordinary shape — a screenshot, then "что тут не так?" a reply below it — left the agent with nothing to look at, and the transcript did not even name the file. Thread messages arrive from the context fetch already carrying their `files`, so this costs no extra API call: only the download.
+- Two caps, because a thread is not a message: `trigger.max_attachments` (10) bounds downloads per run, and `trigger.max_images` (4) bounds how many pictures reach the model — a picture is expensive in a way a line of text is not. What does not fit is still named in the transcript with its path, so the agent can say which one it needs. The question's own images are never displaced by older ones.
+- Downloads are filed by message id rather than event id, so two messages in one thread cannot collide over a filename.
+
 ## [0.18.0] - 2026-09-08
 
 ### Fixed
