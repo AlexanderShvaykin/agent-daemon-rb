@@ -80,7 +80,7 @@ class TestBackendExecute < Minitest::Test
     assert_includes result.stdout, "ответ агента"
     assert result.stdout.valid_encoding?
     # The thing that actually broke: this used to raise.
-    assert_includes "ошибка: #{result.stdout}", "ответ агента"
+    assert_includes "error: #{result.stdout}", "ответ агента"
   end
 
   # A 4096-byte read can land mid-character, so the tail of a chunk is

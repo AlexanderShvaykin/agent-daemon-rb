@@ -8,9 +8,9 @@ require "stringio"
 class PachcaStubBackend
   attr_reader :prompts
 
-  # Настоящий агент оставляет после себя YAML ответа, и раннер теперь на это
-  # смотрит: ран, вышедший с нулём и ничего не записавший, успехом не считается.
-  # `writes: false` изображает ровно тот случай — CLI доволен, ответа нет.
+  # A real agent leaves a reply YAML behind, and the runner now looks for it:
+  # a run that exits 0 having written nothing is not a success.
+  # `writes: false` is exactly that case — the CLI is happy, the answer is not there.
   def initialize(reasons = [], message_dir: nil, writes: true)
     @reasons = reasons.dup
     @prompts = []
@@ -546,9 +546,9 @@ class TestRunnerPachca < Minitest::Test
 
     log = capture_log { runner.send(:iterate) }
 
-    assert_empty client.deleted, "вопрос не должен исчезнуть из истории"
+    assert_empty client.deleted, "the question must not vanish from the history"
     assert_match(/exited 0 but wrote no message/, log)
-    assert_equal 1, attempts(runner)["01A"], "попытка должна быть засчитана"
+    assert_equal 1, attempts(runner)["01A"], "the attempt must be counted"
   end
 
   def test_a_run_that_wrote_a_reply_is_a_success
@@ -562,8 +562,8 @@ class TestRunnerPachca < Minitest::Test
 
   # Retries are what make the check useful: the next cycle gets another go, and
   # only a genuinely exhausted item is dropped.
-  # max_attempts здесь 3, а after_exhausted срабатывает на следующем проходе
-  # после исчерпания — отсюда четвёртая страница.
+  # max_attempts is 3 here, and after_exhausted fires on the pass following
+  # exhaustion — hence the fourth page.
   def test_a_silent_run_is_retried_and_then_exhausts
     events = [event(id: "01A")]
     client = StubPachcaClient.new([events, events, events, events])
@@ -571,8 +571,8 @@ class TestRunnerPachca < Minitest::Test
 
     4.times { runner.send(:iterate) }
 
-    assert_equal 3, backend(runner).prompts.size, "три попытки, не больше"
-    assert_equal %w[01A], client.deleted, "исчерпав попытки, событие подтверждается"
+    assert_equal 3, backend(runner).prompts.size, "three attempts, no more"
+    assert_equal %w[01A], client.deleted, "an exhausted item is acknowledged"
   end
 
   # The Messenger polls the same directory and may move a reply to sent/ before
@@ -606,16 +606,16 @@ class TestRunnerPachca < Minitest::Test
     sent = File.join(@message_dir, "sent")
     FileUtils.mkdir_p(sent)
     delivered = File.join(sent, "01A.yml")
-    File.write(delivered, "message: первый ответ\n")
-    # Явно в прошлое: иначе на файловой системе с секундной гранулярностью обе
-    # записи попали бы в одну метку и тест мигал бы.
+    File.write(delivered, "message: first reply\n")
+    # Explicitly in the past: on a filesystem with one-second granularity both
+    # writes would share a timestamp and the test would flake.
     File.utime(Time.now - 60, Time.now - 60, delivered)
 
     backend = runner.instance_variable_get(:@backend)
     message_dir = @message_dir
     backend.define_singleton_method(:run) do |prompt|
       @prompts << prompt
-      File.write(File.join(message_dir, "01A.yml"), "message: второй ответ\n")
+      File.write(File.join(message_dir, "01A.yml"), "message: second reply\n")
       AgentDaemon::Backend::Result.new(true, "stdout", "stderr", :ok)
     end
 
