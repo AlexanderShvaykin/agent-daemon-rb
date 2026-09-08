@@ -39,6 +39,12 @@ end
 class StubGitHubClient
   attr_reader :read, :comment_urls
 
+  attr_writer :login
+
+  def login
+    @login ||= "bot"
+  end
+
   def initialize(pages, comments: {}, mark_failures: [])
     @pages = pages.dup
     @comments = comments
@@ -116,7 +122,7 @@ class TestRunnerGitHub < Minitest::Test
     runner
   end
 
-  def notification(id:, reason: "mention", repo: REPO, type: "PullRequest", number: 42, comment_url: "c#{id}")
+  def notification(id:, reason: "mention", repo: REPO, type: "PullRequest", number: 42, comment_url: "https://api.github.com/repos/#{repo}/issues/comments/#{id}")
     {
       "id" => id,
       "reason" => reason,
@@ -154,7 +160,7 @@ class TestRunnerGitHub < Minitest::Test
   # --- filtering -----------------------------------------------------------
 
   def test_a_pull_request_mention_is_picked_up
-    client = StubGitHubClient.new([[notification(id: "1")]], comments: { "c1" => comment(login: "zumkorn") })
+    client = StubGitHubClient.new([[notification(id: "1")]], comments: { "https://api.github.com/repos/art/app/issues/comments/1" => comment(login: "zumkorn") })
     runner = build_runner(client, trigger_overrides: { "allowed_users" => %w[zumkorn] })
 
     assert_equal %w[1], fetch(runner).map { |n| n["id"] }
@@ -180,17 +186,61 @@ class TestRunnerGitHub < Minitest::Test
   end
 
   def test_without_a_repo_list_every_watched_repository_counts
-    client = StubGitHubClient.new([[notification(id: "1", repo: "other/repo")]])
+    notification = notification(id: "1", repo: "other/repo")
+    client = StubGitHubClient.new(
+      [[notification]],
+      comments: { notification.dig("subject", "latest_comment_url") => comment(login: "zumkorn") }
+    )
     runner = build_runner(client, trigger_overrides: { "repos" => nil })
 
     refute_empty fetch(runner)
   end
 
+  # --- who actually asked ---------------------------------------------------
+
+  # A thread comes back unread on any activity, not just a comment: a merge, a
+  # push, a label, and the review this runner just posted. GitHub then points
+  # latest_comment_url at the pull request itself, and the "author" read from
+  # it is the PR's author — the person most likely to be on the allowlist.
+  # Observed live: one pull request reviewed twice, and merging re-armed the
+  # rest.
+  def test_activity_that_is_not_a_comment_does_not_summon
+    pr_url = "https://api.github.com/repos/#{REPO}/pulls/42"
+    notification = notification(id: "1", comment_url: pr_url)
+    client = StubGitHubClient.new([[notification]], comments: { pr_url => comment(login: "zumkorn") })
+    runner = build_runner(client)
+
+    assert_empty fetch(runner)
+    assert_equal %w[1], client.read, "иначе тред возвращался бы каждый опрос"
+  end
+
+  # Nobody types anything to request a review, so that one needs no comment.
+  def test_a_review_request_needs_no_comment
+    pr_url = "https://api.github.com/repos/#{REPO}/pulls/42"
+    notification = notification(id: "1", reason: "review_requested", comment_url: pr_url)
+    client = StubGitHubClient.new([[notification]], comments: { pr_url => comment(login: "zumkorn") })
+
+    refute_empty fetch(build_runner(client))
+  end
+
+  # Checked before the allowlist rather than through it: with no allowlist
+  # every author passes, and the agent would answer its own review forever.
+  def test_the_agents_own_comment_never_summons_it
+    notification = notification(id: "1")
+    client = StubGitHubClient.new(
+      [[notification]],
+      comments: { notification.dig("subject", "latest_comment_url") => comment(login: "bot") }
+    )
+    runner = build_runner(client, trigger_overrides: { "allowed_users" => nil })
+
+    assert_empty fetch(runner)
+  end
+
   # The agent answers publicly under this account, so who may summon it is a
   # wider question than who may ask it something in chat.
   def test_only_allowlisted_authors_may_summon
-    notifications = [notification(id: "1", comment_url: "c1"), notification(id: "2", comment_url: "c2")]
-    comments = { "c1" => comment(login: "stranger"), "c2" => comment(login: "zumkorn") }
+    notifications = [notification(id: "1", comment_url: "https://api.github.com/repos/art/app/issues/comments/1"), notification(id: "2", comment_url: "https://api.github.com/repos/art/app/issues/comments/2")]
+    comments = { "https://api.github.com/repos/art/app/issues/comments/1" => comment(login: "stranger"), "https://api.github.com/repos/art/app/issues/comments/2" => comment(login: "zumkorn") }
     client = StubGitHubClient.new([notifications], comments: comments)
     runner = build_runner(client, trigger_overrides: { "allowed_users" => %w[zumkorn] })
 
@@ -198,7 +248,7 @@ class TestRunnerGitHub < Minitest::Test
   end
 
   def test_the_allowlist_ignores_login_case
-    client = StubGitHubClient.new([[notification(id: "1")]], comments: { "c1" => comment(login: "ZumKorn") })
+    client = StubGitHubClient.new([[notification(id: "1")]], comments: { "https://api.github.com/repos/art/app/issues/comments/1" => comment(login: "ZumKorn") })
     runner = build_runner(client, trigger_overrides: { "allowed_users" => %w[zumkorn] })
 
     refute_empty fetch(runner)
@@ -234,7 +284,7 @@ class TestRunnerGitHub < Minitest::Test
   # --- acknowledgement -----------------------------------------------------
 
   def test_a_handled_notification_is_marked_read
-    client = StubGitHubClient.new([[notification(id: "1")]], comments: { "c1" => comment(login: "zumkorn") })
+    client = StubGitHubClient.new([[notification(id: "1")]], comments: { "https://api.github.com/repos/art/app/issues/comments/1" => comment(login: "zumkorn") })
     runner = build_runner(client)
 
     runner.send(:iterate)
@@ -256,7 +306,7 @@ class TestRunnerGitHub < Minitest::Test
   # Marking read is a destructive ack: the request is gone. A run that exits 0
   # without posting anything must not reach it.
   def test_a_run_that_posted_nothing_is_not_acknowledged
-    client = StubGitHubClient.new([[notification(id: "1")]], comments: { "c1" => comment(login: "zumkorn") })
+    client = StubGitHubClient.new([[notification(id: "1")]], comments: { "https://api.github.com/repos/art/app/issues/comments/1" => comment(login: "zumkorn") })
     runner = build_runner(client, writes: false)
 
     log = capture_log { runner.send(:iterate) }
@@ -268,7 +318,7 @@ class TestRunnerGitHub < Minitest::Test
   def test_a_failed_mark_read_is_retried_and_never_reprocessed
     notifications = [notification(id: "1")]
     client = StubGitHubClient.new([notifications, notifications],
-                                  comments: { "c1" => comment(login: "zumkorn") },
+                                  comments: { "https://api.github.com/repos/art/app/issues/comments/1" => comment(login: "zumkorn") },
                                   mark_failures: %w[1])
     runner = build_runner(client)
 
@@ -285,7 +335,7 @@ class TestRunnerGitHub < Minitest::Test
 
   def test_the_prompt_carries_the_pull_request_and_who_asked
     client = StubGitHubClient.new([[notification(id: "1", number: 77)]],
-                                  comments: { "c1" => comment(login: "zumkorn", body: "глянь плиз") })
+                                  comments: { "https://api.github.com/repos/art/app/issues/comments/1" => comment(login: "zumkorn", body: "глянь плиз") })
     runner = build_runner(client)
 
     prompt = runner.send(:render_prompt, fetch(runner).first)

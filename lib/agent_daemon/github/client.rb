@@ -43,6 +43,19 @@ module AgentDaemon
         nil
       end
 
+      # The login this token belongs to, asked once. Needed to tell the agent's
+      # own comments from everyone else's: without it a runner with no
+      # allowlist answers itself, since a review it posts brings the thread
+      # back unread.
+      def login
+        return @login if defined?(@login)
+
+        @login = get("/user")&.fetch("login", nil)
+      rescue StandardError => e
+        Log.warn("[GitHub] could not resolve own login: #{e.message}")
+        @login = nil
+      end
+
       # Acknowledge a thread. Marking read is what stops a handled mention
       # coming back on the next poll, so it is the ack — and, as with any ack,
       # doing it for work that did not happen loses the request.

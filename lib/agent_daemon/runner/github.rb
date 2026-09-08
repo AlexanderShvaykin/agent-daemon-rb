@@ -89,8 +89,28 @@ module AgentDaemon
         return false unless @reasons.include?(notification["reason"].to_s)
         return false unless notification.dig("subject", "type") == SUBJECT_TYPE
         return false unless watched_repo?(notification)
+        return false unless somebody_asked?(notification)
 
         summoned_by_allowed_author?(notification)
+      end
+
+      # A thread comes back unread on any activity, not just a comment: a merge,
+      # a push, a label — and the review this runner just posted. GitHub then
+      # points latest_comment_url at the pull request itself rather than at a
+      # comment, and reading an author from it yields the PR's author, who is
+      # exactly the person likely to be on the allowlist. Observed live: one
+      # pull request reviewed twice, and merging re-armed the rest.
+      #
+      # So a mention has to arrive as a comment. A review request does not —
+      # nobody types anything to ask for one.
+      def somebody_asked?(notification)
+        return true if notification["reason"].to_s == "review_requested"
+
+        comment_url?(notification.dig("subject", "latest_comment_url"))
+      end
+
+      def comment_url?(url)
+        url.to_s.include?("/comments/")
       end
 
       def watched_repo?(notification)
@@ -108,12 +128,20 @@ module AgentDaemon
       # asked, the gate cannot be applied at all, and acting anyway would make
       # the allowlist decorative.
       def summoned_by_allowed_author?(notification)
-        return true if @allowed_users.empty?
-
         author = comment_author(notification)
         return false if author.nil?
+        # Checked before the allowlist and not through it: with no allowlist
+        # every author passes, and the agent would answer its own review for
+        # as long as the poll runs.
+        return false if own?(author)
+        return true if @allowed_users.empty?
 
         @allowed_users.include?(author.downcase)
+      end
+
+      def own?(author)
+        login = @client.login
+        !login.nil? && author.downcase == login.downcase
       end
 
       def comment_author(notification)
