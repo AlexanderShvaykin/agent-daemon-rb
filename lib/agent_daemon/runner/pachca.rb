@@ -65,6 +65,15 @@ module AgentDaemon
 
       private
 
+      # This trigger acknowledges by deleting the event from Pachca's history,
+      # so a run that exits 0 without writing an answer destroys the question
+      # rather than leaving it somewhere visible. Seen live: a message_dir the
+      # agent could not write to produced exactly that — the agent said it
+      # could not save the file, the CLI exited 0, and the question was gone.
+      def expects_message_file?
+        true
+      end
+
       # Stated on startup rather than left to be inferred from the config: with
       # neither list set, the right to command the agent is exactly the right to
       # talk to the bot, and that is worth reading in the log.

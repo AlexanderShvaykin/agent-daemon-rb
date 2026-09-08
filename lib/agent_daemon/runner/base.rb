@@ -131,14 +131,34 @@ module AgentDaemon
         @sinks.publish_event(type: :started, work_item: key, attempt: attempt_no, at: Time.now.utc.iso8601)
         @sinks.publish_state(status: :in_progress, work_item: key, attempt: attempt_no)
         before_attempt(item)
+        files_before = expects_message_file? ? message_file_snapshot : nil
         result = @backend.run(prompt)
 
         case result.reason
         when :ok
-          @attempts.delete(key)
-          Log.info("[#{log_tag}] #{key} done: #{result.stdout.lines.first&.strip}")
-          Log.debug("[#{log_tag}] Full output:\n#{result.stdout}")
-          after_success(item)
+          # A zero exit code is not the same as work done. Agent CLIs report
+          # success for plenty of runs that produced nothing: an
+          # unauthenticated `claude -p` prints "Not logged in" and exits 0, a
+          # sandbox that refused the write leaves the agent politely explaining
+          # it could not save the file, a message_dir that does not exist does
+          # the same. For a trigger that archives on success the damage is at
+          # least visible; for one that acknowledges by deleting, the work item
+          # is gone and nobody learns a question went unanswered.
+          #
+          # So when a reply was expected and none appeared, this is a failure:
+          # attempt counted, work item kept, next cycle retries.
+          if files_before && !wrote_message?(files_before)
+            Log.error("[#{log_tag}] #{key} exited 0 but wrote no message " \
+                      "(attempt #{attempt_no}/#{@max_attempts}): #{result.stdout.lines.last&.strip}")
+            Log.debug("[#{log_tag}] Full output:\n#{result.stdout}")
+            create_error_message("no_message", work_item: key, error_text: result.stdout) if attempt_no >= @max_attempts
+            after_failure(item)
+          else
+            @attempts.delete(key)
+            Log.info("[#{log_tag}] #{key} done: #{result.stdout.lines.first&.strip}")
+            Log.debug("[#{log_tag}] Full output:\n#{result.stdout}")
+            after_success(item)
+          end
         when :timeout
           Log.error("[#{log_tag}] CLI timeout for #{key} (attempt #{attempt_no}/#{@max_attempts})")
           create_error_message("timeout", work_item: key) if attempt_no >= @max_attempts
@@ -172,6 +192,61 @@ module AgentDaemon
 
       def render_prompt(_item)
         raise NotImplementedError, "#{self.class}#render_prompt"
+      end
+
+      # Whether a run that leaves no message file behind should count as a
+      # failure. Off by default: a runner whose agent is expected to act rather
+      # than write — move a ticket, start a detached job — has no artefact to
+      # look for, and demanding one would turn working setups into failing ones.
+      #
+      # A trigger that acknowledges by deleting the work item turns this on,
+      # because there a silent no-op is unrecoverable.
+      def expects_message_file?
+        false
+      end
+
+      # Message files as name => mtime, including ones the Messenger has
+      # already moved to sent/. Both directories are counted because the
+      # Messenger polls the same directory: a reply written near the end of a
+      # run can be picked up before this check runs, and missing it would mean
+      # answering twice.
+      #
+      # Keyed by name but compared by mtime, because names repeat. A prompt
+      # naturally derives the filename from the work item ("write your answer
+      # to <event id>.yml"), so a retry — or a second summons on the same PR,
+      # which GitHub reports under the notification id it used before — writes
+      # the name that is already sitting in sent/ from the previous run. Names
+      # alone would call that run silent and retry an answer already delivered.
+      def message_file_snapshot
+        return {} if @message_dir.nil?
+
+        [@message_dir, ::File.join(@message_dir, "sent")]
+          .flat_map { |dir| Dir.glob(::File.join(dir, "*.{yml,yaml}")) }
+          .each_with_object({}) do |path, snapshot|
+            name = ::File.basename(path)
+            # The Messenger may move a file out from under the glob; that file
+            # is a delivered reply either way, so skip it rather than lose the
+            # whole snapshot to one race.
+            mtime = begin
+              ::File.mtime(path)
+            rescue SystemCallError
+              next
+            end
+            # The same name can sit in both directories at once — a fresh reply
+            # in the queue beside the delivered one it replaces. Keep the later
+            # of the two: the question is when this name was last written, and
+            # taking whichever the glob happened to yield second would hide the
+            # new file behind the old one's timestamp.
+            snapshot[name] = mtime if snapshot[name].nil? || mtime > snapshot[name]
+          end
+      rescue SystemCallError
+        {}
+      end
+
+      # Whether the run left a reply behind: a file that was not there before,
+      # or one whose name was there but has been written again since.
+      def wrote_message?(before)
+        message_file_snapshot.any? { |name, mtime| before[name].nil? || mtime > before[name] }
       end
 
       # Called once per attempt, immediately before the backend runs — the

@@ -188,7 +188,7 @@ module AgentDaemon
         end
 
         success = reason == :ok
-        Result.new(success, stdout_buf, stderr_buf, reason, started_at, finished_at, pid)
+        Result.new(success, as_utf8(stdout_buf), as_utf8(stderr_buf), reason, started_at, finished_at, pid)
       ensure
         # `reason` is nil here when the body raised before a terminal reason
         # was assigned; sinks accept nil as an opaque "run aborted" value.
@@ -201,6 +201,21 @@ module AgentDaemon
       def append_chunk(stream, chunk, buf)
         buf << chunk
         @sinks.append_output(stream, chunk)
+      end
+
+      # Agent output is UTF-8 prose, but it does not arrive that way.
+      # `read_nonblock` hands back ASCII-8BIT, and appending a chunk that
+      # carries a single non-ASCII byte flips the whole buffer to binary — so a
+      # Result read by an English-speaking agent is UTF-8 and the same Result
+      # read by a Russian-speaking one is not. Interpolating the binary one into
+      # a message then raises Encoding::CompatibilityError, and the runner dies
+      # at the exact moment it was trying to report a failure.
+      #
+      # scrub, because a 4096-byte read can land mid-character: the tail of a
+      # chunk is then an incomplete sequence that is genuinely invalid UTF-8,
+      # and a diagnostic message is not worth raising over.
+      def as_utf8(buffer)
+        buffer.dup.force_encoding(Encoding::UTF_8).scrub
       end
 
       def drain_remaining(io, stream, buf)

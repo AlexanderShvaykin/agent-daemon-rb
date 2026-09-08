@@ -8,14 +8,26 @@ require "stringio"
 class PachcaStubBackend
   attr_reader :prompts
 
-  def initialize(reasons = [])
+  # A real agent leaves a reply YAML behind, and the runner now looks for it:
+  # a run that exits 0 having written nothing is not a success.
+  # `writes: false` is exactly that case — the CLI is happy, the answer is not there.
+  def initialize(reasons = [], message_dir: nil, writes: true)
     @reasons = reasons.dup
     @prompts = []
+    @message_dir = message_dir
+    @writes = writes
+    @written = 0
   end
 
   def run(prompt)
     @prompts << prompt
     reason = @reasons.shift || :ok
+
+    if reason == :ok && @writes && @message_dir
+      @written += 1
+      File.write(File.join(@message_dir, "reply-#{@written}.yml"), "message: ok\n")
+    end
+
     AgentDaemon::Backend::Result.new(reason == :ok, "stdout", "stderr", reason)
   end
 end
@@ -128,11 +140,12 @@ class TestRunnerPachca < Minitest::Test
     }
   end
 
-  def build_runner(client, reasons: [], trigger_overrides: {})
+  def build_runner(client, reasons: [], trigger_overrides: {}, writes: true)
     runner = AgentDaemon::Runner::Pachca.new(
       runner_config(trigger_overrides), @message_dir, @project_path, PachcaStubShutdown.new
     )
-    runner.instance_variable_set(:@backend, PachcaStubBackend.new(reasons))
+    runner.instance_variable_set(:@backend,
+                                 PachcaStubBackend.new(reasons, message_dir: @message_dir, writes: writes))
     runner.instance_variable_set(:@client, client)
     runner
   end
@@ -152,6 +165,7 @@ class TestRunnerPachca < Minitest::Test
   def fetch(runner) = runner.send(:fetch_work_items)
   def backend(runner) = runner.instance_variable_get(:@backend)
   def settled(runner) = runner.instance_variable_get(:@settled)
+  def attempts(runner) = runner.instance_variable_get(:@attempts)
 
   def capture_log
     prior = AgentDaemon::Log.instance_variable_get(:@logger)
@@ -517,6 +531,98 @@ class TestRunnerPachca < Minitest::Test
     runner.send(:iterate)
 
     assert_equal "было:\n222: деплой сломался\nспросили: а почему?", backend(runner).prompts.first
+  end
+
+  # --- a run that produced nothing -----------------------------------------
+
+  # Exit code 0 is not the same as work done. An unauthenticated `claude -p`
+  # prints "Not logged in" and exits 0; a sandbox that refused the write leaves
+  # the agent politely explaining it could not save the file. Here the event is
+  # acknowledged by DELETING it, so treating that as success destroys the
+  # question — observed live with a message_dir the agent could not write to.
+  def test_a_run_that_wrote_nothing_is_not_a_success
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    runner = build_runner(client, writes: false)
+
+    log = capture_log { runner.send(:iterate) }
+
+    assert_empty client.deleted, "the question must not vanish from the history"
+    assert_match(/exited 0 but wrote no message/, log)
+    assert_equal 1, attempts(runner)["01A"], "the attempt must be counted"
+  end
+
+  def test_a_run_that_wrote_a_reply_is_a_success
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    runner = build_runner(client)
+
+    runner.send(:iterate)
+
+    assert_equal %w[01A], client.deleted
+  end
+
+  # Retries are what make the check useful: the next cycle gets another go, and
+  # only a genuinely exhausted item is dropped.
+  # max_attempts is 3 here, and after_exhausted fires on the pass following
+  # exhaustion — hence the fourth page.
+  def test_a_silent_run_is_retried_and_then_exhausts
+    events = [event(id: "01A")]
+    client = StubPachcaClient.new([events, events, events, events])
+    runner = build_runner(client, writes: false)
+
+    4.times { runner.send(:iterate) }
+
+    assert_equal 3, backend(runner).prompts.size, "three attempts, no more"
+    assert_equal %w[01A], client.deleted, "an exhausted item is acknowledged"
+  end
+
+  # The Messenger polls the same directory and may move a reply to sent/ before
+  # this check runs. Missing that would mean answering the same question twice.
+  def test_a_reply_already_moved_to_sent_still_counts
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    runner = build_runner(client, writes: false)
+    sent = File.join(@message_dir, "sent")
+    FileUtils.mkdir_p(sent)
+
+    backend = runner.instance_variable_get(:@backend)
+    backend.define_singleton_method(:run) do |prompt|
+      @prompts << prompt
+      File.write(File.join(sent, "already-delivered.yml"), "message: ok\n")
+      AgentDaemon::Backend::Result.new(true, "stdout", "stderr", :ok)
+    end
+
+    runner.send(:iterate)
+
+    assert_equal %w[01A], client.deleted
+  end
+
+  # Prompts name the reply after the work item ("write your answer to
+  # <event id>.yml"), so a second run on the same item writes a name that is
+  # already sitting in sent/ from the first. Comparing names alone called that
+  # run silent and retried an answer the person had already received — observed
+  # live on a GitHub review summoned twice on one pull request.
+  def test_a_reply_reusing_a_delivered_filename_still_counts
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    runner = build_runner(client, writes: false)
+    sent = File.join(@message_dir, "sent")
+    FileUtils.mkdir_p(sent)
+    delivered = File.join(sent, "01A.yml")
+    File.write(delivered, "message: first reply\n")
+    # Explicitly in the past: on a filesystem with one-second granularity both
+    # writes would share a timestamp and the test would flake.
+    File.utime(Time.now - 60, Time.now - 60, delivered)
+
+    backend = runner.instance_variable_get(:@backend)
+    message_dir = @message_dir
+    backend.define_singleton_method(:run) do |prompt|
+      @prompts << prompt
+      File.write(File.join(message_dir, "01A.yml"), "message: second reply\n")
+      AgentDaemon::Backend::Result.new(true, "stdout", "stderr", :ok)
+    end
+
+    log = capture_log { runner.send(:iterate) }
+
+    assert_equal %w[01A], client.deleted
+    refute_match(/wrote no message/, log)
   end
 
   # --- acknowledging what is ignored ---------------------------------------
