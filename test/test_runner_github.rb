@@ -19,7 +19,7 @@ class GitHubStubBackend
     @written = 0
   end
 
-  def run(prompt)
+  def run(prompt, images: [])
     @prompts << prompt
     reason = @reasons.shift || :ok
 
