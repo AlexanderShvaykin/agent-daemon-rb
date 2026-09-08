@@ -240,7 +240,7 @@ reads are rate-limited at ~10/s.
 The daemon downloads rather than leaving it to the agent, for two reasons: the
 file has to exist before the backend can name it on the command line, and an
 agent told to fetch a URL may simply not bother. Files land under
-`<message_dir>/attachments/<event id>/` — the one directory the sandbox is
+`<message_dir>/attachments/<message id>/` — the one directory the sandbox is
 already given, and a subdirectory the Messenger's top-level `*.yml` glob ignores.
 Names come from whoever sent the message, so they decide the basename and nothing
 above it.
