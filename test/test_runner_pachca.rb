@@ -593,7 +593,7 @@ class TestRunnerPachca < Minitest::Test
     FileUtils.mkdir_p(sent)
 
     backend = runner.instance_variable_get(:@backend)
-    backend.define_singleton_method(:run) do |prompt|
+    backend.define_singleton_method(:run) do |prompt, images: []|
       @prompts << prompt
       File.write(File.join(sent, "already-delivered.yml"), "message: ok\n")
       AgentDaemon::Backend::Result.new(true, "stdout", "stderr", :ok)
@@ -622,7 +622,7 @@ class TestRunnerPachca < Minitest::Test
 
     backend = runner.instance_variable_get(:@backend)
     message_dir = @message_dir
-    backend.define_singleton_method(:run) do |prompt|
+    backend.define_singleton_method(:run) do |prompt, images: []|
       @prompts << prompt
       File.write(File.join(message_dir, "01A.yml"), "message: second reply\n")
       AgentDaemon::Backend::Result.new(true, "stdout", "stderr", :ok)
