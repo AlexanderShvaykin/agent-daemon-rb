@@ -14,7 +14,7 @@ class StubBackend
     @calls = 0
   end
 
-  def run(_prompt)
+  def run(_prompt, images: [])
     @calls += 1
     reason = @reasons.shift || :ok
     AgentDaemon::Backend::Result.new(reason == :ok, "stdout", "stderr", reason)

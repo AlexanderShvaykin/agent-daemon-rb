@@ -82,8 +82,12 @@ module AgentDaemon
         @run_seq = 0
       end
 
-      def run(prompt)
-        cmd = build_command(prompt)
+      # `images` are local paths to put in front of the model. They travel
+      # beside the prompt rather than inside it because a picture cannot be
+      # described into one: an agent that opens a PNG through the shell reads
+      # bytes. A backend whose CLI has no such flag ignores the argument.
+      def run(prompt, images: [])
+        cmd = build_command(prompt, images: images)
         timeout = @runner_config.fetch("timeout", 1200)
         execute(cmd, timeout: timeout)
       end
@@ -99,7 +103,7 @@ module AgentDaemon
 
       private
 
-      def build_command(_prompt)
+      def build_command(_prompt, images: [])
         raise NotImplementedError, "#{self.class}#build_command is not implemented"
       end
 

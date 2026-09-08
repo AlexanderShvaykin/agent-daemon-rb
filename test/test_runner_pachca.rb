@@ -19,7 +19,7 @@ class PachcaStubBackend
     @written = 0
   end
 
-  def run(prompt)
+  def run(prompt, images: [])
     @prompts << prompt
     reason = @reasons.shift || :ok
 
@@ -71,8 +71,17 @@ class StubPachcaClient
     (@pages.shift || []).sort_by { |event| event["id"].to_s }
   end
 
-  attr_writer :history, :history_error, :root, :root_error
-  attr_reader :message_queries, :message_gets
+  attr_writer :history, :history_error, :root, :root_error, :download_failure
+  attr_reader :message_queries, :message_gets, :fetched_urls
+
+  # The file comes from a presigned storage link, not from the API.
+  def fetch_file(url, limit:)
+    raise @download_failure if @download_failure
+
+    (@fetched_urls ||= []) << url
+    body = "PNG-байты"
+    body.bytesize > limit ? nil : body
+  end
 
   def messages(chat_id:, limit: 20)
     raise @history_error if @history_error
@@ -584,7 +593,7 @@ class TestRunnerPachca < Minitest::Test
     FileUtils.mkdir_p(sent)
 
     backend = runner.instance_variable_get(:@backend)
-    backend.define_singleton_method(:run) do |prompt|
+    backend.define_singleton_method(:run) do |prompt, images: []|
       @prompts << prompt
       File.write(File.join(sent, "already-delivered.yml"), "message: ok\n")
       AgentDaemon::Backend::Result.new(true, "stdout", "stderr", :ok)
@@ -613,7 +622,7 @@ class TestRunnerPachca < Minitest::Test
 
     backend = runner.instance_variable_get(:@backend)
     message_dir = @message_dir
-    backend.define_singleton_method(:run) do |prompt|
+    backend.define_singleton_method(:run) do |prompt, images: []|
       @prompts << prompt
       File.write(File.join(message_dir, "01A.yml"), "message: second reply\n")
       AgentDaemon::Backend::Result.new(true, "stdout", "stderr", :ok)
@@ -765,4 +774,250 @@ class TestRunnerPachca < Minitest::Test
 
     assert_empty client.reactions
   end
+  # --- attachments ----------------------------------------------------------
+
+  # Shape copied from a live message: a picture carries width/height and
+  # file_type "image", a plain file carries neither.
+  def message_with_files(*files)
+    { "id" => 555, "files" => files }
+  end
+
+  def image_file(name: "screen.png")
+    { "id" => 111_305_739, "name" => name, "file_type" => "image",
+      "width" => 1920, "height" => 1080, "url" => "https://storage.test/#{name}?X-Amz-Signature=abc" }
+  end
+
+  def plain_file(name: "hello-world.txt")
+    { "id" => 111_305_740, "name" => name, "file_type" => "file",
+      "width" => nil, "height" => nil, "url" => "https://storage.test/#{name}?X-Amz-Signature=abc" }
+  end
+
+  # Pachca's docs are explicit that the event payload cannot tell you whether a
+  # message has an attachment, so finding out costs one GET per acted-on item.
+  def test_an_attachment_is_downloaded_and_named_in_the_prompt
+    File.write(@template_path, "вопрос: {{message}}\nфайлы:\n{{files}}")
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(plain_file)
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    runner.send(:iterate)
+
+    prompt = backend(runner).prompts.first
+    assert_match(/hello-world\.txt \(file\)/, prompt)
+    assert_equal 1, client.fetched_urls.size
+
+    path = prompt[%r{(/\S*hello-world\.txt)}, 1]
+    assert File.exist?(path), "файл должен лежать на диске: #{path}"
+    assert_equal "PNG-байты", File.read(path)
+  end
+
+  # A picture reaches the model only through the CLI flag: opened through the
+  # shell it is bytes.
+  def test_an_image_is_handed_to_the_backend_and_a_plain_file_is_not
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(image_file, plain_file)
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    images = runner.send(:run_images, event(id: "01A"))
+
+    assert_equal 1, images.size
+    assert_match(/screen\.png\z/, images.first)
+  end
+
+  # Downloading it twice would double the traffic for nothing: the summary is
+  # built for the prompt, the list for the backend, from one fetch.
+  def test_attachments_are_fetched_once_per_event
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(image_file)
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    runner.send(:iterate)
+
+    assert_equal 1, client.fetched_urls.size
+    assert_equal 1, client.message_gets.size
+  end
+
+  # An answer written without the screenshot is worse than one written with it,
+  # and far better than none at all.
+  def test_a_failed_download_does_not_sink_the_run
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(image_file)
+    client.download_failure = "storage refused"
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    log = capture_log { runner.send(:iterate) }
+
+    assert_match(/could not download/, log)
+    assert_equal %w[01A], client.deleted, "вопрос всё равно обработан"
+  end
+
+  # The name comes from whoever sent the message: it may decide the basename
+  # and nothing above it.
+  def test_a_traversing_filename_cannot_escape_the_attachment_directory
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(plain_file(name: "../../etc/passwd"))
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    downloaded = runner.send(:attachments, event(id: "01A"))
+
+    assert_equal 1, downloaded.size
+    assert_equal File.join(@message_dir, "attachments", "01A", "passwd"), downloaded.first["path"]
+  end
+
+  def test_attachments_can_be_turned_off
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(image_file)
+    runner = build_runner(client, trigger_overrides: { "chats" => nil, "attachments" => false })
+
+    assert_empty runner.send(:attachments, event(id: "01A"))
+    assert_nil client.message_gets
+  end
+
+  # --- attachments ----------------------------------------------------------
+
+  # Shape copied from a live message: a picture carries width/height and
+  # file_type "image", a plain file carries neither.
+  def message_with_files(*files)
+    { "id" => 555, "files" => files }
+  end
+
+  def image_file(name: "screen.png")
+    { "id" => 111_305_739, "name" => name, "file_type" => "image",
+      "width" => 1920, "height" => 1080, "url" => "https://storage.test/#{name}?X-Amz-Signature=abc" }
+  end
+
+  def plain_file(name: "hello-world.txt")
+    { "id" => 111_305_740, "name" => name, "file_type" => "file",
+      "width" => nil, "height" => nil, "url" => "https://storage.test/#{name}?X-Amz-Signature=abc" }
+  end
+
+  # Pachca's docs are explicit that the event payload cannot tell you whether a
+  # message has an attachment, so finding out costs one GET per acted-on item.
+  def test_an_attachment_is_downloaded_and_named_in_the_prompt
+    File.write(@template_path, "вопрос: {{message}}\nфайлы:\n{{files}}")
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(plain_file)
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    runner.send(:iterate)
+
+    prompt = backend(runner).prompts.first
+    assert_match(/hello-world\.txt \(file\)/, prompt)
+    assert_equal 1, client.fetched_urls.size
+
+    path = prompt[%r{(/\S*hello-world\.txt)}, 1]
+    assert File.exist?(path), "файл должен лежать на диске: #{path}"
+    assert_equal "PNG-байты", File.read(path)
+  end
+
+  # A picture reaches the model only through the CLI flag: opened through the
+  # shell it is bytes.
+  def test_an_image_is_handed_to_the_backend_and_a_plain_file_is_not
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(image_file, plain_file)
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    images = runner.send(:run_images, event(id: "01A"))
+
+    assert_equal 1, images.size
+    assert_match(/screen\.png\z/, images.first)
+  end
+
+  # Downloading it twice would double the traffic for nothing: the summary is
+  # built for the prompt, the list for the backend, from one fetch.
+  def test_attachments_are_fetched_once_per_event
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(image_file)
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    runner.send(:iterate)
+
+    assert_equal 1, client.fetched_urls.size
+    assert_equal 1, client.message_gets.size
+  end
+
+  # An answer written without the screenshot is worse than one written with it,
+  # and far better than none at all.
+  def test_a_failed_download_does_not_sink_the_run
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(image_file)
+    client.download_failure = "storage refused"
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    log = capture_log { runner.send(:iterate) }
+
+    assert_match(/could not download/, log)
+    assert_equal %w[01A], client.deleted, "вопрос всё равно обработан"
+  end
+
+  # The name comes from whoever sent the message: it may decide the basename
+  # and nothing above it.
+  def test_a_traversing_filename_cannot_escape_the_attachment_directory
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(plain_file(name: "../../etc/passwd"))
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    downloaded = runner.send(:attachments, event(id: "01A"))
+
+    assert_equal 1, downloaded.size
+    # Filed by message id: a thread has several, and names can collide.
+    assert_equal File.join(@message_dir, "attachments", "555", "passwd"), downloaded.first["path"]
+  end
+
+  # A screenshot goes up, the question about it comes a reply later. That is
+  # the common shape, and until this fix the older file did not exist for the
+  # agent at all — not even by name.
+  def test_a_screenshot_posted_earlier_in_the_thread_is_seen
+    File.write(@template_path, "тред:\n{{thread_context}}\nвопрос: {{message}}")
+    client = StubPachcaClient.new([[thread_event]])
+    client.history = [{ "id" => 222, "user_id" => 42, "content" => "смотри",
+                        "files" => [image_file(name: "bug.png")] }]
+    client.root = { "id" => 555, "files" => [] }
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    runner.send(:iterate)
+
+    prompt = backend(runner).prompts.first
+    assert_match(/bug\.png:/, prompt, "старое вложение должно быть названо в транскрипте")
+    assert_equal 1, client.fetched_urls.size
+  end
+
+  # Thread messages arrive carrying their own files: an older attachment costs
+  # the download and no extra API call.
+  def test_thread_attachments_cost_no_extra_api_call
+    client = StubPachcaClient.new([[thread_event]])
+    client.history = [{ "id" => 222, "user_id" => 42, "content" => "смотри",
+                        "files" => [image_file(name: "bug.png")] }]
+    client.root = { "id" => 555, "files" => [] }
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    runner.send(:iterate)
+
+    # One GET for the thread root, one for the question itself.
+    assert_operator client.message_gets.size, :<=, 2
+  end
+
+  # A picture is expensive where a line of text is not. What does not fit is
+  # still named in the transcript, with its path.
+  def test_images_are_capped_and_the_question_own_files_win
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(image_file(name: "a.png"), image_file(name: "b.png"),
+                                     image_file(name: "c.png"))
+    runner = build_runner(client, trigger_overrides: { "chats" => nil, "max_images" => 2 })
+
+    images = runner.send(:run_images, event(id: "01A"))
+
+    assert_equal 2, images.size
+    assert_match(/c\.png\z/, images.last)
+  end
+
+  def test_attachments_can_be_turned_off
+    client = StubPachcaClient.new([[event(id: "01A")]])
+    client.root = message_with_files(image_file)
+    runner = build_runner(client, trigger_overrides: { "chats" => nil, "attachments" => false })
+
+    assert_empty runner.send(:attachments, event(id: "01A"))
+    assert_nil client.message_gets
+  end
+
 end

@@ -7,7 +7,7 @@ module AgentDaemon
     class ConfiguredAgent < Base
       private
 
-      def build_command(prompt)
+      def build_command(prompt, images: [])
         config = @runner_config.fetch("fallback_agent")
         argv = [config.fetch("command"), *config.fetch("args"), prompt]
 

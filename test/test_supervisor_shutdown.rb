@@ -20,7 +20,7 @@ class TestSupervisorShutdown < Minitest::Test
       @seconds = seconds
     end
 
-    def build_command(_prompt)
+    def build_command(_prompt, images: [])
       "sleep #{@seconds}"
     end
   end
@@ -30,7 +30,7 @@ class TestSupervisorShutdown < Minitest::Test
   class RecordingSleepBackend < SleepBackend
     attr_reader :last_result
 
-    def run(prompt)
+    def run(prompt, images: [])
       @last_result = super
     end
   end

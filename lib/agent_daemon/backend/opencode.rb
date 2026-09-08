@@ -7,7 +7,7 @@ module AgentDaemon
     class OpenCode < Base
       private
 
-      def build_command(prompt)
+      def build_command(prompt, images: [])
         model = @runner_config.dig("opencode", "model")
         raise ArgumentError, "Model not specified for opencode in runner #{@runner_config['name'].inspect}: opencode.model" if model.nil? || model.empty?
 

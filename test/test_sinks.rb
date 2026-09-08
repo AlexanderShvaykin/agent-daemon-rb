@@ -75,7 +75,7 @@ class SinksStubBackend
     @reasons = reasons.dup
   end
 
-  def run(_prompt)
+  def run(_prompt, images: [])
     reason = @reasons.shift || :ok
     AgentDaemon::Backend::Result.new(reason == :ok, "stdout", "stderr", reason)
   end

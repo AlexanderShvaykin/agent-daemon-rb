@@ -10,7 +10,7 @@ class StubBackendFile
     @reasons = reasons.dup
   end
 
-  def run(_prompt)
+  def run(_prompt, images: [])
     reason = @reasons.shift || :ok
     AgentDaemon::Backend::Result.new(reason == :ok, "stdout", "stderr", reason)
   end
@@ -149,7 +149,7 @@ class TestRunnerFile < Minitest::Test
     runner = build_runner([], cancel_flag: token)
     calls = []
     backend = Object.new
-    backend.define_singleton_method(:run) do |_prompt|
+    backend.define_singleton_method(:run) do |_prompt, images: []|
       calls << true
       token.value = true
       AgentDaemon::Backend::Result.new(true, "stdout", "", :ok)

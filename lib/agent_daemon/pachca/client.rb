@@ -238,6 +238,36 @@ module AgentDaemon
         body << "\r\n--#{boundary}--\r\n".b
       end
 
+      public
+
+      # Downloads an attachment. The url comes from a message's `files` entry:
+      # it is a pre-signed storage link, valid for seven days, and carries its
+      # own credentials — sending the bot token there would leak it to a third
+      # party for nothing.
+      #
+      # Returns nil rather than raising when the file is bigger than `limit`.
+      # Half a PNG is not a picture, and a run that answers without the
+      # screenshot beats one that dies over it. Same for a refusal from the
+      # storage: it is logged by the caller and the answer goes on without it.
+      def fetch_file(url, limit:)
+        uri = URI(url.to_s)
+        response = storage_http(uri).request(Net::HTTP::Get.new(uri.request_uri))
+        return nil unless response.is_a?(Net::HTTPSuccess)
+
+        # Checked twice on purpose: Content-Length lets an oversized file be
+        # refused before it is read, and the body length catches a response
+        # that did not declare one.
+        declared = response["content-length"].to_i
+        return nil if declared.positive? && declared > limit
+
+        body = response.body
+        return nil if body.nil? || body.bytesize > limit
+
+        body
+      end
+
+      private
+
       # Kept per host: the storage is a different origin from the API, and its
       # read timeout is an upload's, not a JSON round trip's.
       def storage_http(url)

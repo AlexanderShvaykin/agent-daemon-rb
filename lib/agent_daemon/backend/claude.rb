@@ -7,7 +7,7 @@ module AgentDaemon
     class Claude < Base
       private
 
-      def build_command(prompt)
+      def build_command(prompt, images: [])
         flags = extra_flags
         # `agent: null` suppresses the flag entirely; the default from
         # RUNNER_DEFAULTS still applies when the operator writes nothing.
