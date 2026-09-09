@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.20.0] - 2026-09-08
+
+### Added
+- `github` trigger: a poller over the notification inbox that turns "@bot, take a look" on a pull request into an agent run. GitHub's notifications are already a queue — `GET /notifications?participating=true` plus `PATCH /notifications/threads/{id}` is read-plus-ack — so this needs no webhook and no public URL, the same shape as the `pachca` trigger. The agent posts the review itself with whatever CLI it has; the daemon decides when to wake it and who may ask.
+- Three gates, cheapest first: `reason` (default `mention`, `review_requested`), a `PullRequest` subject, and `trigger.repos`. Only then is the comment fetched — that costs a request — to check its author against `trigger.allowed_users`. A notification whose comment cannot be read is not acted on: without knowing who asked, the gate cannot be applied, and acting anyway would make the allowlist decorative.
+- The runner sets `expects_message_file?`, so the prompt asks the agent to write a one-line report after posting the review. Marking a notification read is a destructive ack, and a run that exits 0 having posted nothing would lose the request silently. The report doubles as a chat notification that a review landed.
+- A `mention` must arrive as a comment. A thread comes back unread on *any* activity — a merge, a push, a label, and the review the runner just posted — and GitHub then points `latest_comment_url` at the pull request itself rather than at a comment. Reading an author from that URL yields the PR's author, who is exactly the person likely to be on the allowlist, so the gate opened. Found in use: one pull request reviewed twice, and every merge re-arming the rest. `review_requested` still needs no comment, since nobody types anything to ask for one.
+- A comment by the agent itself never summons it, checked before the allowlist rather than through it. With no allowlist every author passes, and a review the agent posts brings the thread back unread — so the runner would have answered itself for as long as it ran. Costs one `GET /user`, asked once. Consequently a notification whose author cannot be read is refused even with no allowlist: acting without knowing who asked was the weaker half of the old rule.
+
 ## [0.19.0] - 2026-09-08
 
 ### Added

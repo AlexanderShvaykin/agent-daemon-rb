@@ -39,6 +39,9 @@ module AgentDaemon
     FILE_TRIGGER_DEFAULTS       = { "interval" => 10, "jitter" => 5 }.freeze
     MATTERMOST_TRIGGER_DEFAULTS = { "interval" => 2, "jitter" => 0 }.freeze
     PACHCA_TRIGGER_DEFAULTS     = { "interval" => 5, "jitter" => 1 }.freeze
+    # Far slower than a chat trigger on purpose: nobody waits seconds for a
+    # code review, and polling the notification inbox spends GitHub rate limit.
+    GITHUB_TRIGGER_DEFAULTS     = { "interval" => 60, "jitter" => 5 }.freeze
 
     # The whole `support:` vocabulary, at both the config and the runner level.
     # Closed on purpose: a typo'd key would otherwise vanish silently and the
@@ -49,7 +52,7 @@ module AgentDaemon
     # is rejected at load rather than turned into a javascript:/data: link.
     RUNBOOK_SCHEMES = %w[http https].freeze
 
-    VALID_TRIGGER_TYPES   = %w[tracker file mattermost pachca].freeze
+    VALID_TRIGGER_TYPES   = %w[tracker file mattermost pachca github].freeze
     VALID_BACKENDS        = %w[claude opencode codex].freeze
     VALID_MESSENGER_TYPES = %w[webhook mattermost pachca].freeze
     MATTERMOST_REQUIRED   = %w[base_url token team default_channel].freeze
@@ -184,6 +187,10 @@ module AgentDaemon
         # No work dirs: the poller acknowledges an event by deleting it from
         # Pachca's own history, so there is no inbox/done/failed to resolve.
         deep_merge(PACHCA_TRIGGER_DEFAULTS, raw_trigger)
+      when "github"
+        # Same as pachca: the ack is marking a notification read, so there are
+        # no work dirs to place.
+        deep_merge(GITHUB_TRIGGER_DEFAULTS, raw_trigger)
       else
         raw_trigger
       end
@@ -562,6 +569,27 @@ module AgentDaemon
             errors << "runner #{runner_label.inspect}: trigger.context_messages must be an Integer between 0 and #{max} " \
                       "(0 disables thread context; anything above #{Pachca::Client::MAX_PAGE} is paged, one request per #{Pachca::Client::MAX_PAGE})"
           end
+        end
+        unless trigger["interval"].is_a?(Integer) && trigger["interval"] > 0
+          errors << "runner #{runner_label.inspect}: trigger.interval must be a positive Integer"
+        end
+      when "github"
+        unless trigger["token"].is_a?(String) && !trigger["token"].empty?
+          errors << "runner #{runner_label.inspect}: trigger.token is required (String)"
+        end
+        # Both lists are optional and both narrow: without them the runner acts
+        # on every pull-request mention this account receives, from anyone who
+        # can comment. That is a wider boundary than a chat reply, because the
+        # agent answers publicly under this account — so the effective scope is
+        # logged at startup rather than left to be inferred here.
+        %w[repos allowed_users reasons].each do |key|
+          next unless trigger.key?(key)
+
+          value = trigger[key]
+          next if value.is_a?(Array) && !value.empty? &&
+                  value.all? { |item| item.is_a?(String) && !item.strip.empty? }
+
+          errors << "runner #{runner_label.inspect}: trigger.#{key} must be a non-empty Array of non-empty Strings when present"
         end
         unless trigger["interval"].is_a?(Integer) && trigger["interval"] > 0
           errors << "runner #{runner_label.inspect}: trigger.interval must be a positive Integer"
