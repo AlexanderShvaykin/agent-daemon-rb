@@ -70,6 +70,22 @@ module AgentDaemon
       message_data = YAML.safe_load_file(file)
       route_system_alert(message_data)
       task_key = message_data["task_key"]
+
+      # `skip: true` is how an agent says it deliberately has nothing to add.
+      # It needs a file at all because a trigger with expects_message_file? set
+      # reads a missing one as a run that failed, and would retry it — so
+      # silence and failure have to be told apart, and only the agent knows
+      # which one it is. The file is archived like any other, which acks the
+      # work item: the decision not to answer is final, not deferred.
+      #
+      # Logged at info with the agent's stated reason, because a wrong silence
+      # is otherwise indistinguishable from a lost message.
+      if message_data["skip"]
+        Log.info("[Messenger] Skipping #{task_key}: #{message_data["reason"] || "no reason given"}")
+        move_to_sent(file)
+        return
+      end
+
       Log.info("[Messenger] Sending message for #{task_key}")
 
       @transport.deliver(message_data)
