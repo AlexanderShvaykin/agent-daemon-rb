@@ -132,6 +132,27 @@ class TestMessenger < Minitest::Test
     assert_path_exists ignored_path
   end
 
+  # An agent that decides it has nothing to add still has to leave a file: a
+  # trigger with expects_message_file? set reads a missing one as a failed run
+  # and retries it. So silence is stated, not implied — and archiving the file
+  # acks the work item, because the decision is final rather than deferred.
+  def test_a_skipped_message_is_archived_without_being_sent
+    File.write(File.join(@message_dir, "quiet.yml"),
+               { "task_key" => "quiet", "skip" => true, "reason" => "not addressed to me" }.to_yaml)
+    File.write(File.join(@message_dir, "loud.yml"),
+               { "task_key" => "loud", "message" => "答" }.to_yaml)
+
+    config = ConfigStub.new(mattermost_config, @message_dir)
+    messenger = AgentDaemon::Messenger.new(config, ShutdownStub.new)
+    transport = TransportStub.new
+    messenger.instance_variable_set(:@transport, transport)
+
+    messenger.send(:iterate)
+
+    assert_equal %w[loud], transport.messages.map { |m| m["task_key"] }
+    assert_equal %w[loud.yml quiet.yml], Dir.children(File.join(@message_dir, "sent")).sort
+  end
+
   def test_routes_system_alert_to_configured_user_as_separate_post
     delivered = process(
       mattermost_config("user" => "alexander.shvaykin"),
