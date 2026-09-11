@@ -3,6 +3,7 @@
 $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 require "agent_daemon"
 require "minitest/autorun"
+require "stringio"
 require "net/http"
 
 # Minitest 6 dropped minitest/mock, so substitute Net::HTTP.new by hand for the
@@ -52,6 +53,22 @@ module LogStubbing
   def restore_logger!
     AgentDaemon::Log.instance_variable_set(:@logger, @__prior_logger)
     AgentDaemon::Log.clear_context
+  end
+
+  # Returns whatever the block logged. The logger is a process-wide singleton,
+  # so this swaps it and puts back what was there — including the null logger
+  # stub_null_logger! installed, which is why the two compose.
+  def capture_log
+    prior = AgentDaemon::Log.instance_variable_get(:@logger)
+    io = StringIO.new
+    logger = ::Logger.new(io)
+    logger.level = ::Logger::INFO
+    logger.formatter = proc { |_severity, _datetime, _progname, message| "#{message}\n" }
+    AgentDaemon::Log.use(logger)
+    yield
+    io.string
+  ensure
+    AgentDaemon::Log.instance_variable_set(:@logger, prior)
   end
 end
 

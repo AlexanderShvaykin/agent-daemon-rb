@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "stringio"
 require "tmpdir"
 require "yaml"
 
@@ -130,6 +131,42 @@ class TestMessenger < Minitest::Test
     assert_equal expected_order, Dir.children(File.join(@message_dir, "sent")).sort
     files.each_key { |filename| refute_path_exists File.join(@message_dir, filename) }
     assert_path_exists ignored_path
+  end
+
+  # An agent that decides it has nothing to add still has to leave a file: a
+  # trigger with expects_message_file? set reads a missing one as a failed run
+  # and retries it. So silence is stated, not implied — and archiving the file
+  # acks the work item, because the decision is final rather than deferred.
+  def test_a_skipped_message_is_archived_without_being_sent
+    File.write(File.join(@message_dir, "quiet.yml"),
+               { "task_key" => "quiet", "skip" => true, "reason" => "not addressed to me" }.to_yaml)
+    File.write(File.join(@message_dir, "loud.yml"),
+               { "task_key" => "loud", "message" => "答" }.to_yaml)
+
+    config = ConfigStub.new(mattermost_config, @message_dir)
+    messenger = AgentDaemon::Messenger.new(config, ShutdownStub.new)
+    transport = TransportStub.new
+    messenger.instance_variable_set(:@transport, transport)
+
+    messenger.send(:iterate)
+
+    assert_equal %w[loud], transport.messages.map { |m| m["task_key"] }
+    assert_equal %w[loud.yml quiet.yml], Dir.children(File.join(@message_dir, "sent")).sort
+  end
+
+  # The point of logging a silence is being able to check it later, and nothing
+  # obliges the agent to restate the work item in a file that carries no reply.
+  def test_a_skip_without_a_task_key_is_logged_by_filename
+    File.write(File.join(@message_dir, "01ABC.yml"),
+               { "skip" => true, "reason" => "nobody addressed me" }.to_yaml)
+
+    config = ConfigStub.new(mattermost_config, @message_dir)
+    messenger = AgentDaemon::Messenger.new(config, ShutdownStub.new)
+    messenger.instance_variable_set(:@transport, TransportStub.new)
+
+    log = capture_log { messenger.send(:iterate) }
+
+    assert_match(/Skipping 01ABC\.yml: nobody addressed me/, log)
   end
 
   def test_routes_system_alert_to_configured_user_as_separate_post

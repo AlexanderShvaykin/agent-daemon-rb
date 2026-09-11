@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.21.0] - 2026-09-11
+
+### Added
+- A message file may carry `skip: true` instead of a message, and the Messenger archives it without delivering. The line names the file when the agent left no `task_key` in it — nothing obliges it to restate the work item in a file that carries no reply, and the point of logging a silence is being able to check it later. This is how an agent says it deliberately has nothing to add — needed because a trigger with `expects_message_file?` set reads a missing file as a failed run and retries it, so silence and failure have to be told apart and only the agent knows which one it is. Archiving acks the work item: the decision not to answer is final, not deferred. The agent's `reason` is logged at info, because a wrong silence is otherwise indistinguishable from a lost message.
+
 ## [0.20.1] - 2026-09-11
 
 ### Fixed
