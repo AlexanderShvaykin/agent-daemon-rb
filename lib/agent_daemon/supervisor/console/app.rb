@@ -1380,7 +1380,7 @@ module AgentDaemon
             <div><dt>Liveness</dt><dd>#{liveness_cell(entry.liveness)}</dd></div>
             <div><dt>Note</dt><dd>#{esc(note)}</dd></div>
             </dl>
-            #{restart_card_placeholder}
+            #{restart_card_link(entry)}
             </article></li>
           HTML
         end
@@ -1417,13 +1417,14 @@ module AgentDaemon
         end
 
         # AC2/AD-13: every supervised entity gets a restart affordance on the
-        # fleet list, and on the list it stays disabled. The endpoint exists as
-        # of Story 4.3, but AC1 scopes the action to the detail page: a live
+        # fleet list. AC1 scopes the action itself to the detail page: a live
         # control per card would put N forms and N CSRF tokens on one page for
-        # an action that wants the diagnostics beside it. The working control
-        # is #detail_restart_control.
-        def restart_card_placeholder
-          '<button type="button" disabled>Restart</button>'
+        # an action that wants the diagnostics beside it. So the card links to
+        # the working control (#detail_restart_control) instead of carrying it
+        # — a plain GET, never a restart.
+        def restart_card_link(entry)
+          href = esc("/entity?id=#{Rack::Utils.escape(entry.id)}#restart-action")
+          %(<a class="restart-link" href="#{href}">Restart →</a>)
         end
 
         # Detail page contract (Story 2.4 Dev Notes). Conditional rows are

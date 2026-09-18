@@ -919,11 +919,11 @@ class TestConsoleApp < Minitest::Test
       <div><dt>Note</dt><dd>—</dd></div>
       </dl>
     HTML
-    assert_includes group, '<button type="button" disabled>Restart</button>'
+    assert_includes group, '<a class="restart-link" href="/entity?id=runner%3Awf%3Aalpha#restart-action">Restart →</a>'
   end
 
   # AC2: supervisor-owned entities are not just listed — each carries its own
-  # liveness indicator and its own restart placeholder.
+  # liveness indicator and its own restart link.
   def test_messenger_groups_under_its_workflow_and_the_reactor_is_fleet_wide
     roster = [
       Fleet::Rostered.new(kind: :messenger, workflow: "wf", name: "messenger", entity_id: "messenger:wf"),
@@ -945,7 +945,7 @@ class TestConsoleApp < Minitest::Test
 
     [wf_section, fleet_wide_section].each do |sect|
       assert_includes sect, %(<span class="liveness liveness-alive">alive</span>)
-      assert_includes sect, '<button type="button" disabled>Restart</button>'
+      assert_includes sect, 'Restart →</a>'
     end
   end
 
@@ -1033,21 +1033,21 @@ class TestConsoleApp < Minitest::Test
   end
 
   # AC2/AD-13: the restart affordance exists for every kind on the fleet list,
-  # and on the list it stays disabled. The endpoint exists as of Story 4.3;
-  # AC1 puts the working control on the detail page instead, so that one page
-  # does not carry N forms and N CSRF tokens for an action whose diagnostics
-  # live elsewhere.
-  def test_restart_placeholder_is_disabled_and_posts_nowhere
+  # as a link to the detail page. AC1 puts the working control there, so that
+  # one page does not carry N forms and N CSRF tokens for an action whose
+  # diagnostics live elsewhere.
+  def test_restart_card_links_to_the_detail_control_and_posts_nowhere
     id = RunnerIdentity.new(workflow: "wf", runner: "alpha")
     roster = [Fleet::Rostered.new(kind: :runner, workflow: "wf", name: "alpha", entity_id: id)]
     app = build_app(Fleet.new(roster: roster, state_registry: StateRegistry.new))
 
     body = get_on(app, "/").body
 
-    assert_includes body, '<button type="button" disabled>Restart</button>'
+    assert_includes body, '<a class="restart-link" href="/entity?id=runner%3Awf%3Aalpha#restart-action">Restart →</a>'
+    refute_includes body, "disabled>Restart<"
     # "Posts nowhere" is only proved by there being no form to post through:
     # matching /restart/ inside a <form> open tag would miss any action path
-    # spelled differently, and the button sits outside that tag anyway.
+    # spelled differently.
     assert_equal ['<form method="post" action="/auth/logout">'], body.scan(/<form[^>]*>/),
                  "AC1 scopes the restart action to the detail page: a fleet card must carry no form"
   end

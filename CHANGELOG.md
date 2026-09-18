@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.21.1] - 2026-09-19
+
+### Fixed
+- The fleet list no longer shows a permanently disabled Restart button on every card, which read as a broken control. Each card now carries a "Restart →" link to the entity's detail page, anchored at the working restart control. The action itself stays on the detail page (AC1), so the list still carries no forms and no per-card CSRF tokens.
+
 ## [0.21.0] - 2026-09-11
 
 ### Added
