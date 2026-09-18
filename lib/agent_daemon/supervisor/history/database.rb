@@ -97,14 +97,16 @@ module AgentDaemon
             end
           end
 
-          # lstat, not stat: a symlink is judged as itself and refused.
+          # lstat, not stat: a symlink is judged as itself and refused. Any mode
+          # other than exactly 0600 is reset: group/other bits are too broad, and
+          # a missing owner-write bit (0400) would open read-only yet look ready.
           def secure_existing(path)
             stat = File.lstat(path)
             raise UnsafeStorageError, "#{path} is not a regular file" unless stat.file?
             raise UnsafeStorageError, "#{path} is owned by another user" unless stat.uid == Process.euid
 
             mode = stat.mode & 0o777
-            return if (mode & 0o077).zero?
+            return if mode == FILE_MODE
 
             begin
               File.chmod(FILE_MODE, path)

@@ -100,6 +100,16 @@ class TestSupervisorHistory < Minitest::Test
     assert_match(/\[History\].*#{Regexp.escape(@path)}.*0644/, log)
   end
 
+  def test_a_read_only_store_is_made_writable_again
+    open_store.close
+    File.chmod(0o400, @path)
+
+    log = capture_log { open_store }
+
+    assert_equal 0o600, mode(@path)
+    assert_match(/\[History\].*#{Regexp.escape(@path)}.*0400/, log)
+  end
+
   def test_a_symlinked_store_is_refused
     target = File.join(@dir, "elsewhere.sqlite3")
     File.write(target, "")

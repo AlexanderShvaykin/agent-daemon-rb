@@ -58,7 +58,7 @@ class TestRequireIsolation < Minitest::Test
       require "agent_daemon/supervisor/master"
       # sqlite3 is required lazily inside History::Database.open, so loading
       # the whole supervisor tree must not pull it in either.
-      exit 1 unless $LOADED_FEATURES.grep(%r{/sqlite3(/|\.rb|\.so|\.bundle)}).empty?
+      exit 1 unless $LOADED_FEATURES.grep(%r{/sqlite3(/|\\.rb|\\.so|\\.bundle)}).empty?
       exit(defined?(AgentDaemon::Supervisor::Master) ? 0 : 1)
     RUBY
     out, status = run_core_probe(script)

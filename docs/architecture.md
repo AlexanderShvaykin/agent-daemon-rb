@@ -685,6 +685,7 @@ One file per concern under `lib/agent_daemon/supervisor/`:
 | `fleet.rb`               | Config roster left-joined with current registry state          |
 | `activity_log.rb`        | Per-entity recent events projected from the bounded bus         |
 | `console/`               | Rack/Puma UI, GitLab OAuth, authenticated SSE and restart controls |
+| `history/`               | Owner-only SQLite history store and its versioned schema (Epic 5) |
 
 ### Supervisor config
 
@@ -700,6 +701,11 @@ alone is not a collision). See `examples/supervisor.yml`.
 `restart_warning_margin_seconds` is a supervisor-level integer (default 5,
 range 1..300) added to the fixed restart delay only when the read model decides
 whether to display a delayed-restart warning; it does not change scheduling.
+`history:` is optional; absent or `null` applies every default, and only
+`enabled: false` turns history off. A relative `database_path` (default
+`history/history.sqlite3`) resolves against the supervisor config directory,
+integer keys are range-checked, and unknown keys are rejected; see
+`examples/supervisor.yml` for the keys and ranges.
 
 ### Master: one process, many workflows
 

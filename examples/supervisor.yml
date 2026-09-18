@@ -40,7 +40,7 @@ workflows:
 #
 # The supervisor creates the history directory 0700 and the database, -wal and
 # -shm files 0600, without touching the process umask. An existing file with
-# group/other bits is chmod-ed to 0600 with a warning; a symlink, a non-regular
+# any other mode is chmod-ed to 0600 with a warning; a symlink, a non-regular
 # file, or a file owned by another user is refused. Any failure to open history
 # (a refused file, an unwritable path, a schema newer than this version, the
 # sqlite3 gem missing) is logged once as a [History] error and history runs

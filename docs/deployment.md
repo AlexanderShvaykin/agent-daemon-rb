@@ -193,8 +193,9 @@ to the config directory (configs in a root-owned directory, for example), set
 
 - **Permissions.** The supervisor creates the directory `0700` and the database,
   `-wal` and `-shm` files `0600`, owned by the service user. An existing file
-  with group or other bits is tightened to `0600` and a warning is logged. A
-  symlink, a non-regular file, or a file owned by another user is refused.
+  with any other mode (group/other bits, or no owner write) is reset to `0600`
+  and a warning is logged. A symlink, a non-regular file, or a file owned by
+  another user is refused.
 - **Degraded, never down.** If history cannot be opened (a refused file, an
   unwritable directory, a schema newer than the installed version, the gem
   missing), the journal gets one `[History]` error line naming the path and the
