@@ -33,7 +33,7 @@ class TestSupervisorHistoryWriter < Minitest::Test
   ].freeze
 
   # Wraps the real connection and raises on the Nth #execute, to fail a batch
-  # part-way through.
+  # part-way through, or on every #execute whose SQL matches a Regexp.
   class FailingDb < SimpleDelegator
     attr_accessor :fail_on
 
@@ -45,7 +45,8 @@ class TestSupervisorHistoryWriter < Minitest::Test
 
     def execute(*args)
       @calls += 1
-      raise SQLite3::SQLException, "injected failure" if @calls == @fail_on
+      failing = @fail_on.is_a?(Regexp) ? @fail_on.match?(args.first) : @calls == @fail_on
+      raise SQLite3::SQLException, "injected failure" if failing
 
       __getobj__.execute(*args)
     end
@@ -82,11 +83,36 @@ class TestSupervisorHistoryWriter < Minitest::Test
     @source_cursor.read
   end
 
-  def lifecycle(key, generation: 1, reason: :ok, attempt: 1, entity: RUNNER)
-    publish(entity, generation, type: :picked_up, work_item: key, at: "2026-09-19T10:00:00Z")
-    publish(entity, generation, type: :started, work_item: key, attempt: attempt, at: "2026-09-19T10:00:01Z")
+  def lifecycle(key, generation: 1, reason: :ok, attempt: 1, entity: RUNNER, bus: @source)
+    publish(entity, generation, type: :picked_up, work_item: key, at: "2026-09-19T10:00:00Z", bus: bus)
+    publish(entity, generation, type: :started, work_item: key, attempt: attempt, at: "2026-09-19T10:00:01Z", bus: bus)
     publish(entity, generation, type: :finished, work_item: key, reason: reason, attempt: attempt,
-                                at: "2026-09-19T10:00:05Z")
+                                at: "2026-09-19T10:00:05Z", bus: bus)
+  end
+
+  # A sleeper that records the requested delays instead of sleeping.
+  def recording_sleeper
+    sleeps = []
+    [sleeps, ->(seconds) { sleeps << seconds }]
+  end
+
+  def wait_until(timeout = 5)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    until yield
+      flunk "condition not met within #{timeout}s" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      sleep 0.01
+    end
+  end
+
+  # Ends the current session and opens the same DB again, as a restarted
+  # master does: a fresh connection and a fresh bus whose seqs restart at 1.
+  def reopen_session
+    @writer&.stop(timeout: 5)
+    @writer = nil
+    @store.close
+    @store = Database.open(path: @path, busy_timeout_ms: 5000)
+    @source = EventBus.new
+    @source_cursor = @source.subscribe
   end
 
   def rows(sql)
@@ -133,7 +159,8 @@ class TestSupervisorHistoryWriter < Minitest::Test
 
     assert writer.write(records)
 
-    assert_equal [[1, nil, nil], [2, nil, nil]], rows("SELECT generation, finished_at, reason FROM run ORDER BY id")
+    assert_equal [[1, nil, nil, 1], [2, nil, nil, 0]],
+                 rows("SELECT generation, finished_at, reason, incomplete FROM run ORDER BY id")
     assert_equal 2, count("run_event")
   end
 
@@ -163,15 +190,15 @@ class TestSupervisorHistoryWriter < Minitest::Test
     assert_equal [[1, "ok"], [2, "killed"]], rows("SELECT generation, reason FROM run ORDER BY id")
   end
 
-  def test_a_finish_for_another_work_item_leaves_the_open_run_open
+  def test_a_start_for_another_work_item_abandons_the_open_run_as_incomplete
     publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z")
     publish(RUNNER, 1, type: :started, work_item: "L", attempt: 1, at: "2026-09-19T10:00:01Z")
     publish(RUNNER, 1, type: :finished, work_item: "L", reason: :ok, attempt: 1, at: "2026-09-19T10:00:02Z")
 
     assert writer.write(records)
 
-    assert_equal [["K", nil, nil], ["L", "2026-09-19T10:00:02.000Z", "ok"]],
-                 rows("SELECT work_item, finished_at, reason FROM run ORDER BY id")
+    assert_equal [["K", nil, nil, 1], ["L", "2026-09-19T10:00:02.000Z", "ok", 0]],
+                 rows("SELECT work_item, finished_at, reason, incomplete FROM run ORDER BY id")
   end
 
   def test_an_unknown_reason_is_null_in_both_run_and_run_event
@@ -386,5 +413,224 @@ class TestSupervisorHistoryWriter < Minitest::Test
     publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z", bus: bus)
     assert w.stop(timeout: 5)
     assert_equal 1, count("run")
+  end
+
+  # --- Story 5.3: gaps --------------------------------------------------------
+
+  def test_evicted_records_are_one_gap_line_and_only_the_retained_ones_persist
+    bus = EventBus.new(capacity: 3)
+    w = writer(bus: bus, poll_interval: 0.05)
+    lifecycle("K", bus: bus)
+    lifecycle("L", bus: bus)
+
+    log = capture_log do
+      w.start
+      assert w.stop(timeout: 5)
+    end
+
+    gaps = log.lines.grep(/\[History\] gap:/)
+    assert_equal 1, gaps.size, log
+    assert_includes gaps.first, "3 bus record(s)"
+    assert_equal ["L"], rows("SELECT work_item FROM run").flatten
+    assert_equal 3, count("run_event")
+    refute w.degraded?, "an eviction is logged but does not degrade the writer"
+  end
+
+  # --- Story 5.3: retry -------------------------------------------------------
+
+  def test_a_transient_failure_is_retried_once_and_the_batch_commits_once
+    bus = EventBus.new
+    sleeps, sleeper = recording_sleeper
+    failing = FailingDb.new(@store.db, fail_on: /\AINSERT/)
+    w = writer(FakeStore.new(failing), bus: bus, poll_interval: 0.05,
+                                       sleeper: lambda { |seconds|
+                                         sleeper.call(seconds)
+                                         failing.fail_on = nil # the retry succeeds
+                                       })
+    lifecycle("K", bus: bus)
+
+    log = capture_log do
+      w.start
+      assert w.stop(timeout: 5)
+    end
+
+    assert_equal [0.1], sleeps
+    assert_equal 1, count("run")
+    assert_equal 3, count("run_event")
+    assert_equal 1, log.lines.grep(/\[History\].*failed to write/).size, log
+    assert_empty log.lines.grep(/gap:/)
+    refute w.degraded?
+  end
+
+  def test_exhausted_retries_log_a_gap_degrade_and_later_batches_still_commit
+    bus = EventBus.new
+    sleeps, sleeper = recording_sleeper
+    failing = FailingDb.new(@store.db, fail_on: /\AINSERT/)
+    w = writer(FakeStore.new(failing), bus: bus, poll_interval: 0.05, retry_count: 3, backoff_ceiling_ms: 2000,
+                                       sleeper: sleeper)
+    lifecycle("K", bus: bus)
+
+    log = capture_log do
+      w.start
+      wait_until { w.degraded? }
+      failing.fail_on = nil
+      lifecycle("L", bus: bus)
+      assert w.stop(timeout: 5)
+    end
+
+    assert_equal [0.1, 0.2, 0.4], sleeps
+    history_errors = log.lines.grep(/\[History\]/)
+    assert_equal 4, history_errors.grep(/failed to write a batch of 3 record\(s\)/).size, log
+    gaps = history_errors.grep(/gap:/)
+    assert_equal 1, gaps.size, log
+    assert_includes gaps.first, "3 record(s)"
+    assert_includes gaps.first, "seq 1..3"
+    assert_includes gaps.first, "3 retries"
+    assert w.degraded?, "degraded is sticky"
+    assert_equal ["L"], rows("SELECT work_item FROM run").flatten
+  end
+
+  def test_the_backoff_is_capped_by_the_ceiling
+    bus = EventBus.new
+    sleeps, sleeper = recording_sleeper
+    w = writer(FakeStore.new(FailingDb.new(@store.db, fail_on: /\AINSERT/)), bus: bus, poll_interval: 0.05,
+                                                                               retry_count: 5, backoff_ceiling_ms: 300,
+                                                                               sleeper: sleeper)
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z", bus: bus)
+
+    w.start
+    assert w.stop(timeout: 5)
+
+    assert_equal [0.1, 0.2, 0.3, 0.3, 0.3], sleeps
+    assert w.degraded?
+  end
+
+  def test_no_retries_is_one_attempt_then_a_gap
+    bus = EventBus.new
+    sleeps, sleeper = recording_sleeper
+    w = writer(FakeStore.new(FailingDb.new(@store.db, fail_on: /\AINSERT/)), bus: bus, poll_interval: 0.05,
+                                                                               retry_count: 0, sleeper: sleeper)
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z", bus: bus)
+
+    log = capture_log do
+      w.start
+      assert w.stop(timeout: 5)
+    end
+
+    assert_empty sleeps
+    assert_equal 1, log.lines.grep(/failed to write/).size, log
+    assert_equal 1, log.lines.grep(/gap:/).size, log
+    assert w.degraded?
+  end
+
+  def test_a_failing_batch_never_logs_field_values
+    sentinel = "SENTINEL-7f3a9c"
+    @store.db.execute("CREATE TRIGGER boom BEFORE INSERT ON run BEGIN SELECT RAISE(ABORT, 'boom'); END")
+    bus = EventBus.new
+    _sleeps, sleeper = recording_sleeper
+    w = writer(bus: bus, poll_interval: 0.05, sleeper: sleeper)
+    publish(RUNNER, 1, type: :picked_up, work_item: sentinel, at: "2026-09-19T10:00:00Z", bus: bus)
+    publish(RUNNER, 2, type: :restart, actor: [sentinel], requested_at: "2026-09-19T10:00:00.000Z",
+                       at: "2026-09-19T10:01:00Z", bus: bus)
+
+    log = capture_log do
+      w.start
+      assert w.stop(timeout: 5)
+    end
+
+    assert_includes log, "boom"
+    assert_equal 1, log.lines.grep(/gap:/).size, log
+    refute_includes log, sentinel
+    assert w.degraded?
+  end
+
+  # --- Story 5.3: recovery across master restarts ---------------------------
+
+  def test_a_recovery_that_exhausts_retries_logs_a_gap_degrades_and_later_batches_still_commit
+    bus = EventBus.new
+    sleeps, sleeper = recording_sleeper
+    failing = FailingDb.new(@store.db, fail_on: /\AUPDATE run SET incomplete = 1 WHERE finished_at/)
+    w = writer(FakeStore.new(failing), bus: bus, poll_interval: 0.05, sleeper: sleeper)
+    lifecycle("K", bus: bus)
+
+    log = capture_log do
+      w.start
+      assert w.stop(timeout: 5)
+    end
+
+    assert_equal [0.1, 0.2, 0.4], sleeps
+    gaps = log.lines.grep(/\[History\] gap:/)
+    assert_equal 1, gaps.size, log
+    assert_includes gaps.first, "unmarked"
+    assert w.degraded?
+    assert_equal ["K"], rows("SELECT work_item FROM run").flatten
+  end
+
+  def test_a_run_left_open_by_a_crashed_master_is_marked_incomplete_and_never_finished_later
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z")
+    publish(RUNNER, 1, type: :started, work_item: "K", attempt: 1, at: "2026-09-19T10:00:01Z")
+    assert writer.write(records)
+    assert_equal [[nil, 0]], rows("SELECT finished_at, incomplete FROM run")
+
+    reopen_session
+    bus = EventBus.new
+    w = writer(bus: bus, poll_interval: 0.05)
+    log = capture_log do
+      w.start
+      wait_until { rows("SELECT incomplete FROM run WHERE id = 1").flatten == [1] }
+      publish(RUNNER, 1, type: :finished, work_item: "K", reason: :ok, attempt: 1, at: "2026-09-19T11:00:00Z",
+                         bus: bus)
+      assert w.stop(timeout: 5)
+    end
+
+    assert_equal [[1, "K", nil, nil, 1], [2, "K", "2026-09-19T11:00:00.000Z", "ok", 0]],
+                 rows("SELECT id, work_item, finished_at, reason, incomplete FROM run ORDER BY id")
+    assert_equal 1, log.lines.grep(/\[History\] marked 1 run\(s\)/).size, log
+  end
+
+  def test_two_sessions_on_the_same_db_coexist
+    lifecycle("K")
+    assert writer.write(records)
+
+    reopen_session
+    lifecycle("K")
+    assert writer.write(records)
+
+    assert_equal [[1, "ok", 0], [1, "ok", 0]], rows("SELECT generation, reason, incomplete FROM run ORDER BY id")
+    assert_equal 1, count("supervised_entity")
+    assert_equal 6, count("run_event")
+    assert_equal [1, 2, 3, 1, 2, 3], rows("SELECT seq FROM run_event ORDER BY id").flatten
+  end
+
+  # --- Story 5.3: bounded shutdown and death --------------------------------
+
+  def test_a_missed_deadline_reports_the_unflushed_count
+    bus = EventBus.new
+    w = writer(bus: bus, poll_interval: 0.05)
+    w.start
+    sleep 0.01 until w.thread.status == "sleep" # recovery and the first (empty) drain are done
+    other = SQLite3::Database.new(@path)
+    other.execute("BEGIN IMMEDIATE")
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z", bus: bus)
+    wait_until { w.instance_variable_get(:@inflight) } # the writer is now waiting on the lock mid-batch
+    publish(RUNNER, 1, type: :started, work_item: "K", attempt: 1, at: "2026-09-19T10:00:01Z", bus: bus)
+
+    refute w.stop(timeout: 0.1)
+    assert_equal 2, w.unflushed_count, "1 in flight + 1 on the bus past it"
+
+    other.execute("ROLLBACK")
+    assert w.stop(timeout: 5)
+    assert_equal 0, w.unflushed_count
+  ensure
+    other&.close
+  end
+
+  def test_a_writer_thread_that_dies_unasked_is_degraded
+    w = writer(poll_interval: 0.05).start
+    refute w.degraded?
+
+    w.thread.kill.join
+
+    assert w.degraded?
   end
 end

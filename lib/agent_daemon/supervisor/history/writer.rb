@@ -20,9 +20,29 @@ module AgentDaemon
       # never synthesized.
       #
       # Each drained batch commits in one transaction. On failure the
-      # transaction rolls back, the in-memory maps are restored, and the batch
-      # is dropped (retry and gap logging are Story 5.3). The watermark is the
-      # highest bus seq committed, so re-applying a batch writes nothing twice.
+      # transaction rolls back and the in-memory maps are restored, so the
+      # watermark (the highest bus seq committed) makes re-applying a batch
+      # write nothing twice.
+      #
+      # Story 5.3 hardening:
+      # - Gaps: records the bus evicted before this cursor read them are
+      #   logged as one `[History] gap:` warn with the count. Nothing is
+      #   synthesized for them.
+      # - Retry: a rejected batch is re-applied (the same batch) up to
+      #   retry_count times with capped exponential backoff. Exhaustion logs a
+      #   `[History] gap:` error, makes the writer degraded for good, and moves
+      #   on, so a later batch is still served.
+      # - Recovery: before its first drain the thread marks every run a
+      #   previous master left open as incomplete. A run displaced in memory
+      #   by a newer one is marked the same way, so while a master is live
+      #   `finished_at IS NULL AND incomplete = 0` means its writer still holds
+      #   the run open. Runs still open at a graceful shutdown keep
+      #   incomplete = 0 until the next master's writer marks them at start.
+      # - Bounded shutdown: #unflushed_count tells the master what a missed
+      #   flush deadline leaves behind.
+      #
+      # Log lines carry counts, seqs, attempts and delays, never field values;
+      # every value reaches SQLite through bind parameters.
       #
       # Never references SQLite3:: constants, so loading this file never needs
       # the gem.
@@ -36,10 +56,18 @@ module AgentDaemon
 
         attr_reader :thread
 
-        def initialize(database:, event_bus:, roster:, poll_interval: 0.5)
+        def initialize(database:, event_bus:, roster:, poll_interval: 0.5, retry_count: 3,
+                       backoff_ceiling_ms: 2_000, sleeper: ->(seconds) { sleep(seconds) })
           @db = database.db
           @event_bus = event_bus
           @poll_interval = poll_interval
+          @retry_count = retry_count
+          @backoff_ceiling_ms = backoff_ceiling_ms
+          @sleeper = sleeper
+          @degraded = false
+          @dropped_seen = 0
+          @inflight = nil
+          @settled = 0
           @roster = roster.to_h { |rostered| [RunnerIdentity.key_for(rostered.entity_id), rostered] }
           @open_runs = {}
           @entity_ids = {}
@@ -66,8 +94,28 @@ module AgentDaemon
           finished
         end
 
+        # Sticky: once a batch is lost the session's history has a hole that
+        # no later batch fills. A thread that died without a stop request
+        # counts too.
+        def degraded?
+          return true if @degraded
+
+          thread = @thread
+          !thread.nil? && !thread.alive? && !@stopping
+        end
+
+        # The in-flight batch plus every bus record past it (or past the last
+        # settled seq when nothing is in flight).
+        def unflushed_count
+          inflight = @inflight
+          settled = @settled
+          past = inflight ? inflight.last[:seq] : settled
+          (inflight ? inflight.size : 0) + @event_bus.records.count { |record| record[:seq] > past }
+        end
+
         # Applies records in one transaction. Returns true when the batch
-        # committed (or had nothing new), false when it was dropped.
+        # committed (or had nothing new), false when it was rolled back. One
+        # attempt only: the thread's retry wrapper re-applies it.
         def write(records)
           fresh = records.select { |record| record[:seq] > @watermark }
           return true if fresh.empty?
@@ -82,7 +130,7 @@ module AgentDaemon
           rescue StandardError => e
             @open_runs, @entity_ids, @watermark = saved
             rollback_quietly
-            Log.error("[History] dropped a batch of #{fresh.size} record(s): #{e.class}: #{e.message}")
+            Log.error("[History] failed to write a batch of #{fresh.size} record(s): #{e.class}: #{e.message}")
             false
           end
         end
@@ -92,10 +140,11 @@ module AgentDaemon
         # stopping is read before the drain, so the drain that follows a stop
         # request is always the last one.
         def run_loop
+          recover
           loop do
             stopping = @stopping
             begin
-              write(@cursor.read)
+              drain
             rescue StandardError => e
               Log.error("[History] writer iteration failed: #{e.class}: #{e.message}")
             end
@@ -103,6 +152,63 @@ module AgentDaemon
 
             sleep(@poll_interval)
           end
+        end
+
+        def drain
+          batch = @cursor.read
+          note_evictions
+          return if batch.empty?
+
+          @inflight = batch
+          unless with_retries { write(batch) }
+            @degraded = true
+            Log.error("[History] gap: lost #{batch.size} record(s), seq #{batch.first[:seq]}..#{batch.last[:seq]}, " \
+                      "after #{@retry_count} retries")
+          end
+          @settled = batch.last[:seq]
+          @inflight = nil
+        end
+
+        # dropped is cumulative per cursor; only the delta is new.
+        def note_evictions
+          dropped = @event_bus.dropped(@cursor)
+          return unless dropped > @dropped_seen
+
+          Log.warn("[History] gap: #{dropped - @dropped_seen} bus record(s) evicted before the writer read them")
+          @dropped_seen = dropped
+        end
+
+        # Runs a previous master left open can never be finished by this one.
+        def recover
+          marked = 0
+          recovered = with_retries do
+            @db.execute("UPDATE run SET incomplete = 1 WHERE finished_at IS NULL AND incomplete = 0")
+            marked = @db.changes
+            true
+          rescue StandardError => e
+            Log.error("[History] failed to mark runs left open as incomplete: #{e.class}: #{e.message}")
+            false
+          end
+          if recovered
+            Log.info("[History] marked #{marked} run(s) left open by a previous master as incomplete") if marked.positive?
+          else
+            @degraded = true
+            Log.error("[History] gap: runs left open by a previous master stay unmarked after #{@retry_count} retries")
+          end
+        end
+
+        # At most 1 + retry_count attempts; before retry n (1-based) sleeps
+        # min(100 ms * 2^(n-1), ceiling).
+        def with_retries
+          (0..@retry_count).each do |n|
+            @sleeper.call(backoff(n)) if n.positive?
+            return true if yield
+          end
+          false
+        end
+
+        def backoff(retry_number)
+          [100 * (2**(retry_number - 1)), @backoff_ceiling_ms].min / 1000.0
         end
 
         # A failed COMMIT leaves the transaction open, and the next BEGIN would
@@ -143,9 +249,10 @@ module AgentDaemon
           REASONS.include?(record[:reason].to_s) ? record[:reason].to_s : nil
         end
 
-        # picked_up always opens a new run, abandoning any earlier open one
-        # as-is. started/finished attach to the open run when generation and
-        # work item match, otherwise they open a new run from what was seen.
+        # picked_up always opens a new run, abandoning any earlier open one:
+        # it is marked incomplete, never given an invented end. started/finished
+        # attach to the open run when generation and work item match,
+        # otherwise they open a new run from what was seen.
         def run_for(entity_key, entity_id, generation, record, at)
           open = @open_runs[entity_key]
           if record[:type] != :picked_up && open &&
@@ -162,8 +269,10 @@ module AgentDaemon
           # A run opened by finished is already closed, so it never becomes the
           # open run. Replaced, never mutated: the rollback snapshot is a
           # shallow dup.
-          @open_runs[entity_key] = run unless record[:type] == :finished
-          run
+          return run if record[:type] == :finished
+
+          @db.execute("UPDATE run SET incomplete = 1 WHERE id = ?", [open[:id]]) if open
+          @open_runs[entity_key] = run
         end
 
         def apply_restart(record)

@@ -50,11 +50,16 @@ workflows:
 # sidecars from backups.
 #
 # Runs, lifecycle events and restart actions are written by one background
-# thread that never blocks runners; a batch that fails to commit is logged and
-# dropped for now. Only enabled, database_path, busy_timeout_ms and
-# shutdown_flush_seconds (how long shutdown waits for the writer's final
-# drain) are used so far; the other keys are validated now so a typo fails at
-# load.
+# thread that never blocks runners. A batch that fails to commit is retried
+# write_retry_count times with exponential backoff (100 ms, 200 ms, ...) capped
+# at write_retry_backoff_ceiling_ms; when retries run out the loss is logged as
+# a "[History] gap:" line and history reports degraded. Events the in-memory
+# bus evicted before the writer read them are logged as a gap too. Runs a
+# crashed master left open are marked incomplete (never given an invented
+# result) by the next master. shutdown_flush_seconds is how long shutdown
+# waits for the writer's final drain; past it, the count of unflushed records
+# is logged. page_size and the retention keys are validated now so a typo
+# fails at load; later releases read them.
 #
 # history:
 #   enabled: true                          # default true

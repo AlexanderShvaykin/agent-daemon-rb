@@ -66,13 +66,14 @@ module AgentDaemon
 
       # Builds the single history writer (Story 5.2). Injectable so a test can
       # make it fail on purpose and watch history degrade without the fleet.
-      HISTORY_WRITER_FACTORY = lambda do |database, event_bus, roster|
-        History::Writer.new(database: database, event_bus: event_bus, roster: roster)
+      HISTORY_WRITER_FACTORY = lambda do |database, event_bus, roster, history_config|
+        History::Writer.new(database: database, event_bus: event_bus, roster: roster,
+                            retry_count: history_config["write_retry_count"],
+                            backoff_ceiling_ms: history_config["write_retry_backoff_ceiling_ms"])
       end
 
       attr_reader :state_registry, :event_bus, :output_pipeline, :output_buffers
-      # history_state is nil until #start, then :ready, :disabled or :degraded.
-      attr_reader :history, :history_state, :history_writer
+      attr_reader :history, :history_writer
 
       def initialize(supervisor_config, join_timeout: JOIN_TIMEOUT, console_factory: CONSOLE_FACTORY,
                      history_opener: HISTORY_OPENER, history_writer_factory: HISTORY_WRITER_FACTORY)
@@ -103,6 +104,14 @@ module AgentDaemon
         @output_buffers = OutputBuffers.new(capacity_bytes: supervisor_config.output_buffer_bytes)
         @output_pipeline.subscribe(@output_buffers)
         warn_if_secret_exceeds_forced_cut_hold_back(redactor, supervisor_config)
+      end
+
+      # nil until #start, then :ready, :disabled or :degraded. A ready store
+      # whose writer lost a batch or died reads as :degraded (Story 5.3).
+      def history_state
+        return :degraded if @history_state == :ready && @history_writer&.degraded?
+
+        @history_state
       end
 
       def start
@@ -277,7 +286,7 @@ module AgentDaemon
       # publishes is in its backlog. A writer that cannot be built or started
       # degrades history like an open failure does.
       def start_history_writer
-        writer = @history_writer_factory.call(@history, @event_bus, @roster)
+        writer = @history_writer_factory.call(@history, @event_bus, @roster, @config.history)
         writer.start
         @history_writer = writer
       rescue StandardError, ScriptError => e
@@ -293,13 +302,15 @@ module AgentDaemon
 
       # The writer stops first: its final drain commits what it has already
       # read. A writer still running after the flush deadline may be inside a
-      # transaction, so the store is then left for process exit to close.
+      # transaction, so the store is then left for process exit to close, and
+      # what it had not flushed is counted in the log (Story 5.3).
       def close_history
         return unless @history
 
         flush_seconds = @config.history["shutdown_flush_seconds"]
         if @history_writer && !@history_writer.stop(timeout: flush_seconds)
-          Log.warn("[History] writer did not finish within #{flush_seconds}s; leaving the store open")
+          Log.warn("[History] writer did not finish within #{flush_seconds}s; #{@history_writer.unflushed_count} " \
+                   "accepted record(s) unflushed; leaving the store open")
           return
         end
 

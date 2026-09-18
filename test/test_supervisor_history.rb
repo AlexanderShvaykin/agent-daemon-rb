@@ -191,6 +191,21 @@ class TestSupervisorHistory < Minitest::Test
     end
   end
 
+  # Story 5.3: v2 adds run.incomplete; a v1 store's rows default to 0.
+  def test_a_v1_store_migrates_to_v2_with_existing_runs_not_incomplete
+    open_store(migrations: Schema::MIGRATIONS.first(1)).tap do |store|
+      store.db.execute("INSERT INTO supervised_entity (entity_key, kind, first_seen_at) " \
+                       "VALUES ('messenger:wf', 'messenger', '2026-09-19T00:00:00Z')")
+      store.db.execute("INSERT INTO run (entity_id, generation) VALUES (1, 1)")
+    end.close
+
+    store = open_store
+
+    assert_equal 2, store.schema_version
+    assert_equal [0], store.db.execute("SELECT incomplete FROM run").flatten
+    assert_raises(SQLite3::ConstraintException) { store.db.execute("UPDATE run SET incomplete = 2") }
+  end
+
   def test_pending_migrations_apply_on_top_of_an_older_version
     open_store(migrations: [[1, ["CREATE TABLE first_one (id INTEGER PRIMARY KEY)"]]]).close
 

@@ -10,6 +10,8 @@ require "fileutils"
 require "agent_daemon/supervisor/master"
 
 class TestSupervisorMaster < Minitest::Test
+  include LogStubbing
+
   def setup
     @prior_logger = AgentDaemon::Log.instance_variable_get(:@logger)
     null_logger = ::Logger.new(File::NULL)
@@ -1394,9 +1396,9 @@ class TestSupervisorMaster < Minitest::Test
     with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
       seen = nil
       master = nil
-      factory = lambda do |database, event_bus, roster|
+      factory = lambda do |database, event_bus, roster, history_config|
         seen = { supervisors: master.instance_variable_get(:@supervisors).size, roster: roster.size }
-        AgentDaemon::Supervisor::Master::HISTORY_WRITER_FACTORY.call(database, event_bus, roster)
+        AgentDaemon::Supervisor::Master::HISTORY_WRITER_FACTORY.call(database, event_bus, roster, history_config)
       end
       master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, history_writer_factory: factory)
       boot_and_shut_down(master)
@@ -1449,17 +1451,76 @@ class TestSupervisorMaster < Minitest::Test
       self.stopped_with = timeout
       false
     end
+
+    def unflushed_count = 7
+
+    def degraded? = false
   end
 
   def test_a_writer_that_misses_the_flush_deadline_leaves_the_store_open
     with_config([{ name: "wf", runners: [tracker_runner("a")] }], history: { "shutdown_flush_seconds" => 3 }) do |_d, config|
       writer = StuckWriter.new
       master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, history_writer_factory: ->(*) { writer })
-      boot_and_shut_down(master)
+      log = capture_log { boot_and_shut_down(master) }
 
       assert_equal 3, writer.stopped_with
       refute master.history.db.closed?
+      deadline_lines = log.lines.grep(/\[History\].*did not finish/)
+      assert_equal 1, deadline_lines.size, log
+      assert_includes deadline_lines.first, "3s"
+      assert_includes deadline_lines.first, "7 accepted record(s) unflushed"
       master.history.close
+    end
+  end
+
+  # --- Story 5.3: degraded state, retry wiring, restart recovery -------------
+
+  DegradedWriter = Struct.new(:degraded) do
+    def start = self
+    def stop(timeout:) = true
+    def degraded? = degraded
+  end
+
+  def test_history_state_is_degraded_while_the_writer_reports_degraded
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
+      writer = DegradedWriter.new(false)
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, history_writer_factory: ->(*) { writer })
+      boot_and_shut_down(master)
+
+      assert_equal :ready, master.history_state
+      writer.degraded = true
+      assert_equal :degraded, master.history_state
+    end
+  end
+
+  def test_the_default_factory_hands_the_configured_retry_policy_to_the_writer
+    history = { "write_retry_count" => 7, "write_retry_backoff_ceiling_ms" => 900 }
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], history: history) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      boot_and_shut_down(master)
+
+      writer = master.history_writer
+      assert_equal [7, 900], [writer.instance_variable_get(:@retry_count),
+                              writer.instance_variable_get(:@backoff_ceiling_ms)]
+    end
+  end
+
+  def test_a_second_boot_marks_the_first_boots_open_run_incomplete
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |dir, config|
+      identity = AgentDaemon::Supervisor::RunnerIdentity.new(workflow: "wf", runner: "a")
+      first = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      stamp = AgentDaemon::Supervisor::GenerationStamp.new(1, first.event_bus)
+      stamp.publish(identity, type: :picked_up, work_item: "TI-1", at: "2026-09-19T10:00:00Z")
+      stamp.publish(identity, type: :started, work_item: "TI-1", attempt: 1, at: "2026-09-19T10:00:01Z")
+      boot_and_shut_down(first)
+
+      second = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      boot_and_shut_down(second)
+
+      assert_equal :ready, second.history_state
+      db = SQLite3::Database.new(File.join(dir, "history", "history.sqlite3"))
+      assert_equal [["TI-1", nil, nil, 1]], db.execute("SELECT work_item, finished_at, reason, incomplete FROM run")
+      db.close
     end
   end
 

@@ -675,13 +675,32 @@ the bus and never wait on SQLite. It correlates `picked_up`/`started`/`finished`
 per entity into one `run` row (only observed events are stored, nothing is
 synthesized) and turns each coalesced `restart` event into one
 `restart_action`. Each drained batch commits in one transaction guarded by a
-committed-seq watermark, so a repeated batch writes nothing twice; a failed
-batch is rolled back, logged once, and dropped (retry and gap logging arrive
-in Story 5.3). The connection waits on locks with sqlite3's
-`busy_handler_timeout`, which releases the GVL, rather than `busy_timeout`,
-which would freeze every runner thread for the wait. On shutdown the writer
-drains once more and is given `shutdown_flush_seconds` before the store is
-closed. The metrics exporter remains assigned to Epic 6.
+committed-seq watermark, so a repeated batch writes nothing twice. A failed
+batch is rolled back, logged once per attempt, and re-applied (the same batch)
+up to `write_retry_count` times, sleeping `min(100 ms × 2^(n-1),
+write_retry_backoff_ceiling_ms)` before retry `n`. Exhaustion logs one
+`[History] gap:` error (record count, seq range, retry count), makes the
+writer degraded for the rest of its life (`Master#history_state` then reads
+`:degraded`, as it does when the writer thread dies unasked), and moves on to
+the next batch. Records the bus evicted before the writer's cursor read them
+are one `[History] gap:` warn with the count; nothing is synthesized for them
+and they do not degrade the writer. Log lines carry counts, seqs, attempts and
+delays, never field values. Schema v2 adds `run.incomplete`: before its first
+drain the writer marks every run a previous master left open
+(`finished_at IS NULL`) as `incomplete = 1`, and a run displaced in memory by
+a newer run of its entity is marked the same way, so while a master is live
+`finished_at IS NULL AND incomplete = 0` means its writer still holds the run
+open. Runs still open at a graceful shutdown keep `incomplete = 0` until the
+next master's writer marks them at start. No
+`reason` or `finished_at` is ever invented. Rows key on autoincrement ids and
+entities are reused by `entity_key`, so a restarted master whose generations
+and bus seqs start again at 1 coexists with the old history. The connection
+waits on locks with sqlite3's `busy_handler_timeout`, which releases the GVL,
+rather than `busy_timeout`, which would freeze every runner thread for the
+wait. On shutdown the writer drains once more and is given
+`shutdown_flush_seconds`; if it finishes the store is closed, otherwise the
+master logs the number of accepted records still unflushed and leaves the
+store open for process exit. The metrics exporter remains assigned to Epic 6.
 
 ### Layout
 

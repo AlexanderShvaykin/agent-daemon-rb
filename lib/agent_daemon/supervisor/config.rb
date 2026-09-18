@@ -70,7 +70,8 @@ module AgentDaemon
       }.freeze
 
       # History defaults (Story 5.1). Only enabled, database_path,
-      # busy_timeout_ms and shutdown_flush_seconds are consumed so far; the rest
+      # busy_timeout_ms, write_retry_count, write_retry_backoff_ceiling_ms
+      # (Story 5.3) and shutdown_flush_seconds are consumed so far; the rest
       # are validated now so a typo fails at load rather than on the day the
       # story that reads it lands.
       HISTORY_DEFAULTS = {

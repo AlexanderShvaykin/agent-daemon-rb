@@ -31,6 +31,11 @@ module AgentDaemon
                 source_generation INTEGER, target_generation INTEGER, actors TEXT NOT NULL,
                 requested_at TEXT NOT NULL, completed_at TEXT)
             SQL
+          ].freeze],
+          # Story 5.3: a run no live writer will ever finish (left open by a
+          # crashed master, or displaced by a newer run of its entity).
+          [2, [
+            "ALTER TABLE run ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0 CHECK (incomplete IN (0,1))"
           ].freeze]
         ].freeze
 
