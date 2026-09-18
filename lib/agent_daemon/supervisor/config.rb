@@ -69,9 +69,10 @@ module AgentDaemon
         "secure_cookies" => true
       }.freeze
 
-      # History defaults (Story 5.1). Only enabled, database_path and
-      # busy_timeout_ms are consumed so far; the rest are validated now so a typo
-      # fails at load rather than on the day the story that reads it lands.
+      # History defaults (Story 5.1). Only enabled, database_path,
+      # busy_timeout_ms and shutdown_flush_seconds are consumed so far; the rest
+      # are validated now so a typo fails at load rather than on the day the
+      # story that reads it lands.
       HISTORY_DEFAULTS = {
         "enabled" => true,
         # Relative paths resolve against the supervisor config's directory.

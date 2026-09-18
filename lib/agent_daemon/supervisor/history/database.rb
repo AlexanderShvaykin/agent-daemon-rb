@@ -9,7 +9,13 @@ module AgentDaemon
   module Supervisor
     module History
       # The history store's SQLite connection (Story 5.1): owner-only storage,
-      # WAL mode, busy_timeout, and transactional versioned migrations.
+      # WAL mode, a busy handler, and transactional versioned migrations.
+      #
+      # The busy wait is sqlite3's busy_handler_timeout, never busy_timeout=:
+      # the latter sleeps inside SQLite while holding the GVL, so a writer
+      # waiting on a lock would freeze every runner thread (Story 5.2). Once a
+      # handler is set PRAGMA busy_timeout reads 0, so the configured value is
+      # exposed as #busy_timeout_ms instead.
       #
       # AD-5: `sqlite3` is required lazily inside .open, so loading this file
       # never pulls the gem in, and the core `require "agent_daemon"` graph
@@ -33,7 +39,7 @@ module AgentDaemon
         FILE_MODE = 0o600
         SIDECAR_SUFFIXES = %w[-wal -shm].freeze
 
-        attr_reader :db, :path, :schema_version
+        attr_reader :db, :path, :schema_version, :busy_timeout_ms
 
         def self.open(path:, busy_timeout_ms:, migrations: Schema::MIGRATIONS)
           # First, so a missing gem leaves nothing behind on disk.
@@ -47,17 +53,18 @@ module AgentDaemon
             configure(db, busy_timeout_ms)
             version = migrate(db, migrations)
             secure_sidecars(path)
-            new(db, path, version)
+            new(db, path, version, busy_timeout_ms)
           rescue Exception # close on ANY failure, then re-raise it untouched
             db.close unless db.closed?
             raise
           end
         end
 
-        def initialize(db, path, schema_version)
+        def initialize(db, path, schema_version, busy_timeout_ms)
           @db = db
           @path = path
           @schema_version = schema_version
+          @busy_timeout_ms = busy_timeout_ms
         end
 
         def close
@@ -116,10 +123,10 @@ module AgentDaemon
             Log.warn("[History] #{path} had mode #{format('%04o', mode)}; restricted it to #{format('%04o', FILE_MODE)}")
           end
 
-          # busy_timeout first: switching the journal mode takes a lock that a
-          # concurrent connection may briefly hold.
+          # The busy handler first: switching the journal mode takes a lock that
+          # a concurrent connection may briefly hold.
           def configure(db, busy_timeout_ms)
-            db.busy_timeout = busy_timeout_ms
+            db.busy_handler_timeout = busy_timeout_ms
             mode = db.get_first_value("PRAGMA journal_mode=WAL")
             raise Error, "journal_mode is #{mode.inspect}, expected \"wal\"" unless mode.to_s.downcase == "wal"
 

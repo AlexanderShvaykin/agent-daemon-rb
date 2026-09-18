@@ -49,8 +49,12 @@ workflows:
 # The database holds redacted run history. Exclude it and its -wal/-shm
 # sidecars from backups.
 #
-# Only enabled, database_path and busy_timeout_ms are used so far; the other
-# keys are validated now so a typo fails at load.
+# Runs, lifecycle events and restart actions are written by one background
+# thread that never blocks runners; a batch that fails to commit is logged and
+# dropped for now. Only enabled, database_path, busy_timeout_ms and
+# shutdown_flush_seconds (how long shutdown waits for the writer's final
+# drain) are used so far; the other keys are validated now so a typo fails at
+# load.
 #
 # history:
 #   enabled: true                          # default true

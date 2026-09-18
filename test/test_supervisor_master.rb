@@ -1356,7 +1356,7 @@ class TestSupervisorMaster < Minitest::Test
       busy_timeout = nil
       opener = lambda do |history_config|
         store = AgentDaemon::Supervisor::Master::HISTORY_OPENER.call(history_config)
-        busy_timeout = store.db.get_first_value("PRAGMA busy_timeout")
+        busy_timeout = store.busy_timeout_ms
         store
       end
       master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, history_opener: opener)
@@ -1364,6 +1364,82 @@ class TestSupervisorMaster < Minitest::Test
 
       assert_equal :ready, master.history_state
       assert_equal 250, busy_timeout
+    end
+  end
+
+  # --- Story 5.2: the history writer -----------------------------------------
+
+  def test_events_published_before_start_are_persisted_by_the_writer
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      identity = AgentDaemon::Supervisor::RunnerIdentity.new(workflow: "wf", runner: "a")
+      stamp = AgentDaemon::Supervisor::GenerationStamp.new(2, master.event_bus)
+      stamp.publish(identity, type: :picked_up, work_item: "TI-1", at: "2026-09-19T10:00:00Z")
+      stamp.publish(identity, type: :restart, actor: [:crash_auto], requested_at: "2026-09-19T09:59:00.000Z",
+                              at: "2026-09-19T10:00:00Z")
+      boot_and_shut_down(master)
+
+      assert_equal :ready, master.history_state
+      refute master.history_writer.thread.alive?
+      assert master.history.db.closed?
+      db = SQLite3::Database.new(File.join(dir, "history", "history.sqlite3"))
+      assert_equal [[2, "TI-1"]], db.execute("SELECT generation, work_item FROM run")
+      assert_equal [[1, 2, '["crash_auto"]']],
+                   db.execute("SELECT source_generation, target_generation, actors FROM restart_action")
+      db.close
+    end
+  end
+
+  def test_the_writer_is_built_before_any_entity_spawns
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
+      seen = nil
+      master = nil
+      factory = lambda do |database, event_bus, roster|
+        seen = { supervisors: master.instance_variable_get(:@supervisors).size, roster: roster.size }
+        AgentDaemon::Supervisor::Master::HISTORY_WRITER_FACTORY.call(database, event_bus, roster)
+      end
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, history_writer_factory: factory)
+      boot_and_shut_down(master)
+
+      assert_equal({ supervisors: 0, roster: 1 }, seen)
+    end
+  end
+
+  def test_a_writer_that_fails_to_build_degrades_history_and_the_fleet_still_supervises
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
+      store = nil
+      opener = ->(c) { store = AgentDaemon::Supervisor::Master::HISTORY_OPENER.call(c) }
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, history_opener: opener,
+                                                           history_writer_factory: ->(*) { raise "no writer" })
+      errors = capture_log_errors { boot_and_shut_down(master) }
+
+      assert_equal :degraded, master.history_state
+      assert_nil master.history
+      assert_nil master.history_writer
+      assert store.db.closed?
+      assert_equal 1, errors.grep(/\[History\]/).size, errors.inspect
+      master.instance_variable_get(:@supervisors).each_value { |supervisor| refute_nil supervisor.thread }
+    end
+  end
+
+  StuckWriter = Struct.new(:stopped_with) do
+    def start = self
+
+    def stop(timeout:)
+      self.stopped_with = timeout
+      false
+    end
+  end
+
+  def test_a_writer_that_misses_the_flush_deadline_leaves_the_store_open
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], history: { "shutdown_flush_seconds" => 3 }) do |_d, config|
+      writer = StuckWriter.new
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, history_writer_factory: ->(*) { writer })
+      boot_and_shut_down(master)
+
+      assert_equal 3, writer.stopped_with
+      refute master.history.db.closed?
+      master.history.close
     end
   end
 

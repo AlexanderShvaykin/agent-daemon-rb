@@ -666,8 +666,22 @@ internal architecture spine — a planning artifact kept outside this repository
 not a shipped document; this section describes the shape implemented through
 Epic 4 — including the in-memory live console and authenticated restart
 control. Epic 5 has started: the master opens an owner-only, versioned SQLite
-history store at boot (degrading, never failing, on error), and nothing writes
-to it yet. The metrics exporter remains assigned to Epic 6.
+history store at boot (degrading, never failing, on error), and a single
+`History::Writer` thread (`history_writer`) persists runs, their ordered
+lifecycle events, and restart actions into it. The writer is a read-only
+`EventBus` subscriber whose cursor is created before any supervised entity
+spawns, so startup events are in its backlog; producers only ever publish to
+the bus and never wait on SQLite. It correlates `picked_up`/`started`/`finished`
+per entity into one `run` row (only observed events are stored, nothing is
+synthesized) and turns each coalesced `restart` event into one
+`restart_action`. Each drained batch commits in one transaction guarded by a
+committed-seq watermark, so a repeated batch writes nothing twice; a failed
+batch is rolled back, logged once, and dropped (retry and gap logging arrive
+in Story 5.3). The connection waits on locks with sqlite3's
+`busy_handler_timeout`, which releases the GVL, rather than `busy_timeout`,
+which would freeze every runner thread for the wait. On shutdown the writer
+drains once more and is given `shutdown_flush_seconds` before the store is
+closed. The metrics exporter remains assigned to Epic 6.
 
 ### Layout
 
@@ -685,7 +699,7 @@ One file per concern under `lib/agent_daemon/supervisor/`:
 | `fleet.rb`               | Config roster left-joined with current registry state          |
 | `activity_log.rb`        | Per-entity recent events projected from the bounded bus         |
 | `console/`               | Rack/Puma UI, GitLab OAuth, authenticated SSE and restart controls |
-| `history/`               | Owner-only SQLite history store and its versioned schema (Epic 5) |
+| `history/`               | Owner-only SQLite history store, its versioned schema, and the single writer thread (Epic 5) |
 
 ### Supervisor config
 

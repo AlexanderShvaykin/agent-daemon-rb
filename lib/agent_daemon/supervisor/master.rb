@@ -13,6 +13,7 @@ require_relative "output_pipeline"
 require_relative "output_buffers"
 require_relative "console/server"
 require_relative "history/database"
+require_relative "history/writer"
 
 module AgentDaemon
   module Supervisor
@@ -63,18 +64,26 @@ module AgentDaemon
         )
       end
 
+      # Builds the single history writer (Story 5.2). Injectable so a test can
+      # make it fail on purpose and watch history degrade without the fleet.
+      HISTORY_WRITER_FACTORY = lambda do |database, event_bus, roster|
+        History::Writer.new(database: database, event_bus: event_bus, roster: roster)
+      end
+
       attr_reader :state_registry, :event_bus, :output_pipeline, :output_buffers
       # history_state is nil until #start, then :ready, :disabled or :degraded.
-      attr_reader :history, :history_state
+      attr_reader :history, :history_state, :history_writer
 
       def initialize(supervisor_config, join_timeout: JOIN_TIMEOUT, console_factory: CONSOLE_FACTORY,
-                     history_opener: HISTORY_OPENER)
+                     history_opener: HISTORY_OPENER, history_writer_factory: HISTORY_WRITER_FACTORY)
         @config = supervisor_config
         @join_timeout = join_timeout
         @console_factory = console_factory
         @history_opener = history_opener
+        @history_writer_factory = history_writer_factory
         @history = nil
         @history_state = nil
+        @history_writer = nil
         @shutdown_flag = AgentDaemon::ShutdownFlag.new
         @entity_factories = {}
         @entity_ids = {}
@@ -100,8 +109,8 @@ module AgentDaemon
         Log.info("Supervisor starting (#{@config.workflows.size} workflow(s))")
         setup_signal_handlers
         build_factories
-        # Before any supervisor exists, so the store is ready before the first
-        # entity spawns (the 5.2 writer subscribes here too).
+        # Before any supervisor exists, so the store is ready and the history
+        # writer's bus cursor exists before the first entity spawns.
         open_history
         build_supervisors
         start_supervisors
@@ -255,6 +264,7 @@ module AgentDaemon
         @history = @history_opener.call(history_config)
         @history_state = :ready
         Log.info("[History] opened #{history_config['database_path']}")
+        start_history_writer
       rescue StandardError, ScriptError => e
         @history = nil
         @history_state = :degraded
@@ -262,8 +272,36 @@ module AgentDaemon
                   "#{e.class}: #{e.message}")
       end
 
+      # The roster is complete here (build_factories ran first), and the
+      # writer subscribes in its constructor, so every event any entity
+      # publishes is in its backlog. A writer that cannot be built or started
+      # degrades history like an open failure does.
+      def start_history_writer
+        writer = @history_writer_factory.call(@history, @event_bus, @roster)
+        writer.start
+        @history_writer = writer
+      rescue StandardError, ScriptError => e
+        @history_state = :degraded
+        Log.error("[History] writer failed to start, continuing without history: #{e.class}: #{e.message}")
+        begin
+          @history.close
+        rescue StandardError
+          nil
+        end
+        @history = nil
+      end
+
+      # The writer stops first: its final drain commits what it has already
+      # read. A writer still running after the flush deadline may be inside a
+      # transaction, so the store is then left for process exit to close.
       def close_history
         return unless @history
+
+        flush_seconds = @config.history["shutdown_flush_seconds"]
+        if @history_writer && !@history_writer.stop(timeout: flush_seconds)
+          Log.warn("[History] writer did not finish within #{flush_seconds}s; leaving the store open")
+          return
+        end
 
         @history.close
       rescue StandardError => e

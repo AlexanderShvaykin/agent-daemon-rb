@@ -61,14 +61,35 @@ class TestSupervisorHistory < Minitest::Test
     assert_equal Schema::LATEST, store.db.get_first_value("PRAGMA user_version")
     assert_equal TABLES, tables(store.db)
     assert_equal "wal", store.db.get_first_value("PRAGMA journal_mode")
-    assert_equal 1000, store.db.get_first_value("PRAGMA busy_timeout")
+    assert_equal 1000, store.busy_timeout_ms
     assert_equal 1, store.db.get_first_value("PRAGMA foreign_keys")
     assert_equal @path, store.path
   end
 
   def test_busy_timeout_follows_the_configured_value
     store = open_store(busy_timeout_ms: 2500)
-    assert_equal 2500, store.db.get_first_value("PRAGMA busy_timeout")
+    assert_equal 2500, store.busy_timeout_ms
+  end
+
+  # Behavioural: the handler really waits out a held lock (PRAGMA busy_timeout
+  # reads 0 once busy_handler_timeout is set), and it releases the GVL while it
+  # waits, so other Ruby threads keep running.
+  def test_a_held_lock_is_waited_out_without_holding_the_gvl
+    store = open_store(busy_timeout_ms: 300)
+    with_raw_db(@path) do |other|
+      other.execute("BEGIN IMMEDIATE")
+      ticks = 0
+      counter = Thread.new { loop { ticks += 1 } }
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      assert_raises(SQLite3::BusyException) { store.db.execute("BEGIN IMMEDIATE") }
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+      counter.kill.join
+      other.execute("ROLLBACK")
+
+      assert_operator elapsed, :>=, 0.25
+      assert_operator elapsed, :<, 1.5, "the configured 300 ms must bound the wait"
+      assert_operator ticks, :>, 1000
+    end
   end
 
   # --- Reopen ---------------------------------------------------------------

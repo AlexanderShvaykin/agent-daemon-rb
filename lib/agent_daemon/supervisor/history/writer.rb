@@ -1,0 +1,224 @@
+# frozen_string_literal: true
+
+require "json"
+require "time"
+
+require_relative "../../log"
+require_relative "../runner_identity"
+
+module AgentDaemon
+  module Supervisor
+    module History
+      # The single history writer (Story 5.2): one thread, one read-only
+      # EventBus cursor, one SQLite connection. Producers only ever publish to
+      # the bus; this thread pulls through its own cursor and never blocks
+      # them. The cursor is created in #initialize, so building the writer
+      # before any entity spawns means startup events are never missed.
+      #
+      # Correlation is in memory and per entity: at most one open run per
+      # entity_key. Only observed events are stored; a missing transition is
+      # never synthesized.
+      #
+      # Each drained batch commits in one transaction. On failure the
+      # transaction rolls back, the in-memory maps are restored, and the batch
+      # is dropped (retry and gap logging are Story 5.3). The watermark is the
+      # highest bus seq committed, so re-applying a batch writes nothing twice.
+      #
+      # Never references SQLite3:: constants, so loading this file never needs
+      # the gem.
+      class Writer
+        THREAD_NAME = "history_writer"
+        LIFECYCLE_TYPES = %i[picked_up started finished].freeze
+        REASONS = %w[ok failed timeout killed].freeze
+
+        # A record that cannot be stored; skipped with one warn line.
+        class Skip < StandardError; end
+
+        attr_reader :thread
+
+        def initialize(database:, event_bus:, roster:, poll_interval: 0.5)
+          @db = database.db
+          @event_bus = event_bus
+          @poll_interval = poll_interval
+          @roster = roster.to_h { |rostered| [RunnerIdentity.key_for(rostered.entity_id), rostered] }
+          @open_runs = {}
+          @entity_ids = {}
+          @watermark = 0
+          @stopping = false
+          @thread = nil
+          @cursor = event_bus.subscribe(from: :backlog)
+        end
+
+        def start
+          @thread = Thread.new { run_loop }
+          # Named from here, so the name is set before #start returns.
+          @thread.name = THREAD_NAME
+          self
+        end
+
+        # Requests a stop and waits up to timeout for the final drain. Returns
+        # true when the thread finished. A thread still running keeps its
+        # cursor, so its next read does not fail.
+        def stop(timeout:)
+          @stopping = true
+          finished = @thread.nil? || !@thread.join(timeout).nil?
+          @event_bus.unsubscribe(@cursor) if finished
+          finished
+        end
+
+        # Applies records in one transaction. Returns true when the batch
+        # committed (or had nothing new), false when it was dropped.
+        def write(records)
+          fresh = records.select { |record| record[:seq] > @watermark }
+          return true if fresh.empty?
+
+          saved = [@open_runs.dup, @entity_ids.dup, @watermark]
+          begin
+            @db.transaction(:immediate) do
+              fresh.each { |record| apply(record) }
+              @watermark = fresh.last[:seq]
+            end
+            true
+          rescue StandardError => e
+            @open_runs, @entity_ids, @watermark = saved
+            rollback_quietly
+            Log.error("[History] dropped a batch of #{fresh.size} record(s): #{e.class}: #{e.message}")
+            false
+          end
+        end
+
+        private
+
+        # stopping is read before the drain, so the drain that follows a stop
+        # request is always the last one.
+        def run_loop
+          loop do
+            stopping = @stopping
+            begin
+              write(@cursor.read)
+            rescue StandardError => e
+              Log.error("[History] writer iteration failed: #{e.class}: #{e.message}")
+            end
+            break if stopping
+
+            sleep(@poll_interval)
+          end
+        end
+
+        # A failed COMMIT leaves the transaction open, and the next BEGIN would
+        # then fail forever.
+        def rollback_quietly
+          @db.rollback if @db.transaction_active?
+        rescue StandardError
+          nil
+        end
+
+        def apply(record)
+          case record[:type]
+          when *LIFECYCLE_TYPES then apply_lifecycle(record)
+          when :restart then apply_restart(record)
+          else raise Skip, "unknown type"
+          end
+        rescue Skip => e
+          Log.warn("[History] skipped bus record seq #{record[:seq]} (#{record[:type]}): #{e.message}")
+        end
+
+        def apply_lifecycle(record)
+          entity_key, rostered = rostered_for(record)
+          generation = required_generation(record)
+          at = timestamp(record[:at], "at")
+          entity_id = entity_row_id(entity_key, rostered, at)
+          run = run_for(entity_key, entity_id, generation, record, at)
+          @db.execute("INSERT INTO run_event (run_id, seq, event, reason, occurred_at) VALUES (?, ?, ?, ?, ?)",
+                      [run[:id], record[:seq], record[:type].to_s, reason(record), at])
+          return unless record[:type] == :finished
+
+          @db.execute("UPDATE run SET finished_at = ?, reason = ? WHERE id = ?", [at, reason(record), run[:id]])
+          # Only when this finished closed the open run itself: a finished that
+          # opened its own run must not displace it.
+          @open_runs.delete(entity_key) if @open_runs[entity_key].equal?(run)
+        end
+
+        def reason(record)
+          REASONS.include?(record[:reason].to_s) ? record[:reason].to_s : nil
+        end
+
+        # picked_up always opens a new run, abandoning any earlier open one
+        # as-is. started/finished attach to the open run when generation and
+        # work item match, otherwise they open a new run from what was seen.
+        def run_for(entity_key, entity_id, generation, record, at)
+          open = @open_runs[entity_key]
+          if record[:type] != :picked_up && open &&
+             open[:generation] == generation && open[:work_item] == record[:work_item]
+            unless record[:attempt].nil?
+              @db.execute("UPDATE run SET attempt = ? WHERE id = ?", [record[:attempt], open[:id]])
+            end
+            return open
+          end
+
+          @db.execute("INSERT INTO run (entity_id, generation, work_item, attempt, started_at) VALUES (?, ?, ?, ?, ?)",
+                      [entity_id, generation, record[:work_item]&.to_s, record[:attempt], at])
+          run = { id: @db.last_insert_row_id, generation: generation, work_item: record[:work_item] }.freeze
+          # A run opened by finished is already closed, so it never becomes the
+          # open run. Replaced, never mutated: the rollback snapshot is a
+          # shallow dup.
+          @open_runs[entity_key] = run unless record[:type] == :finished
+          run
+        end
+
+        def apply_restart(record)
+          entity_key, rostered = rostered_for(record)
+          generation = required_generation(record)
+          completed_at = timestamp(record[:at], "at")
+          requested_at = timestamp(record[:requested_at], "requested_at")
+          entity_id = entity_row_id(entity_key, rostered, completed_at)
+          actors = JSON.generate(Array(record[:actor]).map(&:to_s))
+          @db.execute("INSERT INTO restart_action (entity_id, source_generation, target_generation, actors, " \
+                      "requested_at, completed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                      [entity_id, generation - 1, generation, actors, requested_at, completed_at])
+        end
+
+        def rostered_for(record)
+          key = RunnerIdentity.key_for(record[:entity_id])
+          rostered = @roster[key]
+          raise Skip, "entity not in roster" unless rostered
+
+          [key, rostered]
+        end
+
+        def required_generation(record)
+          generation = record[:generation]
+          raise Skip, "missing generation" unless generation.is_a?(Integer)
+
+          generation
+        end
+
+        def timestamp(value, field)
+          raise Skip, "missing #{field}" if value.nil?
+
+          Time.iso8601(value.to_s).utc.iso8601(3)
+        rescue ArgumentError
+          raise Skip, "unparseable #{field}"
+        end
+
+        # Created on the entity's first persisted event; the id is cached.
+        def entity_row_id(entity_key, rostered, first_seen_at)
+          @entity_ids[entity_key] ||= begin
+            workflow, runner = entity_columns(rostered)
+            @db.execute("INSERT OR IGNORE INTO supervised_entity (entity_key, kind, workflow, runner, first_seen_at) " \
+                        "VALUES (?, ?, ?, ?, ?)", [entity_key, rostered.kind.to_s, workflow, runner, first_seen_at])
+            @db.get_first_value("SELECT id FROM supervised_entity WHERE entity_key = ?", [entity_key])
+          end
+        end
+
+        def entity_columns(rostered)
+          case rostered.kind
+          when :runner then [rostered.workflow, rostered.name]
+          when :messenger then [rostered.workflow, nil]
+          else [nil, nil]
+          end
+        end
+      end
+    end
+  end
+end
