@@ -35,7 +35,8 @@ class TestRequireIsolation < Minitest::Test
       # story also answered the question 1.8 deferred — "rack in the core graph:
       # allow or deny?" — as DENY, for all three: they are supervisor-console
       # deps, reachable solely from lib/agent_daemon/supervisor/console/.
-      # sqlite3 (Epic 5) is still ahead of us and holds trivially for now.
+      # sqlite3 joined them in Story 5.1 (supervisor history): a gemspec runtime
+      # dep, required lazily inside Supervisor::History::Database.open only.
       # Matching by feature PATH (not a rescue-able `require`) is what makes
       # this a boundary check rather than an availability check.
       bad.concat($LOADED_FEATURES.grep(%r{/(sqlite3|puma|rack|oauth2)(/|\\.rb|\\.so|\\.bundle)}))
@@ -55,6 +56,9 @@ class TestRequireIsolation < Minitest::Test
   def test_supervisor_tree_is_loadable_in_isolation
     script = <<~RUBY
       require "agent_daemon/supervisor/master"
+      # sqlite3 is required lazily inside History::Database.open, so loading
+      # the whole supervisor tree must not pull it in either.
+      exit 1 unless $LOADED_FEATURES.grep(%r{/sqlite3(/|\.rb|\.so|\.bundle)}).empty?
       exit(defined?(AgentDaemon::Supervisor::Master) ? 0 : 1)
     RUBY
     out, status = run_core_probe(script)

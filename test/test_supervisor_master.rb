@@ -29,7 +29,7 @@ class TestSupervisorMaster < Minitest::Test
   # so 1.1's collision validation never rejects the fixture itself.
   # `console:` splices a Story 2.2 console block into the supervisor config;
   # omitting it (every pre-2.2 caller) leaves the config exactly as before.
-  def with_config(specs, console: nil)
+  def with_config(specs, console: nil, history: nil)
     Dir.mktmpdir do |dir|
       wf_dir = File.join(dir, "workflows")
       FileUtils.mkdir_p(File.join(wf_dir, "prompts"))
@@ -53,6 +53,7 @@ class TestSupervisorMaster < Minitest::Test
       path = File.join(dir, "supervisor.yml")
       supervisor_data = { "workflows" => entries }
       supervisor_data["console"] = console if console
+      supervisor_data["history"] = history if history
       File.write(path, supervisor_data.to_yaml)
 
       yield dir, AgentDaemon::Supervisor::Config.new(path)
@@ -1292,6 +1293,132 @@ class TestSupervisorMaster < Minitest::Test
       File.write(path, { "workflows" => [{ "name" => "wf", "config" => "workflows/wf.yml" }] }.to_yaml)
 
       yield AgentDaemon::Supervisor::Config.new(path)
+    end
+  end
+
+  # --- Story 5.1: history is opened before the fleet and never stops it -----
+
+  # Master#start installs its own INT/TERM handlers; save and restore the real
+  # ones (test_supervisor_shutdown.rb's precedent). The flag is preset, so
+  # start runs one full boot-to-shutdown cycle and returns.
+  def boot_and_shut_down(master)
+    original_term = Signal.trap("TERM", "DEFAULT")
+    original_int = Signal.trap("INT", "DEFAULT")
+    master.instance_variable_get(:@shutdown_flag).set!
+    master.start
+  ensure
+    Signal.trap("TERM", original_term)
+    Signal.trap("INT", original_int)
+  end
+
+  def raising_opener(error)
+    ->(_history_config) { raise error }
+  end
+
+  def test_a_history_open_failure_degrades_history_and_the_fleet_still_supervises
+    require "sqlite3"
+    [SQLite3::CantOpenException.new("unable to open database file"), LoadError.new("cannot load such file -- sqlite3")]
+      .each do |error|
+      with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
+        master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, history_opener: raising_opener(error))
+        errors = capture_log_errors { boot_and_shut_down(master) }
+
+        assert_equal :degraded, master.history_state
+        assert_nil master.history
+        history_lines = errors.grep(/\[History\]/)
+        assert_equal 1, history_lines.size, errors.inspect
+        assert_includes history_lines.first, config.history["database_path"]
+        assert_includes history_lines.first, error.class.name
+        refute_empty master.instance_variable_get(:@supervisors)
+        master.instance_variable_get(:@supervisors).each_value { |supervisor| refute_nil supervisor.thread }
+      end
+    end
+  end
+
+  def test_history_opens_after_the_factories_are_built_and_before_any_entity_spawns
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
+      seen = nil
+      master = nil
+      opener = lambda do |_history_config|
+        seen = { factories: master.instance_variable_get(:@entity_factories).size,
+                 supervisors: master.instance_variable_get(:@supervisors).size }
+        raise "stop here"
+      end
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, history_opener: opener)
+      boot_and_shut_down(master)
+
+      assert_equal({ factories: 1, supervisors: 0 }, seen)
+    end
+  end
+
+  def test_the_default_opener_applies_the_configured_busy_timeout
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], history: { "busy_timeout_ms" => 250 }) do |_dir, config|
+      busy_timeout = nil
+      opener = lambda do |history_config|
+        store = AgentDaemon::Supervisor::Master::HISTORY_OPENER.call(history_config)
+        busy_timeout = store.db.get_first_value("PRAGMA busy_timeout")
+        store
+      end
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, history_opener: opener)
+      boot_and_shut_down(master)
+
+      assert_equal :ready, master.history_state
+      assert_equal 250, busy_timeout
+    end
+  end
+
+  def test_disabled_history_is_never_opened_and_creates_nothing
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], history: { "enabled" => false }) do |dir, config|
+      opened = false
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2,
+                                                           history_opener: ->(_c) { opened = true })
+      boot_and_shut_down(master)
+
+      assert_equal :disabled, master.history_state
+      refute opened
+      refute File.exist?(File.join(dir, "history"))
+    end
+  end
+
+  def test_default_history_is_created_owner_only_and_survives_a_second_boot
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |dir, config|
+      history_dir = File.join(dir, "history")
+      db_path = File.join(history_dir, "history.sqlite3")
+
+      first = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      boot_and_shut_down(first)
+
+      assert_equal :ready, first.history_state
+      assert first.history.db.closed?, "the store is closed on shutdown"
+      assert_equal 0o700, File.stat(history_dir).mode & 0o777
+      assert_equal 0o600, File.stat(db_path).mode & 0o777
+      schema = ->(db) { db.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name") }
+      db = SQLite3::Database.new(db_path)
+      before = schema.call(db)
+      assert_equal AgentDaemon::Supervisor::History::Schema::LATEST, db.get_first_value("PRAGMA user_version")
+      db.close
+      assert_equal %w[restart_action run run_event supervised_entity],
+                   before.select { |type, _, _| type == "table" }.map { |_, name, _| name }
+
+      second = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      boot_and_shut_down(second)
+
+      db = SQLite3::Database.new(db_path)
+      assert_equal before, schema.call(db)
+      assert_equal AgentDaemon::Supervisor::History::Schema::LATEST, db.get_first_value("PRAGMA user_version")
+      db.close
+    end
+  end
+
+  def test_an_unopenable_database_path_degrades_history_with_the_real_opener
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], history: { "database_path" => "taken" }) do |dir, config|
+      FileUtils.mkdir_p(File.join(dir, "taken"))
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      errors = capture_log_errors { boot_and_shut_down(master) }
+
+      assert_equal :degraded, master.history_state
+      assert_equal 1, errors.grep(/\[History\]/).size, errors.inspect
+      refute_empty master.instance_variable_get(:@supervisors)
     end
   end
 end

@@ -12,6 +12,7 @@ require_relative "redactor"
 require_relative "output_pipeline"
 require_relative "output_buffers"
 require_relative "console/server"
+require_relative "history/database"
 
 module AgentDaemon
   module Supervisor
@@ -52,12 +53,28 @@ module AgentDaemon
         )
       end
 
-      attr_reader :state_registry, :event_bus, :output_pipeline, :output_buffers
+      # Opens the history store from the config's `history` block. Injectable
+      # for the same reason console_factory is: a test must be able to make
+      # history fail on purpose and watch the fleet carry on regardless.
+      HISTORY_OPENER = lambda do |history_config|
+        History::Database.open(
+          path: history_config["database_path"],
+          busy_timeout_ms: history_config["busy_timeout_ms"]
+        )
+      end
 
-      def initialize(supervisor_config, join_timeout: JOIN_TIMEOUT, console_factory: CONSOLE_FACTORY)
+      attr_reader :state_registry, :event_bus, :output_pipeline, :output_buffers
+      # history_state is nil until #start, then :ready, :disabled or :degraded.
+      attr_reader :history, :history_state
+
+      def initialize(supervisor_config, join_timeout: JOIN_TIMEOUT, console_factory: CONSOLE_FACTORY,
+                     history_opener: HISTORY_OPENER)
         @config = supervisor_config
         @join_timeout = join_timeout
         @console_factory = console_factory
+        @history_opener = history_opener
+        @history = nil
+        @history_state = nil
         @shutdown_flag = AgentDaemon::ShutdownFlag.new
         @entity_factories = {}
         @entity_ids = {}
@@ -83,6 +100,9 @@ module AgentDaemon
         Log.info("Supervisor starting (#{@config.workflows.size} workflow(s))")
         setup_signal_handlers
         build_factories
+        # Before any supervisor exists, so the store is ready before the first
+        # entity spawns (the 5.2 writer subscribes here too).
+        open_history
         build_supervisors
         start_supervisors
         start_console
@@ -98,6 +118,7 @@ module AgentDaemon
           # most likely to be left behind.
           finalize_supervisors
           sweep_orphaned_agents
+          close_history
         end
         Log.info("Supervisor stopped")
       end
@@ -217,6 +238,36 @@ module AgentDaemon
         # (EADDRINUSE, a bad base_url, an OAuth misconfiguration) arrives here
         # as one log line and nothing else.
         Log.error("[Console] failed to start, continuing without it: #{e.class}: #{e.message}")
+      end
+
+      # History is an observer, never a fleet dependency (Epic 5): any failure
+      # to open it (sqlite3 missing, a bad path, unsafe permissions, a newer
+      # schema) is one [History] log line and an explicit :degraded state. The
+      # line carries the path and the error, never DB contents.
+      def open_history
+        history_config = @config.history
+        unless history_config["enabled"]
+          @history_state = :disabled
+          Log.info("[History] disabled by configuration")
+          return
+        end
+
+        @history = @history_opener.call(history_config)
+        @history_state = :ready
+        Log.info("[History] opened #{history_config['database_path']}")
+      rescue StandardError, ScriptError => e
+        @history = nil
+        @history_state = :degraded
+        Log.error("[History] unavailable, continuing without it: #{history_config['database_path']}: " \
+                  "#{e.class}: #{e.message}")
+      end
+
+      def close_history
+        return unless @history
+
+        @history.close
+      rescue StandardError => e
+        Log.error("[History] failed to close #{@config.history['database_path']}: #{e.class}: #{e.message}")
       end
 
       # The console is not a supervised entity (AD-13 enumerates exactly three

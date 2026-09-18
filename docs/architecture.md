@@ -665,8 +665,9 @@ this subsystem is built against (AD-1…AD-16) is captured in the project's
 internal architecture spine — a planning artifact kept outside this repository,
 not a shipped document; this section describes the shape implemented through
 Epic 4 — including the in-memory live console and authenticated restart
-control. SQLite history and the metrics exporter remain assigned to Epics 5
-and 6.
+control. Epic 5 has started: the master opens an owner-only, versioned SQLite
+history store at boot (degrading, never failing, on error), and nothing writes
+to it yet. The metrics exporter remains assigned to Epic 6.
 
 ### Layout
 

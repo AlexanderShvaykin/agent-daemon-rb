@@ -951,4 +951,120 @@ class TestSupervisorConfig < Minitest::Test
       assert_match(/console\.port must be a port number/, err.message)
     end
   end
+
+  # --- history (Story 5.1) --------------------------------------------------
+
+  def with_history(value)
+    specs = [{ name: "a", file: "a", data: sandboxed_workflow_data }]
+    with_supervisor(specs) do |dir, path|
+      data = YAML.safe_load(File.read(path))
+      data["history"] = value unless value == :omitted
+      File.write(path, data.to_yaml)
+      yield dir, path
+    end
+  end
+
+  def history_error(value)
+    with_history(value) do |_dir, path|
+      return assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Supervisor::Config.new(path) }.message
+    end
+  end
+
+  def test_history_defaults_apply_when_the_block_is_absent
+    with_history(:omitted) do |dir, path|
+      expected = AgentDaemon::Supervisor::Config::HISTORY_DEFAULTS.merge(
+        "database_path" => File.join(dir, "history", "history.sqlite3")
+      )
+      assert_equal expected, AgentDaemon::Supervisor::Config.new(path).history
+    end
+  end
+
+  def test_a_null_history_block_gets_the_full_defaults
+    with_history(nil) do |dir, path|
+      history = AgentDaemon::Supervisor::Config.new(path).history
+      assert_equal AgentDaemon::Supervisor::Config::HISTORY_DEFAULTS.keys.sort, history.keys.sort
+      assert_equal File.join(dir, "history", "history.sqlite3"), history["database_path"]
+    end
+  end
+
+  def test_a_partial_history_block_is_merged_over_the_defaults
+    with_history({ "enabled" => false, "busy_timeout_ms" => 250 }) do |_dir, path|
+      history = AgentDaemon::Supervisor::Config.new(path).history
+      assert_equal false, history["enabled"]
+      assert_equal 250, history["busy_timeout_ms"]
+      assert_equal 30, history["retention_days"]
+    end
+  end
+
+  def test_a_relative_database_path_resolves_against_the_supervisor_config_dir
+    with_history({ "database_path" => "state/h.db" }) do |dir, path|
+      assert_equal File.join(dir, "state", "h.db"), AgentDaemon::Supervisor::Config.new(path).history["database_path"]
+    end
+  end
+
+  def test_an_absolute_database_path_is_kept
+    with_history({ "database_path" => "/var/lib/agent/h.db" }) do |_dir, path|
+      assert_equal "/var/lib/agent/h.db", AgentDaemon::Supervisor::Config.new(path).history["database_path"]
+    end
+  end
+
+  def test_history_integer_keys_accept_their_inclusive_boundaries
+    AgentDaemon::Supervisor::Config::HISTORY_RANGES.each do |key, range|
+      [range.min, range.max].each do |value|
+        with_history({ key => value }) do |_dir, path|
+          assert_equal value, AgentDaemon::Supervisor::Config.new(path).history[key]
+        end
+      end
+    end
+  end
+
+  def test_history_integer_keys_reject_out_of_range_and_non_integer_values
+    AgentDaemon::Supervisor::Config::HISTORY_RANGES.each do |key, range|
+      [range.min - 1, range.max + 1, range.min.to_f, range.min.to_s, true, nil].each do |bad|
+        message = history_error({ key => bad })
+        assert_match(/history\.#{key} must be an integer in #{Regexp.escape(range.to_s)} \(got #{Regexp.escape(bad.inspect)}\)/,
+                     message)
+      end
+    end
+  end
+
+  def test_an_unknown_history_key_is_a_collected_problem
+    message = history_error({ "retention_day" => 7, "busy_timeout_ms" => 50 })
+    assert_match(/history\.retention_day is not a known key/, message)
+    assert_match(/history\.busy_timeout_ms must be an integer/, message)
+  end
+
+  def test_history_must_be_a_mapping
+    assert_match(/history must be a mapping/, history_error(3))
+  end
+
+  def test_history_enabled_must_be_a_boolean
+    assert_match(/history\.enabled must be true or false \(got "yes"\)/, history_error({ "enabled" => "yes" }))
+  end
+
+  def test_history_database_path_must_be_a_non_empty_string
+    assert_match(/history\.database_path must be a non-empty string \(got ""\)/, history_error({ "database_path" => "" }))
+    assert_match(/history\.database_path must be a non-empty string \(got 7\)/, history_error({ "database_path" => 7 }))
+  end
+
+  def test_an_unexpandable_database_path_is_a_collected_problem
+    assert_match(/history\.database_path "~nosuchuser_xyz\/h\.db" cannot be resolved/,
+                 history_error({ "database_path" => "~nosuchuser_xyz/h.db" }))
+  end
+
+  def test_history_problems_are_collected_into_one_config_error
+    specs = [{ name: "a", file: "a", data: sandboxed_workflow_data }]
+    with_supervisor(specs) do |_dir, path|
+      data = YAML.safe_load(File.read(path))
+      data["event_bus_capacity"] = -5
+      data["history"] = { "busy_timeout_ms" => 50, "database_path" => "", "enabled" => "yes" }
+      File.write(path, data.to_yaml)
+
+      message = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Supervisor::Config.new(path) }.message
+      assert_match(/event_bus_capacity must be a positive integer/, message)
+      assert_match(/history\.busy_timeout_ms must be an integer in 100\.\.30000 \(got 50\)/, message)
+      assert_match(/history\.database_path must be a non-empty string/, message)
+      assert_match(/history\.enabled must be true or false/, message)
+    end
+  end
 end

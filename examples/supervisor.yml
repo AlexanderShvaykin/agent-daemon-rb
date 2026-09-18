@@ -33,6 +33,37 @@ workflows:
 # a delayed-restart warning. Default 5; accepted range 1-300.
 # restart_warning_margin_seconds: 5
 
+# Persistent run history (SQLite). OPTIONAL: omit the block (or leave it null)
+# and every default below applies, which means history is ON and stored at
+# <this file's directory>/history/history.sqlite3. Set `enabled: false` to turn
+# it off; nothing is then created on disk.
+#
+# The supervisor creates the history directory 0700 and the database, -wal and
+# -shm files 0600, without touching the process umask. An existing file with
+# group/other bits is chmod-ed to 0600 with a warning; a symlink, a non-regular
+# file, or a file owned by another user is refused. Any failure to open history
+# (a refused file, an unwritable path, a schema newer than this version, the
+# sqlite3 gem missing) is logged once as a [History] error and history runs
+# degraded: runners and the console carry on regardless.
+#
+# The database holds redacted run history. Exclude it and its -wal/-shm
+# sidecars from backups.
+#
+# Only enabled, database_path and busy_timeout_ms are used so far; the other
+# keys are validated now so a typo fails at load.
+#
+# history:
+#   enabled: true                          # default true
+#   database_path: history/history.sqlite3 # default; relative to THIS file's dir
+#   busy_timeout_ms: 1000                  # default 1000; range 100-30000
+#   write_retry_count: 3                   # default 3; range 0-10
+#   write_retry_backoff_ceiling_ms: 2000   # default 2000; range 100-30000
+#   shutdown_flush_seconds: 5              # default 5; range 1-30
+#   page_size: 50                          # default 50; range 10-200
+#   retention_days: 30                     # default 30; range 1-365
+#   prune_interval_seconds: 21600          # default 21600 (6 h); range 300-86400
+#   prune_batch_size: 500                  # default 500; range 50-5000
+
 # Optional web console. OMIT THIS WHOLE BLOCK and no server is started and
 # nothing below is validated — a supervisor config without it behaves exactly
 # as it did before the console existed.

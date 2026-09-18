@@ -4,10 +4,13 @@ This file provides guidance to Code Agents when working with code in this reposi
 
 ## What this is
 
-`agent_daemon` is a packaged Ruby gem: a daemon that orchestrates CLI AI agents (Claude Code, OpenCode). It runs one thread per configured runner, each with a trigger (Yandex Tracker query, file polling, or Mattermost @-mentions), a backend, and a prompt template, plus one Messenger thread that delivers webhook notifications. **The core daemon is stdlib only.** Two narrow exceptions carry runtime gems, and both are confined to the subsystem that needs them:
+`agent_daemon` is a packaged Ruby gem: a daemon that orchestrates CLI AI agents (Claude Code, OpenCode). It runs one thread per configured runner, each with a trigger (Yandex Tracker query, file polling, or Mattermost @-mentions), a backend, and a prompt template, plus one Messenger thread that delivers webhook notifications. **The core daemon is stdlib only.** Three narrow exceptions carry runtime gems, and each is confined to the subsystem that needs it:
 
 - `eventmachine` + `faye-websocket` — used *only* by the `mattermost` trigger, to handle the WebSocket protocol instead of hand-rolling RFC 6455.
-- `puma` + `rack` + `oauth2` — used *only* by the supervisor's web console (`lib/agent_daemon/supervisor/console/`), authorized by NFR6/AD-6. `test/test_require_isolation.rb` is the guard: `require "agent_daemon"` must load none of them, and that is enforced, not aspirational.
+- `puma` + `rack` + `oauth2` — used *only* by the supervisor's web console (`lib/agent_daemon/supervisor/console/`), authorized by NFR6/AD-6.
+- `sqlite3` — used *only* by the supervisor's run history (`lib/agent_daemon/supervisor/history/`), authorized by AD-5, and required lazily inside `History::Database.open`, never at file top level.
+
+`test/test_require_isolation.rb` is the guard: `require "agent_daemon"` must load none of them, and that is enforced, not aspirational.
 
 Everything else stays stdlib. Do not add any other gems to the runtime path, and do not reach for these from outside the subsystem that owns them; `minitest`/`rake` are dev-only.
 

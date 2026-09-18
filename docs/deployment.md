@@ -180,6 +180,31 @@ What to expect when you press it:
 `systemctl restart` remains the right tool for config changes, upgrades, and
 anything that must reload the process itself.
 
+### Run history on disk
+
+The supervisor keeps run history in a SQLite database, on by default, at
+`<supervisor config dir>/history/history.sqlite3` (see the `history:` block in
+`examples/supervisor.yml` for every key, its default, and its range). It needs
+the `sqlite3` gem, which is a runtime dependency of the gem but is loaded only by
+the supervisor, never by `bin/agent-daemon`. If the service user cannot write
+to the config directory (configs in a root-owned directory, for example), set
+`database_path` to a writable state directory such as
+`/var/lib/agent-daemon/history.sqlite3`; otherwise history runs degraded.
+
+- **Permissions.** The supervisor creates the directory `0700` and the database,
+  `-wal` and `-shm` files `0600`, owned by the service user. An existing file
+  with group or other bits is tightened to `0600` and a warning is logged. A
+  symlink, a non-regular file, or a file owned by another user is refused.
+- **Degraded, never down.** If history cannot be opened (a refused file, an
+  unwritable directory, a schema newer than the installed version, the gem
+  missing), the journal gets one `[History]` error line naming the path and the
+  error, and the fleet and console run normally without history. `/healthz` does
+  not depend on it.
+- **Backups.** Exclude the database and its `-wal`/`-shm` sidecars from backups.
+  They hold redacted run history, not state the fleet needs, and copying a live
+  WAL database file by file does not produce a consistent copy anyway.
+- **Turning it off.** `history: { enabled: false }` creates nothing on disk.
+
 ## 5. Deploy Updates
 
 A typical deploy is:

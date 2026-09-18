@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+- Supervisor history storage (Story 5.1). A new optional `history:` block in the supervisor config (`enabled`, `database_path`, `busy_timeout_ms`, plus the retry, flush, paging and retention keys later stories read), every key defaulted and range-checked into the single `ConfigError`. The default store is `<config dir>/history/history.sqlite3`; a relative `database_path` resolves against the supervisor config directory.
+- `AgentDaemon::Supervisor::History::Database` opens the store in WAL mode with `busy_timeout` and `foreign_keys`, and runs versioned migrations in one `BEGIN IMMEDIATE` transaction keyed on `PRAGMA user_version`. Schema v1 holds `supervised_entity`, `run`, `run_event` and `restart_action`. A database newer than the code is refused, never downgraded.
+- Storage is owner-only without touching the process umask: the directory is created `0700`, and the database file is pre-created `0600` with `O_EXCL` before SQLite opens it, so the `-wal`/`-shm` sidecars inherit `0600`. An existing file with broad permissions is tightened with a warning; a symlink, a non-regular file, or one owned by another user is refused.
+- History is an observer: any failure to open it is one `[History]` log line and `history_state == :degraded`, and the fleet and console run on. `enabled: false` creates nothing on disk. Nothing writes to the store yet; that is Story 5.2.
+- `sqlite3` (`>= 2.0, < 3`) is a new runtime dependency, loaded lazily and only by the supervisor. The bound is looser than `~> 2.9` so `gem install` keeps working on Ruby 3.0/3.1 for core-only users.
+
 ## [0.21.1] - 2026-09-19
 
 ### Fixed

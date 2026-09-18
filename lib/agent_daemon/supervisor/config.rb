@@ -46,7 +46,11 @@ module AgentDaemon
         # Optional web console (AD-6). nil ⇒ disabled and never validated, so a
         # supervisor config written before the console existed keeps loading
         # unchanged (Story 2.2 AC8).
-        "console" => nil
+        "console" => nil,
+        # Persistent SQLite history (Epic 5). Unlike `console`, nil does NOT
+        # mean disabled: an absent or null block gets the full HISTORY_DEFAULTS
+        # set, and only `enabled: false` turns history off.
+        "history" => nil
       }.freeze
 
       # Server-side console defaults, merged UNDER a present `console:` block.
@@ -63,6 +67,35 @@ module AgentDaemon
         "max_threads" => 16,
         "session_ttl" => 28_800, # 8 hours (FR16)
         "secure_cookies" => true
+      }.freeze
+
+      # History defaults (Story 5.1). Only enabled, database_path and
+      # busy_timeout_ms are consumed so far; the rest are validated now so a typo
+      # fails at load rather than on the day the story that reads it lands.
+      HISTORY_DEFAULTS = {
+        "enabled" => true,
+        # Relative paths resolve against the supervisor config's directory.
+        "database_path" => "history/history.sqlite3",
+        "busy_timeout_ms" => 1_000,
+        "write_retry_count" => 3,
+        "write_retry_backoff_ceiling_ms" => 2_000,
+        "shutdown_flush_seconds" => 5,
+        "page_size" => 50,
+        "retention_days" => 30,
+        "prune_interval_seconds" => 21_600,
+        "prune_batch_size" => 500
+      }.freeze
+
+      # Cross-Story Operational Bounds for every Integer history key.
+      HISTORY_RANGES = {
+        "busy_timeout_ms" => (100..30_000),
+        "write_retry_count" => (0..10),
+        "write_retry_backoff_ceiling_ms" => (100..30_000),
+        "shutdown_flush_seconds" => (1..30),
+        "page_size" => (10..200),
+        "retention_days" => (1..365),
+        "prune_interval_seconds" => (300..86_400),
+        "prune_batch_size" => (50..5_000)
       }.freeze
 
       # The whole role vocabulary (FR15). Roles are parsed and validated here
@@ -83,7 +116,7 @@ module AgentDaemon
       RESTART_WARNING_MARGIN_RANGE = (1..300).freeze
 
       attr_reader :config_path, :config_dir, :workflows, :event_bus_capacity, :output_buffer_bytes,
-                  :restart_warning_margin_seconds, :console
+                  :restart_warning_margin_seconds, :console, :history
 
       def initialize(path)
         @config_path = File.expand_path(path)
@@ -96,6 +129,7 @@ module AgentDaemon
         @output_buffer_bytes = @data["output_buffer_bytes"]
         @restart_warning_margin_seconds = @data["restart_warning_margin_seconds"]
         @console = build_console(@data["console"])
+        @history = build_history(@data["history"])
         validate!
       end
 
@@ -212,6 +246,28 @@ module AgentDaemon
         deep_merge(CONSOLE_DEFAULTS, raw)
       end
 
+      # An absent or null `history:` gets the full default set. A present Hash
+      # gets the defaults merged underneath it, and a relative database_path is
+      # made absolute against the supervisor config directory. A non-Hash value
+      # is passed through untouched so validate_history can report it.
+      def build_history(raw)
+        return raw unless raw.nil? || raw.is_a?(Hash)
+
+        history = deep_merge(HISTORY_DEFAULTS, raw || {})
+        path = history["database_path"]
+        if non_empty_string?(path)
+          begin
+            # Inside a rescue for the same reason as build_workflow: an
+            # unexpandable "~nosuchuser/x" raises ArgumentError, and that must
+            # become a collected problem, not a raw exception.
+            history["database_path"] = File.expand_path(path, @config_dir)
+          rescue ArgumentError => e
+            @history_path_error = e.message
+          end
+        end
+        history
+      end
+
       def validate!
         errors = []
 
@@ -244,6 +300,7 @@ module AgentDaemon
         end
 
         errors.concat(validate_console)
+        errors.concat(validate_history)
 
         raise AgentDaemon::ConfigError, errors.join("\n") unless errors.empty?
       end
@@ -457,6 +514,34 @@ module AgentDaemon
         (value - known_groups).map do |dead|
           "console.auth.roles.#{name} references group #{dead.inspect} which is not in allowed_groups in #{@config_path}"
         end
+      end
+
+      def validate_history
+        return ["history must be a mapping in #{@config_path}"] unless @history.is_a?(Hash)
+
+        errors = (@history.keys - HISTORY_DEFAULTS.keys).map do |key|
+          "history.#{key} is not a known key (expected one of: #{HISTORY_DEFAULTS.keys.join(', ')}) in #{@config_path}"
+        end
+        enabled = @history["enabled"]
+        unless [true, false].include?(enabled)
+          errors << "history.enabled must be true or false (got #{enabled.inspect}) in #{@config_path}"
+        end
+
+        path = @history["database_path"]
+        if !non_empty_string?(path)
+          errors << "history.database_path must be a non-empty string (got #{path.inspect}) in #{@config_path}"
+        elsif @history_path_error
+          errors << "history.database_path #{path.inspect} cannot be resolved: #{@history_path_error} in #{@config_path}"
+        end
+
+        HISTORY_RANGES.each do |key, range|
+          value = @history[key]
+          next if value.is_a?(Integer) && range.cover?(value)
+
+          errors << "history.#{key} must be an integer in #{range} (got #{value.inspect}) in #{@config_path}"
+        end
+
+        errors
       end
 
       def non_empty_string?(value)

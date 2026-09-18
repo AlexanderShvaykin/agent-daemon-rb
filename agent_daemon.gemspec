@@ -40,6 +40,12 @@ Gem::Specification.new do |spec|
   # not through a documented embedding contract. A new major may move any of it.
   spec.add_dependency "puma", ">= 6", "< 9"
   spec.add_dependency "rack", "~> 3"
+  # Supervisor history only (Epic 5, AD-5): required lazily inside
+  # AgentDaemon::Supervisor::History::Database.open, never from
+  # `require "agent_daemon"`. ">= 2.0, < 3" rather than "~> 2.9" because 2.9
+  # needs Ruby 3.2, and a hard pin would break `gem install` for core-only
+  # users on Ruby 3.0/3.1; Bundler still resolves 2.9 where Ruby allows it.
+  spec.add_dependency "sqlite3", ">= 2.0", "< 3"
 
   spec.add_development_dependency "minitest"
 end
