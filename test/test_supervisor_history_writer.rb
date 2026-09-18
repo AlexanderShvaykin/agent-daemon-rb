@@ -357,4 +357,34 @@ class TestSupervisorHistoryWriter < Minitest::Test
   ensure
     other&.close
   end
+
+  def test_a_stop_that_times_out_returns_false_and_keeps_the_cursor
+    bus = EventBus.new
+    w = writer(bus: bus, poll_interval: 0.05)
+    other = SQLite3::Database.new(@path)
+    other.execute("BEGIN IMMEDIATE")
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z", bus: bus)
+    w.start
+    sleep 0.2 # the writer is now waiting on the lock
+
+    refute w.stop(timeout: 0.1)
+    assert_equal 0, bus.dropped(w.instance_variable_get(:@cursor)), "the cursor must stay subscribed"
+
+    other.execute("ROLLBACK")
+    assert w.stop(timeout: 5)
+    assert_equal 1, count("run")
+    assert_raises(KeyError) { bus.dropped(w.instance_variable_get(:@cursor)) }
+  ensure
+    other&.close
+  end
+
+  def test_the_final_drain_commits_what_was_published_while_the_writer_slept
+    bus = EventBus.new
+    w = writer(bus: bus, poll_interval: 0.5).start
+    sleep 0.01 until w.thread.status == "sleep" # first (empty) drain done
+
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z", bus: bus)
+    assert w.stop(timeout: 5)
+    assert_equal 1, count("run")
+  end
 end

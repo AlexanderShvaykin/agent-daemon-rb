@@ -1405,6 +1405,26 @@ class TestSupervisorMaster < Minitest::Test
     end
   end
 
+  # The writer's final drain must see what entities publish while they are
+  # finalized (a killed run's `finished`), so it stops only after them.
+  def test_an_event_published_while_entities_are_finalized_is_persisted
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      identity = AgentDaemon::Supervisor::RunnerIdentity.new(workflow: "wf", runner: "a")
+      stamp = AgentDaemon::Supervisor::GenerationStamp.new(1, master.event_bus)
+      master.define_singleton_method(:finalize_supervisors) do
+        super()
+        stamp.publish(identity, type: :finished, work_item: "TI-1", reason: :killed, attempt: 1,
+                                at: "2026-09-19T10:00:00Z")
+      end
+      boot_and_shut_down(master)
+
+      db = SQLite3::Database.new(File.join(dir, "history", "history.sqlite3"))
+      assert_equal [["TI-1", "killed"]], db.execute("SELECT work_item, reason FROM run")
+      db.close
+    end
+  end
+
   def test_a_writer_that_fails_to_build_degrades_history_and_the_fleet_still_supervises
     with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
       store = nil
