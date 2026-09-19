@@ -66,8 +66,13 @@ module AgentDaemon
 
       # Builds the single history writer (Story 5.2). Injectable so a test can
       # make it fail on purpose and watch history degrade without the fleet.
-      HISTORY_WRITER_FACTORY = lambda do |database, event_bus, roster, history_config|
+      # The writer also observes the output pipeline (Story 5.4) and caps each
+      # run's stored output at the live buffer's output_buffer_bytes.
+      HISTORY_WRITER_FACTORY = lambda do |database, event_bus, output_pipeline, roster, supervisor_config|
+        history_config = supervisor_config.history
         History::Writer.new(database: database, event_bus: event_bus, roster: roster,
+                            output_pipeline: output_pipeline,
+                            output_buffer_bytes: supervisor_config.output_buffer_bytes,
                             retry_count: history_config["write_retry_count"],
                             backoff_ceiling_ms: history_config["write_retry_backoff_ceiling_ms"])
       end
@@ -282,11 +287,12 @@ module AgentDaemon
       end
 
       # The roster is complete here (build_factories ran first), and the
-      # writer subscribes in its constructor, so every event any entity
-      # publishes is in its backlog. A writer that cannot be built or started
-      # degrades history like an open failure does.
+      # writer subscribes to the bus and the output pipeline in its
+      # constructor, so every event and line any entity publishes reaches it.
+      # A writer that cannot be built or started degrades history like an
+      # open failure does.
       def start_history_writer
-        writer = @history_writer_factory.call(@history, @event_bus, @roster, @config.history)
+        writer = @history_writer_factory.call(@history, @event_bus, @output_pipeline, @roster, @config)
         writer.start
         @history_writer = writer
       rescue StandardError, ScriptError => e

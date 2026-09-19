@@ -1396,9 +1396,10 @@ class TestSupervisorMaster < Minitest::Test
     with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
       seen = nil
       master = nil
-      factory = lambda do |database, event_bus, roster, history_config|
+      factory = lambda do |database, event_bus, output_pipeline, roster, supervisor_config|
         seen = { supervisors: master.instance_variable_get(:@supervisors).size, roster: roster.size }
-        AgentDaemon::Supervisor::Master::HISTORY_WRITER_FACTORY.call(database, event_bus, roster, history_config)
+        AgentDaemon::Supervisor::Master::HISTORY_WRITER_FACTORY.call(database, event_bus, output_pipeline, roster,
+                                                                     supervisor_config)
       end
       master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, history_writer_factory: factory)
       boot_and_shut_down(master)
@@ -1423,6 +1424,35 @@ class TestSupervisorMaster < Minitest::Test
 
       db = SQLite3::Database.new(File.join(dir, "history", "history.sqlite3"))
       assert_equal [["TI-1", "killed"]], db.execute("SELECT work_item, reason FROM run")
+      db.close
+    end
+  end
+
+  # Story 5.4: the writer observes the master's own pipeline, so a runner's
+  # line reaches the store without any change to the producer path.
+  def test_a_runners_output_line_through_the_masters_pipeline_is_persisted
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      identity = AgentDaemon::Supervisor::RunnerIdentity.new(workflow: "wf", runner: "a")
+      stamp = AgentDaemon::Supervisor::GenerationStamp.new(1, master.event_bus)
+      ingress = master.output_pipeline.ingress(1)
+      master.define_singleton_method(:finalize_supervisors) do
+        super()
+        stamp.publish(identity, type: :picked_up, work_item: "TI-1", at: "2026-09-19T10:00:00Z")
+        stamp.publish(identity, type: :started, work_item: "TI-1", attempt: 1, at: "2026-09-19T10:00:01Z")
+        ingress.begin_run(identity, 1)
+        ingress.append(identity, :stderr, "boom\n")
+        ingress.end_run(identity, 1, :failed)
+        stamp.publish(identity, type: :finished, work_item: "TI-1", reason: :failed, attempt: 1,
+                                at: "2026-09-19T10:00:02Z")
+      end
+      boot_and_shut_down(master)
+
+      assert_equal config.output_buffer_bytes, master.history_writer.instance_variable_get(:@output_buffer_bytes)
+      db = SQLite3::Database.new(File.join(dir, "history", "history.sqlite3"))
+      assert_equal [%w[stderr boom]], db.execute("SELECT stream, text FROM run_output")
+      assert_equal '{"reason":"failed","attempt":1,"last_stderr":"boom"}',
+                   db.get_first_value("SELECT error_summary FROM run")
       db.close
     end
   end
@@ -1554,7 +1584,7 @@ class TestSupervisorMaster < Minitest::Test
       before = schema.call(db)
       assert_equal AgentDaemon::Supervisor::History::Schema::LATEST, db.get_first_value("PRAGMA user_version")
       db.close
-      assert_equal %w[restart_action run run_event supervised_entity],
+      assert_equal %w[restart_action run run_event run_output supervised_entity],
                    before.select { |type, _, _| type == "table" }.map { |_, name, _| name }
 
       second = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)

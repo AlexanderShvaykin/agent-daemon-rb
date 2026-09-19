@@ -36,6 +36,19 @@ module AgentDaemon
           # crashed master, or displaced by a newer run of its entity).
           [2, [
             "ALTER TABLE run ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0 CHECK (incomplete IN (0,1))"
+          ].freeze],
+          # Story 5.4: bounded redacted output per run, the flags for a
+          # dropped beginning (truncated) and a capture hole (incomplete), and
+          # the JSON error summary of a failed run.
+          [3, [
+            <<~SQL,
+              CREATE TABLE run_output (id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL, stream TEXT NOT NULL CHECK (stream IN ('stdout','stderr')), text TEXT NOT NULL,
+                UNIQUE (run_id, seq))
+            SQL
+            "ALTER TABLE run ADD COLUMN output_truncated INTEGER NOT NULL DEFAULT 0 CHECK (output_truncated IN (0,1))",
+            "ALTER TABLE run ADD COLUMN output_incomplete INTEGER NOT NULL DEFAULT 0 CHECK (output_incomplete IN (0,1))",
+            "ALTER TABLE run ADD COLUMN error_summary TEXT"
           ].freeze]
         ].freeze
 

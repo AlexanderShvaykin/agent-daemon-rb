@@ -700,7 +700,35 @@ rather than `busy_timeout`, which would freeze every runner thread for the
 wait. On shutdown the writer drains once more and is given
 `shutdown_flush_seconds`; if it finishes the store is closed, otherwise the
 master logs the number of accepted records still unflushed and leaves the
-store open for process exit. The metrics exporter remains assigned to Epic 6.
+store open for process exit.
+
+Schema v3 (Story 5.4) adds agent output and error detail. The writer also
+observes the `OutputPipeline` — the same redacted stream the live tail reads;
+never the `OutputBuffers` ring and never a second capture — through a
+`History::OutputQueue`: an in-memory, mutex-guarded append that does no IO, so
+a writer waiting on the SQLite lock never makes `OutputPipeline#append` wait.
+The queue holds at most `output_buffer_bytes × roster size` text bytes; over
+budget its oldest line becomes a `:lost` marker (lifecycle markers are never
+evicted), which sets the run's `output_incomplete = 1`. Each writer iteration
+reads the bus first, then drains the queue, so a `finished` in a batch has all
+of its run's lines in that batch: an entity's pending output is flushed before
+each of its lifecycle records, and a run's terminal-drain lines commit in the
+same transaction that sets `finished_at`, never after. A pipeline run binds to
+the entity's open run once that run's `started` is applied; a `finished` whose
+`started` was evicted adopts the fully pending pipeline run of its generation;
+a pipeline run that still cannot bind after two batches is dropped with one
+`[History] gap:` warn (a count, never text). Lines land in `run_output
+(run_id, seq, stream, text)` with `UNIQUE (run_id, seq)` and `INSERT OR
+IGNORE`, so a retried batch stores each line once. Each run keeps at most
+`output_buffer_bytes` of text, the same limit as the live buffer: the oldest
+rows are deleted first, never the newest, and `output_truncated = 1` records
+the lost beginning. A run with no output has no rows. A `failed` run gets
+`error_summary = {"reason":"failed","attempt":N,"last_stderr":<last stored
+stderr line or null>}`, built from event fields and stored rows only; other
+reasons leave it NULL. `last_stderr` is the last *retained* stderr line: once
+`output_truncated` or `output_incomplete` is set it can be older than the real
+last line, or null. The per-run cap bounds each run, not the store: total
+growth is bounded only by retention (Story 5.6). The metrics exporter remains assigned to Epic 6.
 
 ### Layout
 

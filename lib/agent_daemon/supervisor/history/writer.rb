@@ -5,6 +5,7 @@ require "time"
 
 require_relative "../../log"
 require_relative "../runner_identity"
+require_relative "output_queue"
 
 module AgentDaemon
   module Supervisor
@@ -41,6 +42,28 @@ module AgentDaemon
       # - Bounded shutdown: #unflushed_count tells the master what a missed
       #   flush deadline leaves behind.
       #
+      # Story 5.4 output:
+      # - Source: an OutputQueue subscribed to the OutputPipeline, the same
+      #   redacted stream the live tail reads. Producers only append to it in
+      #   memory; it evicts its oldest lines over budget and leaves a :lost
+      #   marker, which sets the run's output_incomplete.
+      # - Merge: each iteration reads the bus first, then drains the queue.
+      #   Drained entries join the per-entity pending output, which is part of
+      #   the batch (snapshotted and restored with the other maps, re-applied
+      #   by a retry). An entity's pending output is flushed before each of
+      #   its lifecycle records and at the end of every batch, so a run's
+      #   lines commit in the same transaction as its finished, never after.
+      # - Binding: a pipeline run binds to the entity's open run once that
+      #   run's started is applied, at most once per run. A finished that
+      #   closes a never-bound run (its started was evicted) adopts a fully
+      #   pending pipeline run of the same generation. A run_started that
+      #   still cannot bind at the end of the second batch that carried it is
+      #   an orphan and is dropped with its lines (one gap warn).
+      # - Cap: each run keeps at most output_buffer_bytes of text; the oldest
+      #   rows go first, never the newest one, and output_truncated is set.
+      # - A failed run gets a JSON error_summary: reason, attempt and the
+      #   last stored stderr line.
+      #
       # Log lines carry counts, seqs, attempts and delays, never field values;
       # every value reaches SQLite through bind parameters.
       #
@@ -50,14 +73,16 @@ module AgentDaemon
         THREAD_NAME = "history_writer"
         LIFECYCLE_TYPES = %i[picked_up started finished].freeze
         REASONS = %w[ok failed timeout killed].freeze
+        STREAMS = %w[stdout stderr].freeze
 
         # A record that cannot be stored; skipped with one warn line.
         class Skip < StandardError; end
 
         attr_reader :thread
 
-        def initialize(database:, event_bus:, roster:, poll_interval: 0.5, retry_count: 3,
-                       backoff_ceiling_ms: 2_000, sleeper: ->(seconds) { sleep(seconds) })
+        def initialize(database:, event_bus:, roster:, output_pipeline: nil, output_buffer_bytes: 262_144,
+                       poll_interval: 0.5, retry_count: 3, backoff_ceiling_ms: 2_000,
+                       sleeper: ->(seconds) { sleep(seconds) })
           @db = database.db
           @event_bus = event_bus
           @poll_interval = poll_interval
@@ -72,9 +97,25 @@ module AgentDaemon
           @open_runs = {}
           @entity_ids = {}
           @watermark = 0
+          @output_buffer_bytes = output_buffer_bytes
+          # entity_key => frozen Array of queue entries, FIFO. The Hash itself
+          # is frozen and replaced, so #unflushed_count can read it from
+          # another thread.
+          @pending = {}.freeze
+          # entity_key => frozen { generation:, pipeline_run:, run_row: }
+          @bindings = {}
+          # [entity_key, generation, pipeline_run] => batch ends a blocked
+          # run_started has waited through.
+          @waits = {}
+          @inflight_output = nil
+          # Run rows still bound when a batch carrying their output was lost;
+          # the next committed batch marks them output_incomplete.
+          @lost_runs = [].freeze
           @stopping = false
           @thread = nil
           @cursor = event_bus.subscribe(from: :backlog)
+          @output_queue = OutputQueue.new(budget_bytes: output_buffer_bytes * [roster.size, 1].max)
+          output_pipeline&.subscribe(@output_queue)
         end
 
         def start
@@ -105,32 +146,43 @@ module AgentDaemon
         end
 
         # The in-flight batch plus every bus record past it (or past the last
-        # settled seq when nothing is in flight).
+        # settled seq when nothing is in flight), plus the output entries in
+        # flight, pending, and still queued.
         def unflushed_count
           inflight = @inflight
+          inflight_output = @inflight_output
           settled = @settled
           past = inflight ? inflight.last[:seq] : settled
-          (inflight ? inflight.size : 0) + @event_bus.records.count { |record| record[:seq] > past }
+          (inflight ? inflight.size : 0) + @event_bus.records.count { |record| record[:seq] > past } +
+            (inflight_output ? inflight_output.size : 0) + pending_size + @output_queue.size
         end
 
-        # Applies records in one transaction. Returns true when the batch
-        # committed (or had nothing new), false when it was rolled back. One
-        # attempt only: the thread's retry wrapper re-applies it.
-        def write(records)
+        # Applies records, and the output entries drained with them, in one
+        # transaction. Returns true when the batch committed (or had nothing
+        # new), false when it was rolled back. One attempt only: the thread's
+        # retry wrapper re-applies it.
+        def write(records, output = [])
           fresh = records.select { |record| record[:seq] > @watermark }
-          return true if fresh.empty?
+          return true if fresh.empty? && output.empty? && @pending.empty? && @lost_runs.empty?
 
-          saved = [@open_runs.dup, @entity_ids.dup, @watermark]
+          saved = [@open_runs.dup, @entity_ids.dup, @watermark, @pending, @bindings.dup, @waits.dup, @lost_runs]
+          @dropped_lines = 0
+          @orphans = 0
           begin
             @db.transaction(:immediate) do
+              mark_lost_runs
+              enqueue(output)
               fresh.each { |record| apply(record) }
-              @watermark = fresh.last[:seq]
+              finish_batch
+              @watermark = fresh.last[:seq] unless fresh.empty?
             end
+            log_dropped_output
             true
           rescue StandardError => e
-            @open_runs, @entity_ids, @watermark = saved
+            @open_runs, @entity_ids, @watermark, @pending, @bindings, @waits, @lost_runs = saved
             rollback_quietly
-            Log.error("[History] failed to write a batch of #{fresh.size} record(s): #{e.class}: #{e.message}")
+            also = output.empty? ? "" : " and #{output.size} output entr(ies)"
+            Log.error("[History] failed to write a batch of #{fresh.size} record(s)#{also}: #{e.class}: #{e.message}")
             false
           end
         end
@@ -152,21 +204,48 @@ module AgentDaemon
 
             sleep(@poll_interval)
           end
+          left = pending_size
+          Log.warn("[History] gap: dropped #{left} pending output entr(ies) at stop") if left.positive?
         end
 
+        # The bus is read before the queue is drained: every line in this
+        # drain was produced after its run's started was published, so a
+        # finished in this batch has all of its run's lines here too.
         def drain
           batch = @cursor.read
           note_evictions
-          return if batch.empty?
+          output = @output_queue.drain
+          return if batch.empty? && output.empty? && @pending.empty?
 
-          @inflight = batch
-          unless with_retries { write(batch) }
-            @degraded = true
-            Log.error("[History] gap: lost #{batch.size} record(s), seq #{batch.first[:seq]}..#{batch.last[:seq]}, " \
-                      "after #{@retry_count} retries")
-          end
-          @settled = batch.last[:seq]
+          @inflight = batch unless batch.empty?
+          @inflight_output = output
+          lose_batch(batch, output) unless with_retries { write(batch, output) }
+          @settled = batch.last[:seq] unless batch.empty?
           @inflight = nil
+          @inflight_output = nil
+        end
+
+        # The pending output was part of every rejected attempt, so it is lost
+        # with the batch; keeping it would re-fail every later iteration.
+        def lose_batch(batch, output)
+          @degraded = true
+          @lost_runs = (@lost_runs + @bindings.values.map { |binding| binding[:run_row] }).uniq.freeze
+          lost_output = output.size + pending_size
+          @pending = {}.freeze
+          @waits = {}
+          lost = []
+          lost << "#{batch.size} record(s), seq #{batch.first[:seq]}..#{batch.last[:seq]}" unless batch.empty?
+          lost << "#{lost_output} output entr(ies)" if lost_output.positive?
+          Log.error("[History] gap: lost #{lost.join(' and ')}, after #{@retry_count} retries")
+        end
+
+        def mark_lost_runs
+          @lost_runs.each { |run_row| @db.execute("UPDATE run SET output_incomplete = 1 WHERE id = ?", [run_row]) }
+          @lost_runs = [].freeze
+        end
+
+        def pending_size
+          @pending.sum { |_key, entries| entries.size }
         end
 
         # dropped is cumulative per cursor; only the delta is new.
@@ -231,18 +310,34 @@ module AgentDaemon
 
         def apply_lifecycle(record)
           entity_key, rostered = rostered_for(record)
+          flush(entity_key)
           generation = required_generation(record)
           at = timestamp(record[:at], "at")
           entity_id = entity_row_id(entity_key, rostered, at)
           run = run_for(entity_key, entity_id, generation, record, at)
           @db.execute("INSERT INTO run_event (run_id, seq, event, reason, occurred_at) VALUES (?, ?, ?, ?, ?)",
                       [run[:id], record[:seq], record[:type].to_s, reason(record), at])
+          # Replaced, never mutated: the rollback snapshot is a shallow dup.
+          @open_runs[entity_key] = run.merge(started: true).freeze if record[:type] == :started && !run[:started]
           return unless record[:type] == :finished
 
-          @db.execute("UPDATE run SET finished_at = ?, reason = ? WHERE id = ?", [at, reason(record), run[:id]])
+          adopt_pending_run(entity_key, run, generation) unless run[:bound]
+          @db.execute("UPDATE run SET finished_at = ?, reason = ?, error_summary = ? WHERE id = ?",
+                      [at, reason(record), error_summary(record, run), run[:id]])
+          unbind(entity_key, run)
           # Only when this finished closed the open run itself: a finished that
           # opened its own run must not displace it.
           @open_runs.delete(entity_key) if @open_runs[entity_key].equal?(run)
+        end
+
+        # Built from structured fields and stored rows only, never from logs.
+        def error_summary(record, run)
+          return nil unless reason(record) == "failed"
+
+          attempt = @db.get_first_value("SELECT attempt FROM run WHERE id = ?", [run[:id]])
+          last_stderr = @db.get_first_value("SELECT text FROM run_output WHERE run_id = ? AND stream = 'stderr' " \
+                                            "ORDER BY seq DESC LIMIT 1", [run[:id]])
+          JSON.generate({ "reason" => "failed", "attempt" => attempt, "last_stderr" => last_stderr })
         end
 
         def reason(record)
@@ -271,8 +366,175 @@ module AgentDaemon
           # shallow dup.
           return run if record[:type] == :finished
 
-          @db.execute("UPDATE run SET incomplete = 1 WHERE id = ?", [open[:id]]) if open
+          if open
+            @db.execute("UPDATE run SET incomplete = 1 WHERE id = ?", [open[:id]])
+            unbind(entity_key, open)
+          end
           @open_runs[entity_key] = run
+        end
+
+        # --- Output (Story 5.4) -------------------------------------------------
+
+        # Entries of an entity outside the roster have nowhere to go.
+        def enqueue(output)
+          return if output.empty?
+
+          pending = @pending.dup
+          output.group_by { |entry| RunnerIdentity.key_for(entry[:entity_id]) }.each do |entity_key, entries|
+            if @roster.key?(entity_key)
+              pending[entity_key] = ((pending[entity_key] || []) + entries).freeze
+            else
+              @dropped_lines += entries.count { |entry| entry[:kind] == :output }
+            end
+          end
+          @pending = pending.freeze
+        end
+
+        # Processes an entity's pending entries in order until a run_started
+        # that cannot bind yet, or (with through:) until that pipeline run's
+        # run_finished.
+        def flush(entity_key, through: nil)
+          entries = @pending[entity_key]
+          return if entries.nil?
+
+          touched = {}
+          index = 0
+          while index < entries.size
+            entry = entries[index]
+            binding = @bindings[entity_key]
+            bound = !binding.nil? && binding[:generation] == entry[:generation] &&
+                    binding[:pipeline_run] == entry[:run_id]
+            case entry[:kind]
+            when :run_started
+              break unless bind(entity_key, entry)
+            when :output
+              if bound && store_line(binding[:run_row], entry)
+                touched[binding[:run_row]] = true
+              else
+                @dropped_lines += 1
+              end
+            when :lost
+              @db.execute("UPDATE run SET output_incomplete = 1 WHERE id = ?", [binding[:run_row]]) if bound
+            when :run_finished
+              @bindings.delete(entity_key) if bound
+            end
+            index += 1
+            break if through && entry[:kind] == :run_finished && same_pipeline_run?(entry, through)
+          end
+          set_pending(entity_key, entries.drop(index)) if index.positive?
+          touched.each_key { |run_row| cap(run_row) }
+        end
+
+        # A pipeline run belongs to the open run once that run's started is
+        # applied, and each run takes exactly one pipeline run.
+        def bind(entity_key, entry)
+          open = @open_runs[entity_key]
+          return false unless open && open[:started] && !open[:bound] && open[:generation] == entry[:generation]
+
+          @open_runs[entity_key] = open.merge(bound: true).freeze
+          @bindings[entity_key] = { generation: entry[:generation], pipeline_run: entry[:run_id],
+                                    run_row: open[:id] }.freeze
+          true
+        end
+
+        def unbind(entity_key, run)
+          @bindings.delete(entity_key) if @bindings[entity_key]&.fetch(:run_row) == run[:id]
+        end
+
+        # A finished closing a run nothing was bound to (its started was
+        # evicted): the pending pipeline run of the same generation, complete
+        # through its run_finished, is this run's output.
+        def adopt_pending_run(entity_key, run, generation)
+          entries = @pending[entity_key]
+          head = entries&.first
+          return unless head && head[:kind] == :run_started && head[:generation] == generation
+          return unless entries.any? { |entry| entry[:kind] == :run_finished && same_pipeline_run?(entry, head) }
+
+          @bindings[entity_key] = { generation: generation, pipeline_run: head[:run_id], run_row: run[:id] }.freeze
+          set_pending(entity_key, entries.drop(1))
+          flush(entity_key, through: head)
+        end
+
+        def same_pipeline_run?(entry, other)
+          entry[:generation] == other[:generation] && entry[:run_id] == other[:run_id]
+        end
+
+        def store_line(run_row, entry)
+          stream = entry[:stream].to_s
+          return false unless STREAMS.include?(stream)
+
+          @db.execute("INSERT OR IGNORE INTO run_output (run_id, seq, stream, text) VALUES (?, ?, ?, ?)",
+                      [run_row, entry[:seq], stream, entry[:text]])
+          true
+        end
+
+        # Oldest rows first, never the newest one: a single line over the cap
+        # is kept whole.
+        def cap(run_row)
+          total = @db.get_first_value("SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) FROM run_output " \
+                                      "WHERE run_id = ?", [run_row])
+          return if total <= @output_buffer_bytes
+
+          sizes = @db.execute("SELECT seq, length(CAST(text AS BLOB)) FROM run_output WHERE run_id = ? ORDER BY seq",
+                              [run_row])
+          cut = nil
+          sizes[0...-1].each do |seq, bytes|
+            break if total <= @output_buffer_bytes
+
+            total -= bytes
+            cut = seq
+          end
+          return if cut.nil?
+
+          @db.execute("DELETE FROM run_output WHERE run_id = ? AND seq <= ?", [run_row, cut])
+          @db.execute("UPDATE run SET output_truncated = 1 WHERE id = ?", [run_row])
+        end
+
+        def set_pending(entity_key, entries)
+          @pending = if entries.empty?
+                       @pending.reject { |key, _| key == entity_key }.freeze
+                     else
+                       @pending.merge(entity_key => entries.freeze).freeze
+                     end
+        end
+
+        # Flushes every entity, then ages each blocked run_started once. One
+        # that has now waited through two batch ends is an orphan: it is
+        # dropped with its pipeline run's entries, and what follows it is
+        # flushed.
+        def finish_batch
+          waits = {}
+          @pending.each_key do |entity_key|
+            loop do
+              flush(entity_key)
+              head = @pending[entity_key]&.first
+              break if head.nil?
+
+              wait_key = [entity_key, head[:generation], head[:run_id]]
+              waited = @waits.fetch(wait_key, 0) + 1
+              if waited < 2
+                waits[wait_key] = waited
+                break
+              end
+
+              drop_orphan(entity_key, head)
+            end
+          end
+          @waits = waits
+        end
+
+        def drop_orphan(entity_key, head)
+          orphaned, kept = @pending[entity_key].partition { |entry| same_pipeline_run?(entry, head) }
+          @orphans += 1
+          @dropped_lines += orphaned.count { |entry| entry[:kind] == :output }
+          set_pending(entity_key, kept)
+        end
+
+        def log_dropped_output
+          return unless @dropped_lines.positive? || @orphans.positive?
+
+          Log.warn("[History] gap: dropped #{@dropped_lines} output line(s) no run could claim " \
+                   "(#{@orphans} unclaimed run start(s))")
         end
 
         def apply_restart(record)

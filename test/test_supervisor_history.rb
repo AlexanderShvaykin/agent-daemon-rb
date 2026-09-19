@@ -13,7 +13,7 @@ class TestSupervisorHistory < Minitest::Test
 
   Database = AgentDaemon::Supervisor::History::Database
   Schema = AgentDaemon::Supervisor::History::Schema
-  TABLES = %w[restart_action run run_event supervised_entity].freeze
+  TABLES = %w[restart_action run run_event run_output supervised_entity].freeze
 
   def setup
     stub_null_logger!
@@ -60,6 +60,8 @@ class TestSupervisorHistory < Minitest::Test
     assert_equal Schema::LATEST, store.schema_version
     assert_equal Schema::LATEST, store.db.get_first_value("PRAGMA user_version")
     assert_equal TABLES, tables(store.db)
+    unique = store.db.execute("PRAGMA index_list(run_output)").select { |index| index[2] == 1 }
+    assert_equal [%w[run_id seq]], unique.map { |index| store.db.execute("PRAGMA index_info(#{index[1]})").map { |c| c[2] } }
     assert_equal "wal", store.db.get_first_value("PRAGMA journal_mode")
     assert_equal 1000, store.busy_timeout_ms
     assert_equal 1, store.db.get_first_value("PRAGMA foreign_keys")
@@ -199,11 +201,37 @@ class TestSupervisorHistory < Minitest::Test
       store.db.execute("INSERT INTO run (entity_id, generation) VALUES (1, 1)")
     end.close
 
-    store = open_store
+    store = open_store(migrations: Schema::MIGRATIONS.first(2))
 
     assert_equal 2, store.schema_version
     assert_equal [0], store.db.execute("SELECT incomplete FROM run").flatten
     assert_raises(SQLite3::ConstraintException) { store.db.execute("UPDATE run SET incomplete = 2") }
+  end
+
+  # Story 5.4: v3 adds run_output and the run's output columns; a v2 store's
+  # runs default to flags 0 and no summary, and reopening runs no DDL.
+  def test_a_v2_store_migrates_to_v3_once
+    open_store(migrations: Schema::MIGRATIONS.first(2)).tap do |store|
+      store.db.execute("INSERT INTO supervised_entity (entity_key, kind, first_seen_at) " \
+                       "VALUES ('messenger:wf', 'messenger', '2026-09-19T00:00:00Z')")
+      store.db.execute("INSERT INTO run (entity_id, generation) VALUES (1, 1)")
+    end.close
+
+    store = open_store
+    assert_equal 3, store.schema_version
+    assert_equal [[0, 0, nil]], store.db.execute("SELECT output_truncated, output_incomplete, error_summary FROM run")
+    store.db.execute("INSERT INTO run_output (run_id, seq, stream, text) VALUES (1, 1, 'stdout', 'x')")
+    assert_raises(SQLite3::ConstraintException) do
+      store.db.execute("INSERT INTO run_output (run_id, seq, stream, text) VALUES (1, 1, 'stderr', 'y')")
+    end
+    assert_raises(SQLite3::ConstraintException) do
+      store.db.execute("INSERT INTO run_output (run_id, seq, stream, text) VALUES (1, 2, 'stdin', 'y')")
+    end
+    store.close
+
+    store = open_store(migrations: Schema::MIGRATIONS.first(2) + [[3, ["THIS IS NOT SQL"]]])
+    assert_equal 3, store.schema_version
+    assert_equal 1, store.db.get_first_value("SELECT COUNT(*) FROM run_output")
   end
 
   def test_pending_migrations_apply_on_top_of_an_older_version

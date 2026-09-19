@@ -58,8 +58,17 @@ workflows:
 # crashed master left open are marked incomplete (never given an invented
 # result) by the next master. shutdown_flush_seconds is how long shutdown
 # waits for the writer's final drain; past it, the count of unflushed records
-# is logged. page_size and the retention keys are validated now so a typo
-# fails at load; later releases read them.
+# is logged.
+#
+# The writer also stores each run's redacted agent output (the same lines the
+# live tail shows), capped per run at output_buffer_bytes above: the oldest
+# lines are dropped first and the run is flagged truncated. Lines the writer
+# could not keep up with are dropped from its bounded in-memory queue and the
+# run is flagged incomplete. A failed run also gets a JSON error summary
+# (reason, attempt, last stderr line).
+#
+# page_size and the retention keys are validated now so a typo fails at load;
+# later releases read them.
 #
 # history:
 #   enabled: true                          # default true

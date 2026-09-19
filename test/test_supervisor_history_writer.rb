@@ -12,6 +12,8 @@ require "agent_daemon/supervisor/history/writer"
 require "agent_daemon/supervisor/event_bus"
 require "agent_daemon/supervisor/runner_supervisor"
 require "agent_daemon/supervisor/fleet"
+require "agent_daemon/supervisor/output_pipeline"
+require "agent_daemon/supervisor/redactor"
 require "sqlite3"
 
 class TestSupervisorHistoryWriter < Minitest::Test
@@ -23,6 +25,8 @@ class TestSupervisorHistoryWriter < Minitest::Test
   GenerationStamp = AgentDaemon::Supervisor::GenerationStamp
   Rostered = AgentDaemon::Supervisor::Fleet::Rostered
   RunnerIdentity = AgentDaemon::Supervisor::RunnerIdentity
+  OutputPipeline = AgentDaemon::Supervisor::OutputPipeline
+  Redactor = AgentDaemon::Supervisor::Redactor
 
   TIMESTAMP = /\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z\z/
   RUNNER = RunnerIdentity.new(workflow: "wf", runner: "a")
@@ -632,5 +636,361 @@ class TestSupervisorHistoryWriter < Minitest::Test
     w.thread.kill.join
 
     assert w.degraded?
+  end
+
+  # --- Story 5.4: output and error summaries --------------------------------
+
+  def pipeline(secrets = [])
+    @pipeline = OutputPipeline.new(redactor: Redactor.new(secrets))
+  end
+
+  def output_writer(store = @store, **kwargs)
+    writer(store, output_pipeline: @pipeline || pipeline, **kwargs)
+  end
+
+  def queued(writer)
+    writer.instance_variable_get(:@output_queue).drain
+  end
+
+  def say(text, stream: :stdout, generation: 1)
+    @pipeline.append(RUNNER, stream, "#{text}\n", generation)
+  end
+
+  # Producer order: started (bus), begin_run, lines, end_run, finished (bus).
+  def output_run(key, lines, reason: :ok, attempt: 1, run_id: 1, generation: 1, bus: @source)
+    publish(RUNNER, generation, type: :picked_up, work_item: key, at: "2026-09-19T10:00:00Z", bus: bus)
+    publish(RUNNER, generation, type: :started, work_item: key, attempt: attempt, at: "2026-09-19T10:00:01Z", bus: bus)
+    @pipeline.begin_run(RUNNER, run_id, generation)
+    lines.each { |stream, text| say(text, stream: stream, generation: generation) }
+    @pipeline.end_run(RUNNER, run_id, reason, generation)
+    publish(RUNNER, generation, type: :finished, work_item: key, reason: reason, attempt: attempt,
+                                at: "2026-09-19T10:00:05Z", bus: bus)
+  end
+
+  def output_rows
+    rows("SELECT seq, stream, text FROM run_output ORDER BY run_id, seq")
+  end
+
+  def output_flags
+    rows("SELECT output_truncated, output_incomplete, error_summary FROM run ORDER BY id")
+  end
+
+  def test_schema_v3_adds_run_output_and_the_run_output_columns
+    run_columns = rows("PRAGMA table_info(run)").map { |column| column[1] }
+    assert_equal %w[output_truncated output_incomplete error_summary], run_columns.last(3)
+    assert_equal %w[id run_id seq stream text], rows("PRAGMA table_info(run_output)").map { |column| column[1] }
+  end
+
+  def test_a_run_with_output_stores_its_lines_in_order
+    w = output_writer
+    output_run("K", [[:stdout, "out1"], [:stderr, "err1"], [:stdout, "out2"]])
+
+    assert w.write(records, queued(w))
+
+    assert_equal [[1, "stdout", "out1"], [2, "stderr", "err1"], [3, "stdout", "out2"]], output_rows
+    assert_equal [[0, 0, nil]], output_flags
+  end
+
+  def test_output_is_persisted_incrementally_while_the_run_is_open
+    w = output_writer
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z")
+    publish(RUNNER, 1, type: :started, work_item: "K", attempt: 1, at: "2026-09-19T10:00:01Z")
+    @pipeline.begin_run(RUNNER, 1, 1)
+    say("one")
+    say("two")
+
+    assert w.write(records, queued(w))
+
+    reader = SQLite3::Database.new(@path)
+    assert_equal [%w[one], %w[two]], reader.execute("SELECT text FROM run_output ORDER BY seq")
+    assert_equal [nil], reader.execute("SELECT finished_at FROM run").flatten
+
+    @pipeline.end_run(RUNNER, 1, :ok, 1)
+    publish(RUNNER, 1, type: :finished, work_item: "K", reason: :ok, attempt: 1, at: "2026-09-19T10:00:05Z")
+    assert w.write(records, queued(w))
+    assert_equal 2, reader.get_first_value("SELECT COUNT(*) FROM run_output")
+  ensure
+    reader&.close
+  end
+
+  def test_a_failed_run_gets_a_json_error_summary
+    w = output_writer
+    output_run("K", [[:stdout, "out1"], [:stderr, "err1"], [:stdout, "out2"]], reason: :failed, attempt: 2)
+
+    assert w.write(records, queued(w))
+
+    summary = rows("SELECT error_summary FROM run").flatten.first
+    assert_equal({ "reason" => "failed", "attempt" => 2, "last_stderr" => "err1" }, JSON.parse(summary))
+    assert_includes output_rows, [2, "stderr", "err1"]
+  end
+
+  def test_a_failed_run_without_stderr_has_a_null_last_stderr
+    w = output_writer
+    output_run("K", [[:stdout, "out1"]], reason: :failed)
+
+    assert w.write(records, queued(w))
+
+    assert_equal({ "reason" => "failed", "attempt" => 1, "last_stderr" => nil },
+                 JSON.parse(rows("SELECT error_summary FROM run").flatten.first))
+  end
+
+  def test_terminal_drain_lines_commit_with_the_completion_never_after
+    failing = FailingDb.new(@store.db, fail_on: nil)
+    w = output_writer(FakeStore.new(failing))
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z")
+    publish(RUNNER, 1, type: :started, work_item: "K", attempt: 1, at: "2026-09-19T10:00:01Z")
+    @pipeline.begin_run(RUNNER, 1, 1)
+    say("first")
+    assert w.write(records, queued(w))
+
+    @pipeline.append(RUNNER, :stdout, "last words", 1) # no newline: end_run drains it
+    @pipeline.end_run(RUNNER, 1, :timeout, 1)
+    publish(RUNNER, 1, type: :finished, work_item: "K", reason: :timeout, attempt: 1, at: "2026-09-19T10:00:05Z")
+    batch = records
+    output = queued(w)
+    failing.fail_on = /\AUPDATE run SET finished_at/
+    refute w.write(batch, output)
+    assert_equal %w[first], rows("SELECT text FROM run_output").flatten, "the line must not commit without finished"
+
+    failing.fail_on = nil
+    assert w.write(batch, output)
+    assert_equal %w[first last\ words], rows("SELECT text FROM run_output ORDER BY seq").flatten
+    assert_equal [["timeout", nil]], rows("SELECT reason, error_summary FROM run")
+  end
+
+  def test_a_run_without_output_stores_no_rows
+    w = output_writer
+    output_run("K", [])
+
+    assert w.write(records, queued(w))
+
+    assert_equal 0, count("run_output")
+    assert_equal [[0, 0, nil]], output_flags
+  end
+
+  def test_a_known_secret_never_reaches_the_database_files
+    pipeline(["s3cr3t"])
+    w = output_writer
+    output_run("K", [[:stdout, "token=s3cr3t"]])
+
+    assert w.write(records, queued(w))
+
+    assert_equal ["token=[REDACTED]"], rows("SELECT text FROM run_output").flatten
+    ["", "-wal", "-shm"].each do |suffix|
+      path = "#{@path}#{suffix}"
+      refute_includes File.binread(path), "s3cr3t" if File.exist?(path)
+    end
+  end
+
+  def test_a_run_over_the_cap_keeps_its_newest_rows_and_is_truncated
+    w = output_writer(output_buffer_bytes: 20)
+    output_run("K", (1..4).map { |i| [:stdout, "line-00#{i}"] }) # 8 bytes each
+
+    assert w.write(records, queued(w))
+
+    assert_equal [3, 4], rows("SELECT seq FROM run_output ORDER BY seq").flatten
+    assert_equal [[1, 0, nil]], output_flags
+  end
+
+  def test_one_line_over_the_cap_is_kept_whole
+    w = output_writer(output_buffer_bytes: 20)
+    output_run("K", [[:stdout, "x" * 50]])
+
+    assert w.write(records, queued(w))
+
+    assert_equal ["x" * 50], rows("SELECT text FROM run_output").flatten
+    assert_equal [[0, 0, nil]], output_flags
+  end
+
+  def test_lines_evicted_from_the_queue_mark_the_capture_incomplete
+    w = output_writer(output_buffer_bytes: 20) # queue budget 60 with the 3-entity roster
+    output_run("K", (1..10).map { |i| [:stdout, format("line%04d", i)] }) # 8 bytes each
+
+    assert w.write(records, queued(w))
+
+    assert_equal [9, 10], rows("SELECT seq FROM run_output ORDER BY seq").flatten
+    assert_equal [[1, 1, nil]], output_flags
+  end
+
+  def test_a_retried_output_batch_stores_each_line_once
+    bus = EventBus.new
+    failing = FailingDb.new(@store.db, fail_on: /\AINSERT OR IGNORE INTO run_output/)
+    w = output_writer(FakeStore.new(failing), bus: bus, poll_interval: 0.05,
+                                              sleeper: ->(_seconds) { failing.fail_on = nil })
+    output_run("K", [[:stdout, "a"], [:stderr, "b"], [:stdout, "c"]], bus: bus)
+
+    log = capture_log do
+      w.start
+      assert w.stop(timeout: 5)
+    end
+
+    assert_equal [1, 2, 3], rows("SELECT seq FROM run_output ORDER BY seq").flatten
+    assert_equal 1, log.lines.grep(/\[History\].*failed to write/).size, log
+    assert_empty log.lines.grep(/gap:/)
+  end
+
+  def test_output_that_arrives_before_its_started_is_read_waits_one_batch
+    w = output_writer
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z")
+    first = records
+    publish(RUNNER, 1, type: :started, work_item: "K", attempt: 1, at: "2026-09-19T10:00:01Z")
+    @pipeline.begin_run(RUNNER, 1, 1)
+    say("early")
+
+    assert w.write(first, queued(w))
+    assert_equal 0, count("run_output")
+
+    assert w.write(records, queued(w))
+    assert_equal ["early"], rows("SELECT text FROM run_output").flatten
+  end
+
+  def test_output_of_a_run_whose_start_was_evicted_is_stored_on_the_run_finished_opened
+    bus = EventBus.new(capacity: 1)
+    w = output_writer(bus: bus, poll_interval: 0.05)
+    output_run("K", [[:stdout, "out1"], [:stderr, "err1"]], reason: :failed, bus: bus)
+
+    log = capture_log do
+      w.start
+      assert w.stop(timeout: 5)
+    end
+
+    assert_equal [["2026-09-19T10:00:05.000Z", "failed"]], rows("SELECT started_at, reason FROM run")
+    assert_equal [[1, "stdout", "out1"], [2, "stderr", "err1"]], output_rows
+    assert_equal({ "reason" => "failed", "attempt" => 1, "last_stderr" => "err1" },
+                 JSON.parse(rows("SELECT error_summary FROM run").flatten.first))
+    gaps = log.lines.grep(/\[History\] gap:/)
+    assert_equal 1, gaps.size, log
+    assert_includes gaps.first, "bus record(s) evicted"
+  end
+
+  def test_an_orphan_run_start_is_dropped_after_two_batches_and_a_later_run_binds_its_own
+    w = output_writer
+    log = capture_log do
+      @pipeline.begin_run(RUNNER, 1, 1)
+      say("nobody's")
+      assert w.write([], queued(w))
+      assert w.write([], queued(w))
+
+      output_run("L", [[:stdout, "mine"]], run_id: 2)
+      assert w.write(records, queued(w))
+    end
+
+    assert_equal [%w[L mine]], rows("SELECT work_item, text FROM run JOIN run_output ON run_output.run_id = run.id")
+    gaps = log.lines.grep(/\[History\] gap:/)
+    assert_equal 1, gaps.size, log
+    assert_includes gaps.first, "1 output line(s)"
+    refute_includes log, "nobody"
+  end
+
+  def test_a_writer_waiting_on_the_lock_never_makes_the_pipeline_wait
+    bus = EventBus.new
+    w = output_writer(bus: bus, poll_interval: 0.05)
+    other = SQLite3::Database.new(@path)
+    other.execute("BEGIN IMMEDIATE")
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z", bus: bus)
+    publish(RUNNER, 1, type: :started, work_item: "K", attempt: 1, at: "2026-09-19T10:00:01Z", bus: bus)
+    @pipeline.begin_run(RUNNER, 1, 1)
+    w.start
+    sleep 0.2 # the writer is now waiting on the lock
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    1000.times { |i| say("line #{i}") }
+    appending = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+    assert_operator appending, :<, 1.0, "appending 1,000 lines must not wait on SQLite"
+    assert_equal 0, other.get_first_value("SELECT COUNT(*) FROM run_output"), "the writer was still waiting"
+    other.execute("ROLLBACK")
+    assert w.stop(timeout: 5)
+    assert_equal 1000, count("run_output")
+  ensure
+    other&.close
+  end
+
+  def test_failing_output_writes_degrade_history_and_the_live_tail_keeps_its_lines
+    bus = EventBus.new
+    tail = []
+    pipeline.subscribe(->(record) { tail << record.text })
+    w = output_writer(FakeStore.new(FailingDb.new(@store.db, fail_on: /\AINSERT OR IGNORE INTO run_output/)),
+                      bus: bus, poll_interval: 0.05, retry_count: 0)
+    output_run("K", [[:stdout, "a"], [:stdout, "b"]], bus: bus)
+
+    log = capture_log do
+      w.start
+      assert w.stop(timeout: 5)
+    end
+
+    assert_equal %w[a b], tail
+    assert w.degraded?
+    gaps = log.lines.grep(/\[History\] gap:/)
+    assert_equal 1, gaps.size, log
+    assert_includes gaps.first, "output entr(ies)"
+    assert_equal 0, w.unflushed_count
+  end
+
+  def test_unflushed_count_includes_pending_and_queued_output
+    w = output_writer
+    @pipeline.begin_run(RUNNER, 1, 1)
+    say("waiting")
+    assert w.write([], queued(w)) # run_started cannot bind yet: 2 entries stay pending
+    say("queued")
+
+    assert_equal 3, w.unflushed_count
+  end
+
+  def test_a_lost_batch_marks_the_bound_run_incomplete_once_a_later_batch_commits
+    failing = FailingDb.new(@store.db, fail_on: nil)
+    w = output_writer(FakeStore.new(failing), retry_count: 0)
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z")
+    publish(RUNNER, 1, type: :started, work_item: "K", attempt: 1, at: "2026-09-19T10:00:01Z")
+    @pipeline.begin_run(RUNNER, 1, 1)
+    say("one")
+    assert w.write(records, queued(w))
+
+    say("two")
+    failing.fail_on = /\AINSERT OR IGNORE INTO run_output/
+    output = queued(w)
+    refute w.write([], output)
+    w.send(:lose_batch, [], output)
+    failing.fail_on = nil
+
+    say("three")
+    @pipeline.end_run(RUNNER, 1, :ok, 1)
+    publish(RUNNER, 1, type: :finished, work_item: "K", reason: :ok, attempt: 1, at: "2026-09-19T10:00:05Z")
+    capture_log { assert w.write(records, queued(w)) }
+
+    assert_equal [1, 3], rows("SELECT seq FROM run_output ORDER BY seq").flatten
+    assert_equal [[0, 1, nil]], output_flags
+  end
+
+  def test_output_still_pending_at_a_stop_is_one_gap_line
+    bus = EventBus.new
+    w = output_writer(bus: bus, poll_interval: 0.05)
+    @pipeline.begin_run(RUNNER, 1, 1) # its started never arrives
+    say("unclaimed")
+
+    log = capture_log do
+      w.start
+      assert w.stop(timeout: 5)
+    end
+
+    gaps = log.lines.grep(/\[History\] gap:.*at stop/)
+    assert_equal 1, gaps.size, log
+    assert_includes gaps.first, "2 pending output entr(ies)"
+    refute_includes log, "unclaimed"
+  end
+
+  def test_two_generations_reusing_pipeline_run_one_keep_their_own_lines
+    w = output_writer
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: "2026-09-19T10:00:00Z")
+    publish(RUNNER, 1, type: :started, work_item: "K", attempt: 1, at: "2026-09-19T10:00:01Z")
+    @pipeline.begin_run(RUNNER, 1, 1)
+    say("gen one", generation: 1)
+    @pipeline.end_run(RUNNER, 1, :killed, 1) # crashed: no finished on the bus
+
+    output_run("K", [[:stdout, "gen two"]], run_id: 1, generation: 2)
+    assert w.write(records, queued(w))
+
+    assert_equal [[1, "gen one"], [2, "gen two"]],
+                 rows("SELECT generation, text FROM run JOIN run_output ON run_output.run_id = run.id ORDER BY run.id")
   end
 end
