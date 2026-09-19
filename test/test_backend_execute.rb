@@ -93,6 +93,31 @@ class TestBackendExecute < Minitest::Test
     assert_includes result.stdout, "b"
   end
 
+  def test_runner_env_is_layered_over_the_process_environment
+    ENV["AGENT_DAEMON_TEST_SHARED"] = "process"
+    ENV["AGENT_DAEMON_TEST_KEPT"] = "kept"
+    backend = TestableBackend.new(
+      { "name" => "env", "timeout" => 10, "env" => { "AGENT_DAEMON_TEST_SHARED" => "runner", "AGENT_DAEMON_TEST_ONLY" => "only" } },
+      @shutdown, message_dir: Dir.tmpdir, project_path: Dir.tmpdir
+    )
+
+    result = backend.call('echo "$AGENT_DAEMON_TEST_SHARED $AGENT_DAEMON_TEST_KEPT $AGENT_DAEMON_TEST_ONLY"', timeout: 5)
+
+    assert_equal "runner kept only", result.stdout.strip
+    assert_equal "process", ENV["AGENT_DAEMON_TEST_SHARED"], "the parent environment must stay untouched"
+  ensure
+    ENV.delete("AGENT_DAEMON_TEST_SHARED")
+    ENV.delete("AGENT_DAEMON_TEST_KEPT")
+  end
+
+  def test_runner_without_env_inherits_the_process_environment
+    ENV["AGENT_DAEMON_TEST_SHARED"] = "process"
+    result = @backend.call('echo "$AGENT_DAEMON_TEST_SHARED"', timeout: 5)
+    assert_equal "process", result.stdout.strip
+  ensure
+    ENV.delete("AGENT_DAEMON_TEST_SHARED")
+  end
+
   def test_failed_command
     result = @backend.call("exit 7", timeout: 5)
     assert_equal :failed, result.reason

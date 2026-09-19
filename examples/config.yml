@@ -86,6 +86,8 @@ runners:
     #   runbook: https://wiki.example.com/flows/my-project#triage
     #   on_failure: Usually an expired TRACKER_TOKEN.
     # extra_flags: ""          # additional CLI flags
+    # env:                     # variables for THIS runner's agent only, over the process env;
+    #   GITLAB_TOKEN: …        # a value from secret('KEY') (ERB tag); never a {{template}} variable
     # timeout: 1200            # single backend invocation timeout (seconds), default 20 min
     # max_attempts: 3          # max retries per work item before skipping
     trigger:

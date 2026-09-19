@@ -63,6 +63,24 @@ sops exec-env secrets.enc.yml -- bin/agent-daemon config.yml
 Any other mechanism that sets the environment variables (a systemd
 `EnvironmentFile`, a CI secret store, `export`, etc.) works equally well.
 
+### A secret for one runner's agent only
+
+The process environment is shared by every runner — and under the supervisor by
+every workflow — so a variable meant for one agent cannot be exported there
+without reaching all of them. Give it to the runner instead:
+
+```yaml
+runners:
+  - name: reviewer
+    env:
+      GITLAB_TOKEN: <%= secret('REVIEWER_GITLAB_TOKEN') %>
+```
+
+`env` is layered over the process environment for that runner's agent only
+(the fallback agent included) and never becomes a `{{template}}` variable.
+Resolved through `secret()`, the value is redacted from console output and
+history like any other secret.
+
 ## Trust note: `safe_load` vs. ERB
 
 `YAML.safe_load` still guards the parsed *data*. ERB, however, can execute

@@ -293,7 +293,8 @@ module AgentDaemon
       end
 
       def base_template_variables
-        vars = @runner_config.transform_keys(&:to_s).merge("message_dir" => @message_dir)
+        # `env` carries secrets for the agent's process; it never becomes {{env}}.
+        vars = @runner_config.transform_keys(&:to_s).except("env").merge("message_dir" => @message_dir)
         vars["output_dir"] = @runner_config["output_dir"] if @runner_config["output_dir"]
         vars
       end

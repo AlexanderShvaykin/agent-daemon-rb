@@ -30,6 +30,7 @@ module AgentDaemon
       "backend" => "claude",
       "agent" => "task-analyst",
       "extra_flags" => "",
+      "env" => {},
       "timeout" => 1200,
       "max_attempts" => 3,
       "trigger" => {}
@@ -55,6 +56,8 @@ module AgentDaemon
     VALID_TRIGGER_TYPES   = %w[tracker file mattermost pachca github].freeze
     VALID_BACKENDS        = %w[claude opencode codex].freeze
     VALID_MESSENGER_TYPES = %w[webhook mattermost pachca].freeze
+    # A runner's `env:` keys must be usable as environment variable names.
+    ENV_NAME = /\A[A-Za-z_][A-Za-z0-9_]*\z/
     MATTERMOST_REQUIRED   = %w[base_url token team default_channel].freeze
 
     attr_reader :data, :config_dir, :config_path
@@ -346,6 +349,7 @@ module AgentDaemon
       errors.concat(validate_claude(label, runner["claude"]))
       errors.concat(validate_codex(label, runner["codex"]))
       errors.concat(validate_fallback_agent(label, runner["fallback_agent"])) if runner.key?("fallback_agent")
+      errors.concat(validate_env(label, runner["env"]))
       errors.concat(validate_trigger(label, runner["trigger"]))
       errors.concat(validate_documentation(runner["description"], runner["support"],
                                            prefix: "runner #{label.inspect}: "))
@@ -437,6 +441,24 @@ module AgentDaemon
       end
 
       errors
+    end
+
+    # Variables layered over the process environment for this runner's agent
+    # only. The supervisor runs every workflow in one process, so a secret
+    # meant for one runner cannot live in the shared environment without
+    # reaching all of them. Values are never rendered or logged here.
+    def validate_env(runner_label, env)
+      unless env.is_a?(Hash)
+        return ["runner #{runner_label.inspect}: env must be a Hash of NAME => String"]
+      end
+
+      env.filter_map do |name, value|
+        if !name.is_a?(String) || !ENV_NAME.match?(name)
+          "runner #{runner_label.inspect}: env has an invalid variable name #{name.inspect}"
+        elsif !value.is_a?(String)
+          "runner #{runner_label.inspect}: env.#{name} must be a String (got #{value.class})"
+        end
+      end
     end
 
     # Two forms, on purpose. A backend named by String inherits the flags that

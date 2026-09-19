@@ -133,7 +133,9 @@ module AgentDaemon
         # entity's buffers, so the next run cannot inherit a fragment.
         @sinks.begin_output_run(run_id)
 
-        Open3.popen3(cmd, pgroup: true) do |stdin, out, err, wait_thr|
+        # The runner's `env:` is layered over the process environment for this
+        # child only; the fallback agent goes through here too.
+        Open3.popen3(@runner_config.fetch("env", {}), cmd, pgroup: true) do |stdin, out, err, wait_thr|
           stdin.close
           pid = wait_thr.pid
           @current_pid = pid

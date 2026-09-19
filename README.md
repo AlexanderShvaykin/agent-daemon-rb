@@ -83,6 +83,7 @@ Stop with `Ctrl+C` or `kill <pid>` -- graceful shutdown waits for current iterat
 | `timeout` | Backend execution timeout in seconds (default: `1200`) |
 | `max_attempts` | Retries before giving up on a task (default: `3`) |
 | `extra_flags` | Additional CLI flags passed to the backend |
+| `env` | Environment variables for this runner's agent only, layered over the process environment (Hash of `NAME: String`; default `{}`). See [docs/secrets.md](docs/secrets.md) |
 | `output_dir` | Additional directory added to backend `--add-dir` |
 | `trigger` | Trigger configuration (required, see below) |
 

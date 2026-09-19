@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-19
+
+### Added
+- Runner key `env:` — a Hash of `NAME => String` layered over the process environment for that runner's agent only (configured backend and `fallback_agent` alike), default `{}`. The supervisor runs every workflow in one process, so a per-runner credential such as a reviewer bot's `GITLAB_TOKEN` can no longer be expressed through the shared environment without reaching every agent. `env` is validated at load (Hash, variable-name keys, String values; values are never echoed in errors), excluded from prompt template variables, and values resolved through `secret()` are redacted from console output and history as before.
+
 ## [0.22.0] - 2026-09-19
 
 ### Added

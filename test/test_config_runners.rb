@@ -408,6 +408,47 @@ class TestConfigRunners < Minitest::Test
     end
   end
 
+  def test_env_defaults_to_empty_and_accepts_string_values
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      env = { "GITLAB_TOKEN" => "t", "_X1" => "" }
+      path = write_config(dir, base_config(project_path, [tracker_runner, file_runner("env" => env)]))
+
+      runners = AgentDaemon::Config.new(path).runners
+      assert_equal({}, runners.first["env"])
+      assert_equal env, runners.last["env"]
+    end
+  end
+
+  def test_rejects_invalid_env
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      runners = [
+        tracker_runner("name" => "list", "env" => ["GITLAB_TOKEN=t"]),
+        file_runner("name" => "names", "env" => { "1BAD" => "v", "WITH-DASH" => "v" }),
+        file_runner("name" => "values", "env" => { "TOKEN" => 42, "NIL" => nil })
+      ]
+      path = write_config(dir, base_config(project_path, runners))
+
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      assert_includes err.message, 'runner "list": env must be a Hash of NAME => String'
+      assert_includes err.message, 'env has an invalid variable name "1BAD"'
+      assert_includes err.message, 'env has an invalid variable name "WITH-DASH"'
+      assert_includes err.message, "env.TOKEN must be a String (got Integer)"
+      assert_includes err.message, "env.NIL must be a String (got NilClass)"
+    end
+  end
+
+  def test_env_value_is_never_echoed_in_errors
+    Dir.mktmpdir do |dir|
+      project_path = with_project(dir)
+      path = write_config(dir, base_config(project_path, [tracker_runner("env" => { "TOKEN" => ["super-secret"] })]))
+
+      err = assert_raises(AgentDaemon::ConfigError) { AgentDaemon::Config.new(path) }
+      refute_includes err.message, "super-secret"
+    end
+  end
+
   def test_accepts_valid_fallback_agent
     Dir.mktmpdir do |dir|
       project_path = with_project(dir)

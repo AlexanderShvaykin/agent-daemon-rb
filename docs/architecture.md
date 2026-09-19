@@ -320,6 +320,15 @@ fallback_agent: claude                       # another backend, by name
 fallback_agent: {command: omp, args: [...]}  # an arbitrary CLI
 ```
 
+A runner's `env:` (a Hash of `NAME => String`, default `{}`) is passed to
+`Open3.popen3` as the child's environment on top of the process environment, for
+the configured backend and the fallback alike. It exists because the supervisor
+runs every workflow in one process: a variable set in the shared environment
+reaches every runner's agent, so a per-runner credential (e.g. a reviewer bot's
+`GITLAB_TOKEN`) has to travel with the runner instead. `env` is excluded from the
+prompt template variables, and values that come from `secret('KEY')` are already
+redacted from console output and history.
+
 The named form exists because the Hash form inherits none of the flags a backend
 builds for itself. Writing `claude` as a raw command means restating `--add-dir`,
 `--model`, `--agent`, `--output-format` and `--dangerously-skip-permissions` by
@@ -650,6 +659,8 @@ Config loading fails immediately with descriptive errors when:
 - A prompt template file does not exist on disk.
 - A runner's optional `fallback_agent` is not a Hash with exactly a non-blank
   String `command` and an `args` Array containing only Strings.
+- A runner's `env` is not a Hash, a key is not a valid environment variable
+  name, or a value is not a String (values are never echoed in the error).
 - A `description` is present but blank or not a String, `support` is not a Hash,
   it carries an unknown key, one of its values is blank, or `support.runbook` is
   not an `http(s)` URL — at either the config or the runner level.

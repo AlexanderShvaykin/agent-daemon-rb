@@ -81,6 +81,20 @@ class TestRunnerFile < Minitest::Test
     runner
   end
 
+  # `env` carries secrets for the agent's process; a template naming {{env}}
+  # must not print them into the prompt, which reaches logs and history.
+  def test_env_is_not_a_template_variable
+    File.write(@runner_config["prompt_template_path"], "env={{env}} dir={{message_dir}}")
+    @runner_config["env"] = { "GITLAB_TOKEN" => "secret-token" }
+    runner = build_runner([:ok])
+
+    prompt = runner.send(:render_prompt, File.join(@input_dir, "a.yml"))
+
+    refute_includes prompt, "secret-token"
+    assert_includes prompt, "env={{env}}"
+    assert_includes prompt, "dir=#{@message_dir}"
+  end
+
   def test_forwards_cancel_flag_to_backend
     token = Struct.new(:value).new(false)
     runner = AgentDaemon::Runner::File.new(
