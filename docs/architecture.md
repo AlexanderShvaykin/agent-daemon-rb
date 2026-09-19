@@ -752,6 +752,45 @@ next master marks them `incomplete`. The reader closes before the writer stops
 at shutdown. The console files never require `history/*` or `sqlite3`; the
 reader is duck-typed.
 
+Retention (Story 5.6) runs on the same writer thread and connection: no cron,
+no second process, no second connection. After `recover`, each writer
+iteration drains first and then performs at most one prune step. A cycle
+starts on the first iteration and then every `history.prune_interval_seconds`
+measured on the monotonic clock from the previous cycle's start; cycles never
+overlap, and while a stop is pending no cycle starts and no further batch
+runs. A cycle calls its clock once and binds that cutoff
+(`now - retention_days`, as `iso8601(3)` UTC text) in every batch. It has three
+phases, each a sequence of batches of at most `history.prune_batch_size`
+parents, one `BEGIN IMMEDIATE` transaction per batch, picked `ORDER BY id`; a
+phase ends on a short batch. (1) Runs with `finished_at < cutoff`, or
+unfinished runs with `started_at < cutoff` that are not in the writer's
+in-memory open runs (so a crash-incomplete run is pruned, the live master's
+active run never is): their `run_output`, then `run_event`, then `run` rows,
+with explicit child deletes over the same id subquery, so no orphan survives.
+(2) `restart_action` rows with `requested_at < cutoff`, per row. (3)
+`supervised_entity` rows no run and no restart action references and whose
+key is not in the roster, so the writer's entity-id cache never names a
+deleted row. The open-run ids and roster keys are bound as one JSON array each
+and read with `json_each(?)`. A batch that raises is rolled back, ends the
+cycle, marks prune degraded and logs `[History] prune failed: <Class>:
+<message>`; the next scheduled cycle is the retry. A completed cycle records
+`last_pruned_at` in memory (never persisted), clears prune degraded, and logs
+`[History] pruned …` only when it deleted something. There is never a `VACUUM`
+and `auto_vacuum` is untouched: freed pages are reused. Pruning therefore
+removes rows from queries, not bytes from disk: deleted text stays in freed
+pages of the main file (there is no `secure_delete`) and in the WAL until those
+pages are reused, and the file is roughly bounded by the retention window plus
+WAL growth, so the owner-only permissions and backup exclusion still matter.
+`Writer#status` is a
+frozen snapshot (`retention_days`, `last_pruned_at`, `writer_degraded`,
+`prune_degraded`) read from plain replaced instance variables; the master hands
+`writer.method(:status)` to the `History::Reader`, whose `#status` never
+touches SQLite. `/history` shows a Retention block (period and last successful
+prune, or "Not yet run"), and every history page — never the fleet or entity
+page — shows a `role="status"` "History degraded:" warning when the writer or
+prune is degraded or the status call raised (`[Console] history status failed:
+<Class>`).
+
 ### Layout
 
 One file per concern under `lib/agent_daemon/supervisor/`:

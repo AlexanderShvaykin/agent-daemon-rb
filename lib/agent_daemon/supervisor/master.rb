@@ -76,15 +76,19 @@ module AgentDaemon
                             output_pipeline: output_pipeline,
                             output_buffer_bytes: supervisor_config.output_buffer_bytes,
                             retry_count: history_config["write_retry_count"],
-                            backoff_ceiling_ms: history_config["write_retry_backoff_ceiling_ms"])
+                            backoff_ceiling_ms: history_config["write_retry_backoff_ceiling_ms"],
+                            retention_days: history_config["retention_days"],
+                            prune_interval_seconds: history_config["prune_interval_seconds"],
+                            prune_batch_size: history_config["prune_batch_size"])
       end
 
       # Builds the console's query-only history reader (Story 5.5): a second
-      # connection, never the writer's. Construction does no IO.
-      HISTORY_READER_FACTORY = lambda do |history_config|
+      # connection, never the writer's. Construction does no IO. `status` is
+      # the writer's in-memory status callable (Story 5.6).
+      HISTORY_READER_FACTORY = lambda do |history_config, status|
         History::Reader.new(path: history_config["database_path"],
                             busy_timeout_ms: history_config["busy_timeout_ms"],
-                            page_size: history_config["page_size"])
+                            page_size: history_config["page_size"], status: status)
       end
 
       attr_reader :state_registry, :event_bus, :output_pipeline, :output_buffers
@@ -326,7 +330,7 @@ module AgentDaemon
       def build_history_reader(history_config)
         return unless @history && @history_writer
 
-        @history_reader = @history_reader_factory.call(history_config)
+        @history_reader = @history_reader_factory.call(history_config, @history_writer.method(:status))
       rescue StandardError, ScriptError => e
         Log.error("[History] reader unavailable, the console will show history as unavailable: " \
                   "#{e.class}: #{e.message}")

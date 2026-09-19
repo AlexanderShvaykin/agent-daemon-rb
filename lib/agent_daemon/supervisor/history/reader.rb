@@ -41,12 +41,20 @@ module AgentDaemon
 
         attr_reader :page_size
 
-        def initialize(path:, busy_timeout_ms:, page_size:)
+        # `status` (Story 5.6) is a callable returning the writer's in-memory
+        # status snapshot; it never touches SQLite.
+        def initialize(path:, busy_timeout_ms:, page_size:, status: nil)
           @path = path
+          @status = status
           @busy_timeout_ms = busy_timeout_ms
           @page_size = page_size
           @mutex = Mutex.new
           @db = nil
+        end
+
+        # The writer's retention and degraded status, or nil without one.
+        def status
+          @status&.call
         end
 
         # Newest first, `(started_at DESC, id DESC)`. `cursor` is the last

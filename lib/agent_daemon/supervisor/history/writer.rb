@@ -64,6 +64,19 @@ module AgentDaemon
       # - A failed run gets a JSON error_summary: reason, attempt and the
       #   last stored stderr line.
       #
+      # Story 5.6 retention: the pruner lives on this same thread and
+      # connection, with no cron and no second process. A cycle runs on the
+      # first iteration and then every prune_interval_seconds (monotonic,
+      # from the previous cycle's start). It captures its cutoff once and
+      # deletes, one batch = one transaction per iteration so ordinary drains
+      # run between batches: expired runs with their events and output (a
+      # run the writer still holds open is always kept), expired restart
+      # actions, then entities nothing references and the roster does not
+      # name. A failed batch rolls back, ends the cycle and marks prune
+      # degraded until a later cycle succeeds. A stop starts no cycle and no
+      # further batch. There is never a VACUUM: freed pages are reused.
+      # #status is an in-memory snapshot for the console.
+      #
       # Log lines carry counts, seqs, attempts and delays, never field values;
       # every value reaches SQLite through bind parameters.
       #
@@ -75,14 +88,20 @@ module AgentDaemon
         REASONS = %w[ok failed timeout killed].freeze
         STREAMS = %w[stdout stderr].freeze
 
+        PRUNE_PHASES = %i[runs restart_actions entities].freeze
+
         # A record that cannot be stored; skipped with one warn line.
         class Skip < StandardError; end
+
+        # What the console shows about history (Story 5.6).
+        Status = Struct.new(:retention_days, :last_pruned_at, :writer_degraded, :prune_degraded)
 
         attr_reader :thread
 
         def initialize(database:, event_bus:, roster:, output_pipeline: nil, output_buffer_bytes: 262_144,
                        poll_interval: 0.5, retry_count: 3, backoff_ceiling_ms: 2_000,
-                       sleeper: ->(seconds) { sleep(seconds) })
+                       sleeper: ->(seconds) { sleep(seconds) }, retention_days: 30,
+                       prune_interval_seconds: 21_600, prune_batch_size: 500, clock: -> { Time.now })
           @db = database.db
           @event_bus = event_bus
           @poll_interval = poll_interval
@@ -111,6 +130,15 @@ module AgentDaemon
           # Run rows still bound when a batch carrying their output was lost;
           # the next committed batch marks them output_incomplete.
           @lost_runs = [].freeze
+          @retention_days = retention_days
+          @prune_interval_seconds = prune_interval_seconds
+          @prune_batch_size = prune_batch_size
+          @clock = clock
+          # nil, or the running cycle: frozen { cutoff:, now:, phase:, counts: }.
+          @prune = nil
+          @next_prune_at = nil
+          @last_pruned_at = nil
+          @prune_degraded = false
           @stopping = false
           @thread = nil
           @cursor = event_bus.subscribe(from: :backlog)
@@ -143,6 +171,12 @@ module AgentDaemon
 
           thread = @thread
           !thread.nil? && !thread.alive? && !@stopping
+        end
+
+        # Safe from any thread: reads only instance variables that are
+        # replaced, never mutated.
+        def status
+          Status.new(@retention_days, @last_pruned_at, degraded?, @prune_degraded).freeze
         end
 
         # The in-flight batch plus every bus record past it (or past the last
@@ -202,6 +236,7 @@ module AgentDaemon
             end
             break if stopping
 
+            prune_step
             sleep(@poll_interval)
           end
           left = pending_size
@@ -255,6 +290,101 @@ module AgentDaemon
 
           Log.warn("[History] gap: #{dropped - @dropped_seen} bus record(s) evicted before the writer read them")
           @dropped_seen = dropped
+        end
+
+        # --- Retention (Story 5.6) ---------------------------------------------
+
+        # At most one batch per call. Its failure ends the cycle; the next
+        # scheduled cycle is the retry.
+        def prune_step
+          return if @stopping
+
+          if @prune.nil?
+            return unless prune_due?
+
+            start_prune
+          end
+          prune = @prune
+          deleted = prune_batch(prune)
+          counts = prune[:counts].dup
+          counts[prune[:phase]] += deleted
+          phase = deleted < @prune_batch_size ? prune[:phase] + 1 : prune[:phase]
+          if phase == PRUNE_PHASES.size
+            finish_prune(prune, counts)
+          else
+            @prune = prune.merge(phase: phase, counts: counts.freeze).freeze
+          end
+        rescue StandardError => e
+          rollback_quietly
+          @prune = nil
+          @prune_degraded = true
+          Log.error("[History] prune failed: #{e.class}: #{e.message}")
+        end
+
+        def prune_due?
+          @next_prune_at.nil? || monotonic >= @next_prune_at
+        end
+
+        def start_prune
+          @next_prune_at = monotonic + @prune_interval_seconds
+          now = @clock.call.getutc
+          cutoff = (now - (@retention_days * 86_400)).iso8601(3)
+          @prune = { cutoff: cutoff, now: now.iso8601(3), phase: 0, counts: [0, 0, 0].freeze }.freeze
+        end
+
+        def finish_prune(prune, counts)
+          @prune = nil
+          @last_pruned_at = prune[:now]
+          @prune_degraded = false
+          runs, actions, entities = counts
+          return unless counts.any?(&:positive?)
+
+          Log.info("[History] pruned #{runs} run(s), #{actions} restart action(s), #{entities} entit(ies) " \
+                   "older than #{prune[:cutoff]}")
+        end
+
+        def monotonic
+          Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        end
+
+        # One transaction, one batch of parents. Children go first and pick
+        # the same ids, so no orphan row survives.
+        def prune_batch(prune)
+          @db.transaction(:immediate) do
+            case PRUNE_PHASES[prune[:phase]]
+            when :runs then prune_runs(prune[:cutoff])
+            when :restart_actions then prune_restart_actions(prune[:cutoff])
+            else prune_entities
+            end
+          end
+        end
+
+        def prune_runs(cutoff)
+          open_ids = JSON.generate(@open_runs.values.map { |run| run[:id] })
+          pick = "SELECT id FROM run WHERE (finished_at IS NOT NULL AND finished_at < ?1) OR " \
+                 "(finished_at IS NULL AND started_at < ?1 AND id NOT IN (SELECT value FROM json_each(?2))) " \
+                 "ORDER BY id LIMIT ?3"
+          binds = [cutoff, open_ids, @prune_batch_size]
+          %w[run_output run_event].each { |table| @db.execute("DELETE FROM #{table} WHERE run_id IN (#{pick})", binds) }
+          @db.execute("DELETE FROM run WHERE id IN (#{pick})", binds)
+          @db.changes
+        end
+
+        def prune_restart_actions(cutoff)
+          @db.execute("DELETE FROM restart_action WHERE id IN (SELECT id FROM restart_action WHERE requested_at < ? " \
+                      "ORDER BY id LIMIT ?)", [cutoff, @prune_batch_size])
+          @db.changes
+        end
+
+        # Roster entities are always kept, so @entity_ids never names a
+        # deleted row.
+        def prune_entities
+          @db.execute("DELETE FROM supervised_entity WHERE id IN (SELECT e.id FROM supervised_entity e " \
+                      "WHERE NOT EXISTS (SELECT 1 FROM run WHERE run.entity_id = e.id) " \
+                      "AND NOT EXISTS (SELECT 1 FROM restart_action a WHERE a.entity_id = e.id) " \
+                      "AND e.entity_key NOT IN (SELECT value FROM json_each(?)) ORDER BY e.id LIMIT ?)",
+                      [JSON.generate(@roster.keys), @prune_batch_size])
+          @db.changes
         end
 
         # Runs a previous master left open can never be finished by this one.

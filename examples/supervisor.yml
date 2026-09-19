@@ -68,8 +68,18 @@ workflows:
 # (reason, attempt, last stderr line).
 #
 # page_size is the number of runs (and restart actions) per page of the
-# console's persisted-history view. The retention keys are validated now so a
-# typo fails at load; a later release reads them.
+# console's persisted-history view.
+#
+# Retention: the history writer thread deletes history older than
+# retention_days itself, at startup and then every prune_interval_seconds,
+# prune_batch_size runs per transaction (no cron, no VACUUM: the file does not
+# shrink, freed pages are reused). Runs, their events and output go by finish
+# time (a crash-incomplete run by start time; the live master's open run is
+# never pruned), restart actions by request time, and entities no row
+# references once they leave the config. Retention also bounds how long
+# captured agent output can be disclosed from disk. The console's History page
+# shows the retention period, the last successful prune, and a "History
+# degraded" warning when writing or pruning failed.
 #
 # history:
 #   enabled: true                          # default true

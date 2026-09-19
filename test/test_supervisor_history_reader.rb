@@ -268,4 +268,20 @@ class TestSupervisorHistoryReader < Minitest::Test
 
     assert_equal 1, r.runs.runs.size
   end
+
+  # --- Story 5.6: status ------------------------------------------------------
+
+  def test_status_is_the_callables_value_and_never_opens_the_store
+    snapshot = Object.new
+    r = Reader.new(path: File.join(@dir, "missing.sqlite3"), busy_timeout_ms: 5000, page_size: 50,
+                   status: -> { snapshot })
+    @readers << r
+
+    assert_same snapshot, r.status
+    assert_nil r.instance_variable_get(:@db)
+  end
+
+  def test_status_is_nil_without_a_callable
+    assert_nil reader.status
+  end
 end

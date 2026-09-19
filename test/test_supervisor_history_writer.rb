@@ -73,8 +73,12 @@ class TestSupervisorHistoryWriter < Minitest::Test
     restore_logger!
   end
 
-  def writer(store = @store, bus: EventBus.new, **kwargs)
-    @writer = Writer.new(database: store, event_bus: bus, roster: ROSTER, **kwargs)
+  # Story 5.6: the clock is pinned, so the startup prune never deletes the
+  # 2026-09-19T10:… fixtures however far the real date moves on.
+  NOW = Time.utc(2026, 9, 19, 12)
+
+  def writer(store = @store, bus: EventBus.new, clock: -> { NOW }, **kwargs)
+    @writer = Writer.new(database: store, event_bus: bus, roster: ROSTER, clock: clock, **kwargs)
   end
 
   # Publishes exactly as a supervised entity does: through GenerationStamp
@@ -492,6 +496,23 @@ class TestSupervisorHistoryWriter < Minitest::Test
     assert_includes gaps.first, "3 retries"
     assert w.degraded?, "degraded is sticky"
     assert_equal ["L"], rows("SELECT work_item FROM run").flatten
+  end
+
+  def test_a_lost_batch_reports_writer_degraded_in_status_but_not_prune_degraded
+    bus = EventBus.new
+    _sleeps, sleeper = recording_sleeper
+    failing = FailingDb.new(@store.db, fail_on: /\AINSERT/)
+    w = writer(FakeStore.new(failing), bus: bus, poll_interval: 0.05, retry_count: 1, sleeper: sleeper)
+    lifecycle("K", bus: bus)
+
+    capture_log do
+      w.start
+      wait_until { w.degraded? }
+      assert w.stop(timeout: 5)
+    end
+
+    assert w.status.writer_degraded
+    refute w.status.prune_degraded
   end
 
   def test_the_backoff_is_capped_by_the_ceiling
@@ -992,5 +1013,289 @@ class TestSupervisorHistoryWriter < Minitest::Test
 
     assert_equal [[1, "gen one"], [2, "gen two"]],
                  rows("SELECT generation, text FROM run JOIN run_output ON run_output.run_id = run.id ORDER BY run.id")
+  end
+
+  # --- Story 5.6: retention ---------------------------------------------------
+
+  def days_ago(days, from: NOW)
+    (from - (days * 86_400)).iso8601(3)
+  end
+
+  def seed_entity(key = "runner:wf:a")
+    kind = key.split(":").first
+    @store.db.execute("INSERT INTO supervised_entity (entity_key, kind, first_seen_at) VALUES (?, ?, ?)",
+                      [key, kind, days_ago(100)])
+    @store.db.last_insert_row_id
+  end
+
+  def seed_run(entity_id, started_at:, finished_at: nil, incomplete: 0, events: 0, output: 0)
+    @store.db.execute("INSERT INTO run (entity_id, generation, started_at, finished_at, reason, incomplete) " \
+                      "VALUES (?, 1, ?, ?, ?, ?)", [entity_id, started_at, finished_at, finished_at && "ok", incomplete])
+    id = @store.db.last_insert_row_id
+    seed_children(id, events: events, output: output)
+    id
+  end
+
+  def seed_children(run_id, events: 0, output: 0)
+    events.times do |n|
+      @store.db.execute("INSERT INTO run_event (run_id, seq, event, occurred_at) VALUES (?, ?, 'started', ?)",
+                        [run_id, n + 1, days_ago(40)])
+    end
+    output.times do |n|
+      @store.db.execute("INSERT INTO run_output (run_id, seq, stream, text) VALUES (?, ?, 'stdout', ?)",
+                        [run_id, n + 1, "line #{n}"])
+    end
+  end
+
+  def seed_action(entity_id, requested_at)
+    @store.db.execute("INSERT INTO restart_action (entity_id, actors, requested_at) VALUES (?, '[]', ?)",
+                      [entity_id, requested_at])
+    @store.db.last_insert_row_id
+  end
+
+  # One run_loop iteration without the thread: drain, then one prune step.
+  def iterate(w)
+    w.send(:drain)
+    w.send(:prune_step)
+  end
+
+  # Steps until the cycle in progress (or the one that is due) ends.
+  def prune_cycle(w)
+    loop do
+      w.send(:prune_step)
+      break if w.instance_variable_get(:@prune).nil?
+    end
+  end
+
+  def ids(table)
+    rows("SELECT id FROM #{table} ORDER BY id").flatten
+  end
+
+  def run_children(run_id)
+    [@store.db.get_first_value("SELECT COUNT(*) FROM run_event WHERE run_id = ?", [run_id]),
+     @store.db.get_first_value("SELECT COUNT(*) FROM run_output WHERE run_id = ?", [run_id])]
+  end
+
+  def test_an_expired_run_goes_with_its_events_and_output_and_the_boundary_is_strict
+    entity = seed_entity
+    expired = seed_run(entity, started_at: days_ago(31), finished_at: days_ago(31), events: 2, output: 3)
+    boundary = seed_run(entity, started_at: days_ago(31), finished_at: days_ago(30), events: 1, output: 1)
+    recent = seed_run(entity, started_at: days_ago(29), finished_at: days_ago(29), events: 1)
+
+    log = capture_log { prune_cycle(writer) }
+
+    assert_equal [boundary, recent], ids("run")
+    assert_equal [0, 0], run_children(expired)
+    assert_equal [1, 1], run_children(boundary)
+    assert_equal 1, log.lines.grep(/\[History\] pruned 1 run\(s\), 0 restart action\(s\), 0 entit\(ies\) older than #{Regexp.escape(days_ago(30))}/).size, log
+  end
+
+  def test_a_crash_incomplete_run_is_pruned_by_its_start
+    entity = seed_entity
+    seed_run(entity, started_at: days_ago(40), incomplete: 1, output: 1)
+    kept = seed_run(entity, started_at: days_ago(10), incomplete: 1)
+
+    prune_cycle(writer)
+
+    assert_equal [kept], ids("run")
+    assert_equal 0, count("run_output")
+  end
+
+  def test_the_writers_active_open_run_is_kept_however_old
+    w = writer
+    publish(RUNNER, 1, type: :picked_up, work_item: "K", at: days_ago(40))
+    publish(RUNNER, 1, type: :started, work_item: "K", attempt: 1, at: days_ago(40))
+    assert w.write(records)
+    open_run = ids("run").first
+    seed_children(open_run, output: 2)
+
+    prune_cycle(w)
+
+    assert_equal [open_run], ids("run")
+    assert_equal [2, 2], run_children(open_run)
+  end
+
+  def test_restart_actions_are_pruned_per_row_by_request_time
+    entity = seed_entity
+    seed_action(entity, days_ago(40))
+    newer = seed_action(entity, days_ago(1))
+
+    prune_cycle(writer)
+
+    assert_equal [newer], ids("restart_action")
+  end
+
+  def test_an_orphaned_entity_goes_only_when_the_roster_does_not_name_it
+    rostered = seed_entity("runner:wf:a")
+    seed_entity("runner:wf:gone")
+    referenced = seed_entity("runner:wf:old")
+    seed_action(referenced, days_ago(1))
+    with_run = seed_entity("runner:wf:older")
+    seed_run(with_run, started_at: days_ago(1), finished_at: days_ago(1))
+
+    prune_cycle(writer)
+
+    assert_equal [rostered, referenced, with_run], ids("supervised_entity")
+  end
+
+  def test_an_entity_whose_last_run_expires_goes_in_the_same_cycle
+    gone = seed_entity("runner:wf:gone")
+    seed_run(gone, started_at: days_ago(40), finished_at: days_ago(40))
+    seed_action(gone, days_ago(40))
+
+    prune_cycle(writer)
+
+    assert_equal [0, 0, 0], [count("run"), count("restart_action"), count("supervised_entity")]
+  end
+
+  def test_each_batch_is_one_transaction_and_drains_commit_between_them
+    entity = seed_entity
+    7.times { seed_run(entity, started_at: days_ago(40), finished_at: days_ago(40)) }
+    bus = EventBus.new
+    w = writer(bus: bus, prune_batch_size: 3)
+    begins = []
+    @store.db.trace { |sql| begins << sql if sql.match?(/\Abegin/i) }
+
+    iterate(w)
+    assert_equal 4, count("run")
+    lifecycle("fresh", bus: bus)
+    iterate(w)
+    assert_equal 5 - 3, count("run"), "the drain committed the fresh run, then one batch of 3 went"
+    assert_equal ["fresh"], rows("SELECT work_item FROM run WHERE work_item IS NOT NULL").flatten
+    iterate(w)
+    assert_equal ["fresh"], rows("SELECT work_item FROM run").flatten
+    2.times { iterate(w) } # restart actions, then entities
+    assert_nil w.instance_variable_get(:@prune)
+    assert_equal 6, begins.size, "3 run batches + 1 drain + 1 per remaining phase"
+  ensure
+    @store.db.trace(nil)
+  end
+
+  def test_a_failed_batch_rolls_back_whole_degrades_prune_and_a_later_cycle_recovers
+    entity = seed_entity
+    runs = Array.new(4) { seed_run(entity, started_at: days_ago(40), finished_at: days_ago(40), events: 1, output: 1) }
+    failing = FailingDb.new(@store.db, fail_on: nil)
+    w = writer(FakeStore.new(failing), prune_batch_size: 2, prune_interval_seconds: 0)
+
+    log = capture_log do
+      w.send(:prune_step)
+      failing.fail_on = /\ADELETE FROM run WHERE/
+      w.send(:prune_step)
+    end
+
+    assert_equal runs.last(2), ids("run")
+    runs.last(2).each { |run| assert_equal [1, 1], run_children(run) }
+    assert_equal 2, count("run_event")
+    failures = log.lines.grep(/\[History\] prune failed:/)
+    assert_equal ["[History] prune failed: SQLite3::SQLException: injected failure\n"], failures
+    assert w.status.prune_degraded
+    refute w.status.writer_degraded, "a prune failure is not a lost write batch"
+    assert_nil w.status.last_pruned_at
+    refute @store.db.transaction_active?
+
+    failing.fail_on = nil
+    prune_cycle(w)
+
+    assert_empty ids("run")
+    assert_equal 0, count("run_event")
+    refute w.status.prune_degraded
+    assert_equal NOW.iso8601(3), w.status.last_pruned_at
+  end
+
+  def test_the_cutoff_is_captured_once_per_cycle
+    entity = seed_entity
+    7.times { seed_run(entity, started_at: days_ago(35), finished_at: days_ago(35)) }
+    kept = seed_run(entity, started_at: days_ago(25), finished_at: days_ago(25))
+    calls = 0
+    clock = lambda do
+      calls += 1
+      NOW + ((calls - 1) * 10 * 86_400)
+    end
+
+    prune_cycle(writer(clock: clock, prune_batch_size: 3))
+
+    assert_equal 1, calls
+    assert_equal [kept], ids("run")
+  end
+
+  def test_a_second_cycle_runs_on_schedule_without_a_restart
+    entity = seed_entity
+    seed_run(entity, started_at: days_ago(15), finished_at: days_ago(15))
+    later = NOW + (20 * 86_400)
+    calls = 0
+    clock = lambda do
+      calls += 1
+      calls == 1 ? NOW : later
+    end
+    w = writer(clock: clock, poll_interval: 0.02, prune_interval_seconds: 0.2).start
+
+    wait_until { w.status.last_pruned_at == later.iso8601(3) }
+    assert w.stop(timeout: 5)
+
+    assert_equal 0, count("run")
+  end
+
+  def test_a_stop_ends_a_cycle_between_batches
+    entity = seed_entity
+    5.times { seed_run(entity, started_at: days_ago(40), finished_at: days_ago(40)) }
+    w = writer(prune_batch_size: 2)
+    w.send(:prune_step)
+    assert_equal 3, count("run")
+
+    assert w.stop(timeout: 1)
+    w.send(:prune_step)
+
+    assert_equal 3, count("run")
+    assert_nil w.status.last_pruned_at
+    refute w.status.prune_degraded
+  end
+
+  def test_a_writer_mid_cycle_stops_within_its_timeout
+    entity = seed_entity
+    30.times { seed_run(entity, started_at: days_ago(40), finished_at: days_ago(40)) }
+    w = writer(poll_interval: 0.05, prune_batch_size: 1).start
+    wait_until { prune_running?(w) }
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    assert w.stop(timeout: 5)
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 1
+    assert_nil w.status.last_pruned_at, "an abandoned cycle is not a success"
+    refute w.status.prune_degraded, "nor a failure"
+  end
+
+  def prune_running?(writer)
+    !writer.instance_variable_get(:@prune).nil?
+  end
+
+  def test_a_cycle_never_vacuums
+    entity = seed_entity
+    3.times { seed_run(entity, started_at: days_ago(40), finished_at: days_ago(40), events: 1, output: 1) }
+    statements = []
+    @store.db.trace { |sql| statements << sql }
+
+    prune_cycle(writer)
+
+    refute_empty statements.grep(/\ADELETE/)
+    assert_empty statements.grep(/vacuum/i)
+  ensure
+    @store.db.trace(nil)
+  end
+
+  def test_status_before_and_after_a_cycle
+    w = writer(retention_days: 12)
+    before = w.status
+
+    assert_predicate before, :frozen?
+    assert_equal [12, nil, false, false], before.to_a
+
+    prune_cycle(w)
+
+    assert_equal [12, NOW.iso8601(3), false, false], w.status.to_a
+  end
+
+  def test_a_cycle_that_deletes_nothing_logs_nothing
+    log = capture_log { prune_cycle(writer) }
+
+    assert_empty log
   end
 end

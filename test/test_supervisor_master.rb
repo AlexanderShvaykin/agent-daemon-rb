@@ -1319,6 +1319,12 @@ class TestSupervisorMaster < Minitest::Test
     ->(_history_config) { raise error }
   end
 
+  # Story 5.6: a real writer prunes at startup against the real clock, so
+  # persisted fixtures are dated relative to now (an hour ago plus offset),
+  # never to a fixed day that would one day fall out of retention. A
+  # constant, so the singleton methods defined on a master can reach it.
+  RECENT = ->(offset = 0) { (Time.now.utc - 3600 + offset).iso8601(3) }
+
   def test_a_history_open_failure_degrades_history_and_the_fleet_still_supervises
     require "sqlite3"
     [SQLite3::CantOpenException.new("unable to open database file"), LoadError.new("cannot load such file -- sqlite3")]
@@ -1378,9 +1384,9 @@ class TestSupervisorMaster < Minitest::Test
       master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
       identity = AgentDaemon::Supervisor::RunnerIdentity.new(workflow: "wf", runner: "a")
       stamp = AgentDaemon::Supervisor::GenerationStamp.new(2, master.event_bus)
-      stamp.publish(identity, type: :picked_up, work_item: "TI-1", at: "2026-09-19T10:00:00Z")
-      stamp.publish(identity, type: :restart, actor: [:crash_auto], requested_at: "2026-09-19T09:59:00.000Z",
-                              at: "2026-09-19T10:00:00Z")
+      stamp.publish(identity, type: :picked_up, work_item: "TI-1", at: RECENT[])
+      stamp.publish(identity, type: :restart, actor: [:crash_auto], requested_at: RECENT[-60],
+                              at: RECENT[])
       boot_and_shut_down(master)
 
       assert_equal :ready, master.history_state
@@ -1420,7 +1426,7 @@ class TestSupervisorMaster < Minitest::Test
       master.define_singleton_method(:finalize_supervisors) do
         super()
         stamp.publish(identity, type: :finished, work_item: "TI-1", reason: :killed, attempt: 1,
-                                at: "2026-09-19T10:00:00Z")
+                                at: RECENT[])
       end
       boot_and_shut_down(master)
 
@@ -1440,13 +1446,13 @@ class TestSupervisorMaster < Minitest::Test
       ingress = master.output_pipeline.ingress(1)
       master.define_singleton_method(:finalize_supervisors) do
         super()
-        stamp.publish(identity, type: :picked_up, work_item: "TI-1", at: "2026-09-19T10:00:00Z")
-        stamp.publish(identity, type: :started, work_item: "TI-1", attempt: 1, at: "2026-09-19T10:00:01Z")
+        stamp.publish(identity, type: :picked_up, work_item: "TI-1", at: RECENT[])
+        stamp.publish(identity, type: :started, work_item: "TI-1", attempt: 1, at: RECENT[1])
         ingress.begin_run(identity, 1)
         ingress.append(identity, :stderr, "boom\n")
         ingress.end_run(identity, 1, :failed)
         stamp.publish(identity, type: :finished, work_item: "TI-1", reason: :failed, attempt: 1,
-                                at: "2026-09-19T10:00:02Z")
+                                at: RECENT[2])
       end
       boot_and_shut_down(master)
 
@@ -1487,6 +1493,8 @@ class TestSupervisorMaster < Minitest::Test
     def unflushed_count = 7
 
     def degraded? = false
+
+    def status = nil
   end
 
   def test_a_writer_that_misses_the_flush_deadline_leaves_the_store_open
@@ -1511,6 +1519,7 @@ class TestSupervisorMaster < Minitest::Test
     def start = self
     def stop(timeout:) = true
     def degraded? = degraded
+    def status = nil
   end
 
   def test_history_state_is_degraded_while_the_writer_reports_degraded
@@ -1542,8 +1551,8 @@ class TestSupervisorMaster < Minitest::Test
       identity = AgentDaemon::Supervisor::RunnerIdentity.new(workflow: "wf", runner: "a")
       first = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
       stamp = AgentDaemon::Supervisor::GenerationStamp.new(1, first.event_bus)
-      stamp.publish(identity, type: :picked_up, work_item: "TI-1", at: "2026-09-19T10:00:00Z")
-      stamp.publish(identity, type: :started, work_item: "TI-1", attempt: 1, at: "2026-09-19T10:00:01Z")
+      stamp.publish(identity, type: :picked_up, work_item: "TI-1", at: RECENT[])
+      stamp.publish(identity, type: :started, work_item: "TI-1", attempt: 1, at: RECENT[1])
       boot_and_shut_down(first)
 
       second = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
@@ -1682,7 +1691,7 @@ class TestSupervisorMaster < Minitest::Test
       reader.define_singleton_method(:close) { closed << true }
       master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2,
                                                            history_writer_factory: ->(*) { StuckWriter.new },
-                                                           history_reader_factory: ->(_c) { reader })
+                                                           history_reader_factory: ->(_c, _s) { reader })
       capture_log { boot_and_shut_down(master) }
 
       assert_equal [true], closed
@@ -1693,13 +1702,61 @@ class TestSupervisorMaster < Minitest::Test
   def test_a_reader_factory_that_raises_leaves_the_writer_running
     with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
       master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2,
-                                                           history_reader_factory: ->(_c) { raise "no reader" })
+                                                           history_reader_factory: ->(_c, _s) { raise "no reader" })
       errors = capture_log_errors { boot_and_shut_down(master) }
 
       assert_equal :ready, master.history_state
       assert_nil master.history_reader
       refute_nil master.history_writer
       assert_equal 1, errors.grep(/\[History\] reader unavailable/).size, errors.inspect
+    end
+  end
+
+  # --- Story 5.6: retention -------------------------------------------------
+
+  def test_the_masters_reader_reports_the_writers_status
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], history: { "retention_days" => 7, "prune_interval_seconds" => 900,
+                                                                            "prune_batch_size" => 120 }) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      boot_and_shut_down(master)
+
+      status = master.history_reader.status
+      assert_instance_of AgentDaemon::Supervisor::History::Writer::Status, status
+      assert_equal 7, status.retention_days
+      refute status.writer_degraded
+      writer = master.history_writer
+      assert_equal [900, 120], [writer.instance_variable_get(:@prune_interval_seconds),
+                                writer.instance_variable_get(:@prune_batch_size)]
+    end
+  end
+
+  def test_a_started_master_prunes_runs_older_than_retention_without_operator_action
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |dir, config|
+      path = File.join(dir, "history", "history.sqlite3")
+      FileUtils.mkdir_p(File.dirname(path), mode: 0o700)
+      store = AgentDaemon::Supervisor::History::Database.open(path: path, busy_timeout_ms: 1000)
+      old = (Time.now.utc - (40 * 86_400)).iso8601(3)
+      store.db.execute("INSERT INTO supervised_entity (entity_key, kind, workflow, runner, first_seen_at) " \
+                       "VALUES ('runner:wf:a', 'runner', 'wf', 'a', ?)", [old])
+      store.db.execute("INSERT INTO run (entity_id, generation, started_at, finished_at, reason) " \
+                       "VALUES (1, 1, ?, ?, 'ok')", [old, old])
+      store.db.execute("INSERT INTO run_event (run_id, seq, event, occurred_at) VALUES (1, 1, 'finished', ?)", [old])
+      store.db.execute("INSERT INTO run_output (run_id, seq, stream, text) VALUES (1, 1, 'stdout', 'old')")
+      store.close
+
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      master.define_singleton_method(:finalize_supervisors) do
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+        sleep 0.01 until history_writer.status.last_pruned_at ||
+                         Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        super()
+      end
+      boot_and_shut_down(master)
+
+      db = SQLite3::Database.new(path)
+      assert_equal [0, 0, 0], %w[run run_event run_output].map { |t| db.get_first_value("SELECT COUNT(*) FROM #{t}") }
+      db.close
+      refute_nil master.history_writer.status.last_pruned_at
     end
   end
 
@@ -1716,7 +1773,7 @@ class TestSupervisorMaster < Minitest::Test
         stamp = AgentDaemon::Supervisor::GenerationStamp.new(1, event_bus)
         ingress = output_pipeline.ingress(1)
         (1..11).each do |n|
-          at = format("2026-09-19T10:00:%02dZ", n)
+          at = RECENT[n]
           stamp.publish(identity, type: :picked_up, work_item: "TI-#{n}", at: at)
           stamp.publish(identity, type: :started, work_item: "TI-#{n}", attempt: 1, at: at)
           if n == 1

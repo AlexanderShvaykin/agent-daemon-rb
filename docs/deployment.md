@@ -201,9 +201,35 @@ to the config directory (configs in a root-owned directory, for example), set
   missing), the journal gets one `[History]` error line naming the path and the
   error, and the fleet and console run normally without history. `/healthz` does
   not depend on it.
+- **Threat model.** The database and its `-wal` and `-shm` files are all in
+  scope: they hold redacted agent output and error text (secrets arrive already
+  `[REDACTED]`, but the rest of what an agent printed is kept verbatim).
+  Pruning removes rows from queries, not bytes from disk: there is no `VACUUM`
+  and no `secure_delete`, so deleted text stays in freed pages of the main
+  database file until later writes reuse them, and in the `-wal` file until it
+  is checkpointed and overwritten. Protecting the files (owner-only `0600`, the
+  backup exclusion below) therefore still matters after a prune. Treat all
+  three like any other file containing operator-visible run logs.
 - **Backups.** Exclude the database and its `-wal`/`-shm` sidecars from backups.
   They hold redacted run history, not state the fleet needs, and copying a live
   WAL database file by file does not produce a consistent copy anyway.
+- **Retention is a security control.** `retention_days` (default 30) bounds how
+  long captured output and error text can be disclosed from this host, not only
+  how much disk history uses; choose it for the former. Old rows are deleted by
+  the history writer thread itself, at startup and then every
+  `prune_interval_seconds` (default 6 h), in batches of `prune_batch_size` runs:
+  there is no cron job and no separate process to configure. A run the live
+  master still holds open is never pruned; a crash-incomplete run is pruned by
+  its start time. There is no `VACUUM`, so the file does not shrink after a
+  prune: freed pages are reused by later writes, so the database file is
+  roughly bounded by one retention window of history, and the `-wal` file can
+  additionally grow to the size of the largest transaction. The console's History page shows
+  the retention period and the last successful prune (in memory: "Not yet run"
+  until the first cycle after a master start completes), and warns
+  "History degraded" when the writer lost a batch or the last prune failed — a
+  failed prune is logged as `[History] prune failed: <Class>: <message>` and
+  retried at the next interval. The fleet is unaffected either way, and
+  `/healthz` does not change.
 - **Turning it off.** `history: { enabled: false }` creates nothing on disk.
 
 ## 5. Deploy Updates

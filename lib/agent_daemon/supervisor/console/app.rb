@@ -498,6 +498,16 @@ module AgentDaemon
 
           .history-note { margin: 0 0 1rem; color: #425466; }
 
+          .history-warning {
+            margin: 0 0 1rem;
+            padding: 0.75rem 1rem;
+            border: 2px solid #8a4b00;
+            border-radius: 6px;
+            background: #fff4e5;
+            color: #3d2100;
+            overflow-wrap: anywhere;
+          }
+
           .history-pages {
             display: flex;
             flex-wrap: wrap;
@@ -1037,6 +1047,11 @@ module AgentDaemon
         HISTORY_CURSOR = /\A(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\|([1-9]\d{0,18})\z/
         HISTORY_RESULTS = %w[ok failed timeout killed incomplete running].freeze
         HISTORY_ABSENT_BADGE = '<span class="history-absent">absent from current fleet</span>'
+        # Story 5.6: a status call that raised, shown as degraded.
+        HISTORY_STATUS_FAILED = Object.new.freeze
+        HISTORY_WARNING = '<p class="history-warning" role="status"><strong>History degraded:</strong> ' \
+                          "new history or retention may be incomplete. The supervised fleet is unaffected " \
+                          "— the Fleet page shows live state.</p>\n"
         HISTORY_TRUNCATED_NOTE = '<p class="terminal-note">Only the retained tail is shown — earlier output ' \
                                  "exceeded the per-run limit and was discarded.</p>"
         HISTORY_INCOMPLETE_NOTE = '<p class="terminal-note">Captured output is incomplete — the history writer ' \
@@ -1965,11 +1980,13 @@ module AgentDaemon
 
           page = read_history { @history.runs(cursor: cursor) }
           current = current_entity_ids
+          status = history_status
           body = <<~HTML
-            <section aria-labelledby="history-heading">
+            #{history_warning(status)}<section aria-labelledby="history-heading">
             <h2 id="history-heading">Run history</h2>
             <p class="history-note">Newest runs first. This page is a snapshot of the history store; reload it to see newer runs.</p>
             #{history_run_list(page.runs, current)}#{history_pagination(page, cursor)}</section>
+            #{history_retention(status)}
           HTML
           html(request, layout(session, body, current: :history, live: false))
         rescue HistoryUnavailable
@@ -1990,7 +2007,7 @@ module AgentDaemon
 
           page = read_history { @history.runs(cursor: cursor, entity_key: id) }
           actions, more = read_history { @history.restart_actions(id) }
-          body = history_entity_page(id, entity, entry, page, cursor, actions, more)
+          body = history_warning(history_status) + history_entity_page(id, entity, entry, page, cursor, actions, more)
           html(request, layout(session, body, live: false))
         rescue HistoryUnavailable
           history_unavailable(request, session)
@@ -2004,7 +2021,8 @@ module AgentDaemon
           run = read_history { @history.run(id) }
           return not_found unless run
 
-          html(request, layout(session, history_run_page(run), live: false))
+          body = history_warning(history_status) + history_run_page(run)
+          html(request, layout(session, body, live: false))
         rescue HistoryUnavailable
           history_unavailable(request, session)
         end
@@ -2017,6 +2035,38 @@ module AgentDaemon
         rescue StandardError => e
           Log.error("[Console] history read failed: #{e.class}")
           raise HistoryUnavailable
+        end
+
+        # Story 5.6: the writer's in-memory status, read once per rendered
+        # page. A raise is logged by class only and shown as degraded; it
+        # never turns the page into an error.
+        def history_status
+          @history.status
+        rescue StandardError => e
+          Log.error("[Console] history status failed: #{e.class}")
+          HISTORY_STATUS_FAILED
+        end
+
+        def history_warning(status)
+          return "" if status.nil?
+
+          degraded = status.equal?(HISTORY_STATUS_FAILED) || status.writer_degraded || status.prune_degraded
+          degraded ? HISTORY_WARNING : ""
+        end
+
+        def history_retention(status)
+          return "" if status.nil? || status.equal?(HISTORY_STATUS_FAILED)
+
+          pruned = status.last_pruned_at ? history_time(status.last_pruned_at) : "Not yet run"
+          <<~HTML
+            <section aria-labelledby="history-retention-heading">
+            <h2 id="history-retention-heading">Retention</h2>
+            <dl class="history-fields">
+            <div><dt>Retention period</dt><dd>#{esc(status.retention_days)} days</dd></div>
+            <div><dt>Last successful prune</dt><dd>#{pruned}</dd></div>
+            </dl>
+            </section>
+          HTML
         end
 
         # History disabled, or its store never opened: the same unavailable

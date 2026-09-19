@@ -597,4 +597,78 @@ class TestConsoleHistory < Minitest::Test
       refute_includes response.body, "secret-output-line", path
     end
   end
+
+  # --- Story 5.6: retention status and the degraded warning -----------------
+
+  Status = Struct.new(:retention_days, :last_pruned_at, :writer_degraded, :prune_degraded)
+  WARNING = "new history or retention may be incomplete. The supervised fleet is unaffected " \
+            "— the Fleet page shows live state."
+
+  def use_status(&status)
+    @reader.close
+    @reader = Reader.new(path: @path, busy_timeout_ms: 5000, page_size: 50, status: status)
+  end
+
+  def history_paths
+    id = seed_run(seed_entity(RUNNER_KEY), started_at: at(1))
+    ["/history", "/history/entity?id=runner%3Awf%3Aa", "/history/run?id=#{id}"]
+  end
+
+  def test_a_healthy_status_shows_the_retention_period_and_last_prune_without_a_warning
+    use_status { Status.new(30, "2026-09-19T12:00:00.000Z", false, false) }
+    paths = history_paths
+
+    body = get_ok("/history")
+
+    assert_includes body, '<section aria-labelledby="history-retention-heading">'
+    assert_includes body, '<h2 id="history-retention-heading">Retention</h2>'
+    assert_includes body, "<div><dt>Retention period</dt><dd>30 days</dd></div>"
+    assert_includes body, "<div><dt>Last successful prune</dt><dd>" \
+                          '<time datetime="2026-09-19T12:00:00.000Z">2026-09-19T12:00:00.000Z</time></dd></div>'
+    paths.each { |path| refute_includes get_ok(path), "History degraded", path }
+  end
+
+  def test_a_status_before_the_first_prune_says_not_yet_run
+    use_status { Status.new(7, nil, false, false) }
+
+    body = get_ok("/history")
+
+    assert_includes body, "<dd>7 days</dd>"
+    assert_includes body, "<div><dt>Last successful prune</dt><dd>Not yet run</dd></div>"
+  end
+
+  def test_a_degraded_writer_or_prune_warns_on_every_history_page_and_never_on_the_fleet
+    paths = history_paths
+    [Status.new(30, nil, true, false), Status.new(30, nil, false, true)].each do |status|
+      use_status { status }
+      paths.each do |path|
+        body = get_ok(path)
+        assert_includes body, '<p class="history-warning" role="status"><strong>History degraded:</strong> ', path
+        assert_includes body, WARNING, path
+      end
+      refute_includes get_ok("/"), "History degraded", status.inspect
+      refute_includes get_ok("/entity?id=runner%3Awf%3Aa"), "History degraded", status.inspect
+    end
+  end
+
+  def test_a_raising_status_is_degraded_and_logs_the_class_only
+    use_status { raise ArgumentError, "secret detail" }
+
+    history_paths.each do |path|
+      body = nil
+      log = capture_log { body = get_ok(path) }
+
+      assert_includes body, "History degraded:", path
+      assert_includes body, WARNING, path
+      refute_includes body, "history-retention-heading", path
+      assert_equal ["[Console] history status failed: ArgumentError"], log.lines.map(&:chomp), path
+    end
+  end
+
+  def test_a_nil_status_renders_nothing_extra
+    body = get_ok("/history")
+
+    refute_includes body, "Retention"
+    refute_includes body, "History degraded"
+  end
 end
