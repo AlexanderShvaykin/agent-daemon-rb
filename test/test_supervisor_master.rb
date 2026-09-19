@@ -531,9 +531,11 @@ class TestSupervisorMaster < Minitest::Test
   end
 
   def spy_factory(spies, **kwargs)
-    lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry, _output_buffers, restart_control: nil|
+    lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
+               restart_control: nil, history: nil|
       spies << ConsoleSpy.new(console_config, **kwargs)
       spies.last.instance_variable_set(:@restart_control, restart_control)
+      spies.last.instance_variable_set(:@history, history)
       spies.last
     end
   end
@@ -661,7 +663,7 @@ class TestSupervisorMaster < Minitest::Test
   # case (bad base_url, unusable auth block) — same rule applies.
   def test_a_console_factory_that_raises_does_not_stop_the_fleet
     exploding = lambda do |_console_config, _fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
-                          restart_control: nil|
+                          restart_control: nil, history: nil|
       raise "factory boom"
     end
     with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
@@ -729,7 +731,7 @@ class TestSupervisorMaster < Minitest::Test
   def test_console_factory_receives_a_fleet_whose_roster_covers_runners_messenger_and_reactor_in_order
     received_fleet = nil
     factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
-                        restart_control: nil|
+                        restart_control: nil, history: nil|
       received_fleet = fleet
       ConsoleSpy.new(console_config)
     end
@@ -759,7 +761,7 @@ class TestSupervisorMaster < Minitest::Test
   def test_console_factory_receives_a_fleet_carrying_config_authored_descriptions
     received_fleet = nil
     factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
-                        restart_control: nil|
+                        restart_control: nil, history: nil|
       received_fleet = fleet
       ConsoleSpy.new(console_config)
     end
@@ -797,7 +799,7 @@ class TestSupervisorMaster < Minitest::Test
   def test_a_workflow_without_descriptions_has_no_doc
     received_fleet = nil
     factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
-                        restart_control: nil|
+                        restart_control: nil, history: nil|
       received_fleet = fleet
       ConsoleSpy.new(console_config)
     end
@@ -820,7 +822,7 @@ class TestSupervisorMaster < Minitest::Test
   def test_console_factory_receives_an_activity_log_reading_the_masters_own_event_bus
     received_activity_log = nil
     factory = lambda do |console_config, _fleet, activity_log, _event_bus, _state_registry, _output_buffers,
-                        restart_control: nil|
+                        restart_control: nil, history: nil|
       received_activity_log = activity_log
       ConsoleSpy.new(console_config)
     end
@@ -841,7 +843,7 @@ class TestSupervisorMaster < Minitest::Test
   def test_console_factory_receives_the_masters_exact_event_bus_and_state_registry
     received = nil
     factory = lambda do |console_config, _fleet, _activity_log, event_bus, state_registry, _output_buffers,
-                        restart_control: nil|
+                        restart_control: nil, history: nil|
       received = [event_bus, state_registry]
       ConsoleSpy.new(console_config)
     end
@@ -862,7 +864,7 @@ class TestSupervisorMaster < Minitest::Test
   def test_console_factory_receives_the_masters_exact_output_buffers
     received = nil
     factory = lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry, output_buffers,
-                        restart_control: nil|
+                        restart_control: nil, history: nil|
       received = output_buffers
       ConsoleSpy.new(console_config)
     end
@@ -878,7 +880,7 @@ class TestSupervisorMaster < Minitest::Test
   def test_console_factory_receives_a_restart_control_for_the_supervised_roster
     received = nil
     factory = lambda do |console_config, _fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
-                        restart_control: nil|
+                        restart_control: nil, history: nil|
       received = restart_control
       ConsoleSpy.new(console_config)
     end
@@ -903,7 +905,7 @@ class TestSupervisorMaster < Minitest::Test
   def test_the_restart_control_resolves_every_console_id_the_fleet_can_render
     received = nil
     factory = lambda do |console_config, fleet, _activity_log, _event_bus, _state_registry, _output_buffers,
-                        restart_control: nil|
+                        restart_control: nil, history: nil|
       received = [restart_control, fleet]
       ConsoleSpy.new(console_config)
     end
@@ -1606,6 +1608,162 @@ class TestSupervisorMaster < Minitest::Test
       assert_equal :degraded, master.history_state
       assert_equal 1, errors.grep(/\[History\]/).size, errors.inspect
       refute_empty master.instance_variable_get(:@supervisors)
+    end
+  end
+
+  # --- Story 5.5: the console's history reader -------------------------------
+
+  def test_with_history_enabled_the_console_receives_the_masters_reader
+    spies = []
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, console_factory: spy_factory(spies))
+      boot_and_shut_down(master)
+
+      assert_instance_of AgentDaemon::Supervisor::History::Reader, master.history_reader
+      assert_same master.history_reader, spies.last.instance_variable_get(:@history)
+      assert_equal config.history["page_size"], master.history_reader.page_size
+    end
+  end
+
+  def test_with_history_disabled_the_console_receives_no_reader
+    spies = []
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK,
+                                                                  history: { "enabled" => false }) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, console_factory: spy_factory(spies))
+      boot_and_shut_down(master)
+
+      assert_nil master.history_reader
+      assert_nil spies.last.instance_variable_get(:@history)
+    end
+  end
+
+  def test_a_history_opener_that_raises_gives_the_console_no_reader
+    spies = []
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], console: CONSOLE_BLOCK) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2, console_factory: spy_factory(spies),
+                                                           history_opener: raising_opener(RuntimeError.new("no store")))
+      capture_log_errors { boot_and_shut_down(master) }
+
+      assert_equal :degraded, master.history_state
+      assert_nil master.history_reader
+      assert_nil spies.last.instance_variable_get(:@history)
+    end
+  end
+
+  def test_a_writer_that_fails_to_start_builds_no_reader
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2,
+                                                           history_writer_factory: ->(*) { raise "no writer" })
+      boot_and_shut_down(master)
+
+      assert_nil master.history_reader
+    end
+  end
+
+  def test_the_reader_is_closed_at_shutdown
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      master.define_singleton_method(:finalize_supervisors) do
+        super()
+        history_reader.runs # opens the connection while the writer is live
+      end
+      boot_and_shut_down(master)
+
+      assert_nil master.history_reader.instance_variable_get(:@db)
+    end
+  end
+
+  # The reader closes even when the writer misses its flush deadline and
+  # close_history returns early.
+  def test_the_reader_is_closed_even_when_the_writer_misses_its_deadline
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
+      closed = []
+      reader = Object.new
+      reader.define_singleton_method(:close) { closed << true }
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2,
+                                                           history_writer_factory: ->(*) { StuckWriter.new },
+                                                           history_reader_factory: ->(_c) { reader })
+      capture_log { boot_and_shut_down(master) }
+
+      assert_equal [true], closed
+      master.history.close
+    end
+  end
+
+  def test_a_reader_factory_that_raises_leaves_the_writer_running
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }]) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2,
+                                                           history_reader_factory: ->(_c) { raise "no reader" })
+      errors = capture_log_errors { boot_and_shut_down(master) }
+
+      assert_equal :ready, master.history_state
+      assert_nil master.history_reader
+      refute_nil master.history_writer
+      assert_equal 1, errors.grep(/\[History\] reader unavailable/).size, errors.inspect
+    end
+  end
+
+  # AC1: Fleet -> entity -> Persisted history -> Older runs -> a run, every
+  # page 200 from the master's real reader, the last showing that run's output.
+  def test_an_operator_walks_from_the_fleet_to_a_persisted_runs_output
+    require "rack"
+    with_config([{ name: "wf", runners: [tracker_runner("a")] }], history: { "page_size" => 10 }) do |_dir, config|
+      master = AgentDaemon::Supervisor::Master.new(config, join_timeout: 2)
+      identity = AgentDaemon::Supervisor::RunnerIdentity.new(workflow: "wf", runner: "a")
+      bodies = []
+      master.define_singleton_method(:finalize_supervisors) do
+        super()
+        stamp = AgentDaemon::Supervisor::GenerationStamp.new(1, event_bus)
+        ingress = output_pipeline.ingress(1)
+        (1..11).each do |n|
+          at = format("2026-09-19T10:00:%02dZ", n)
+          stamp.publish(identity, type: :picked_up, work_item: "TI-#{n}", at: at)
+          stamp.publish(identity, type: :started, work_item: "TI-#{n}", attempt: 1, at: at)
+          if n == 1
+            ingress.begin_run(identity, 1)
+            ingress.append(identity, :stdout, "persisted-agent-line\n")
+            ingress.end_run(identity, 1, :ok)
+          end
+          stamp.publish(identity, type: :finished, work_item: "TI-#{n}", reason: :ok, attempt: 1, at: at)
+        end
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+        until history_reader.runs.next_cursor
+          raise "runs never persisted" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+          sleep 0.01
+        end
+
+        app = AgentDaemon::Supervisor::Console::App.new(
+          fleet: send(:fleet), activity_log: send(:activity_log),
+          live_updates: AgentDaemon::Supervisor::Console::LiveUpdates.new(event_bus: event_bus,
+                                                                          state_registry: state_registry),
+          output_buffers: output_buffers, history: history_reader
+        )
+        session = AgentDaemon::Supervisor::Console::SessionStore.new(ttl: 60).then do |store|
+          pending = store.create_pending(state: "s")
+          store.claim_pending(pending.id, "s")
+          store.promote(pending.id, username: "alice")
+        end
+        request = Rack::MockRequest.new(Rack::Lint.new(app))
+        visit = lambda do |path|
+          response = request.get(path, AgentDaemon::Supervisor::Console::Auth::SESSION_ENV_KEY => session)
+          bodies << [path, response.status, response.body]
+          response.body
+        end
+        link = ->(body, text) { body[/<a (?:rel="next" )?href="([^"]+)">#{text}<\/a>/, 1].gsub("&amp;", "&") }
+
+        fleet_page = visit.call("/")
+        entity_page = visit.call(link.call(fleet_page, "a"))
+        history_page = visit.call(link.call(entity_page, "Persisted history"))
+        older = visit.call(link.call(history_page, "Older runs"))
+        visit.call(older[%r{<h3><a href="(/history/run\?id=\d+)">}, 1])
+      end
+      boot_and_shut_down(master)
+
+      assert_equal 5, bodies.size
+      bodies.each { |path, status, _body| assert_equal 200, status, path }
+      assert_includes bodies.last[2], "persisted-agent-line"
+      assert_includes bodies.last[2], "<div><dt>Work item</dt><dd>TI-1</dd></div>"
     end
   end
 end

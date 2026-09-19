@@ -14,6 +14,7 @@ require_relative "output_buffers"
 require_relative "console/server"
 require_relative "history/database"
 require_relative "history/writer"
+require_relative "history/reader"
 
 module AgentDaemon
   module Supervisor
@@ -42,7 +43,7 @@ module AgentDaemon
       # for the same reason join_timeout is: a test must be able to make the
       # console fail on purpose and watch the fleet carry on regardless.
       CONSOLE_FACTORY = lambda do |console_config, fleet, activity_log, event_bus, state_registry, output_buffers,
-                                   restart_control: nil|
+                                   restart_control: nil, history: nil|
         Console::Server.new(
           console_config,
           fleet: fleet,
@@ -50,7 +51,8 @@ module AgentDaemon
           event_bus: event_bus,
           state_registry: state_registry,
           output_buffers: output_buffers,
-          restart_control: restart_control
+          restart_control: restart_control,
+          history: history
         )
       end
 
@@ -77,19 +79,30 @@ module AgentDaemon
                             backoff_ceiling_ms: history_config["write_retry_backoff_ceiling_ms"])
       end
 
+      # Builds the console's query-only history reader (Story 5.5): a second
+      # connection, never the writer's. Construction does no IO.
+      HISTORY_READER_FACTORY = lambda do |history_config|
+        History::Reader.new(path: history_config["database_path"],
+                            busy_timeout_ms: history_config["busy_timeout_ms"],
+                            page_size: history_config["page_size"])
+      end
+
       attr_reader :state_registry, :event_bus, :output_pipeline, :output_buffers
-      attr_reader :history, :history_writer
+      attr_reader :history, :history_writer, :history_reader
 
       def initialize(supervisor_config, join_timeout: JOIN_TIMEOUT, console_factory: CONSOLE_FACTORY,
-                     history_opener: HISTORY_OPENER, history_writer_factory: HISTORY_WRITER_FACTORY)
+                     history_opener: HISTORY_OPENER, history_writer_factory: HISTORY_WRITER_FACTORY,
+                     history_reader_factory: HISTORY_READER_FACTORY)
         @config = supervisor_config
         @join_timeout = join_timeout
         @console_factory = console_factory
         @history_opener = history_opener
         @history_writer_factory = history_writer_factory
+        @history_reader_factory = history_reader_factory
         @history = nil
         @history_state = nil
         @history_writer = nil
+        @history_reader = nil
         @shutdown_flag = AgentDaemon::ShutdownFlag.new
         @entity_factories = {}
         @entity_ids = {}
@@ -250,7 +263,7 @@ module AgentDaemon
 
         console = @console_factory.call(
           @config.console, fleet, activity_log, @event_bus, @state_registry, @output_buffers,
-          restart_control: @restart_control
+          restart_control: @restart_control, history: @history_reader
         )
         console.start
         @console = console
@@ -279,6 +292,7 @@ module AgentDaemon
         @history_state = :ready
         Log.info("[History] opened #{history_config['database_path']}")
         start_history_writer
+        build_history_reader(history_config)
       rescue StandardError, ScriptError => e
         @history = nil
         @history_state = :degraded
@@ -306,11 +320,32 @@ module AgentDaemon
         @history = nil
       end
 
+      # Only for a store whose writer is running. A reader that cannot be
+      # built leaves the console showing history as unavailable; the writer
+      # and the fleet are unaffected.
+      def build_history_reader(history_config)
+        return unless @history && @history_writer
+
+        @history_reader = @history_reader_factory.call(history_config)
+      rescue StandardError, ScriptError => e
+        Log.error("[History] reader unavailable, the console will show history as unavailable: " \
+                  "#{e.class}: #{e.message}")
+      end
+
+      # The reader closes first (the console is already down), rescued, so a
+      # writer stop that returns early below never leaves it open.
+      def close_history_reader
+        @history_reader&.close
+      rescue StandardError => e
+        Log.error("[History] failed to close the console reader: #{e.class}: #{e.message}")
+      end
+
       # The writer stops first: its final drain commits what it has already
       # read. A writer still running after the flush deadline may be inside a
       # transaction, so the store is then left for process exit to close, and
       # what it had not flushed is counted in the log (Story 5.3).
       def close_history
+        close_history_reader
         return unless @history
 
         flush_seconds = @config.history["shutdown_flush_seconds"]

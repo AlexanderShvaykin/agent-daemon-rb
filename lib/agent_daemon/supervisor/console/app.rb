@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "json"
 require "rack"
 
 require_relative "../../log"
@@ -362,6 +363,8 @@ module AgentDaemon
           .outcome-timeout { color: #7a4300; background: #fff1d6; }
           .outcome-killed { color: #3f4650; background: #eceff2; }
           .outcome-unknown { color: #4b5563; background: #eceff2; }
+          .outcome-incomplete { color: #6b3a00; background: #fbe7cf; border-style: dashed; }
+          .outcome-running { color: #1f4f82; background: #e3eefb; }
 
           .staleness,
           .activity-note { color: #425466; }
@@ -436,6 +439,72 @@ module AgentDaemon
              up inspecting earlier lines. */
           .terminal-new-output { margin: 0 0 0.75rem; }
 
+          .console-nav {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+          }
+
+          .console-nav a[aria-current="page"] { font-weight: 700; color: #172033; }
+
+          /* Story 5.5: persisted history. Ordered lists of cards, never a
+             table, and no overflow-x (the standing prohibition above). */
+          .history-runs,
+          .history-restarts,
+          .history-transitions {
+            display: grid;
+            gap: 0.9rem;
+            margin: 0;
+            padding: 0;
+            list-style: none;
+          }
+
+          .history-runs > li,
+          .history-restarts > li,
+          .history-transitions > li { min-width: 0; }
+
+          .history-restarts > li,
+          .history-transitions > li {
+            padding: 0.75rem 1rem;
+            border: 1px solid #cbd5df;
+            border-radius: 0.65rem;
+            background: #fbfcfd;
+          }
+
+          .history-fields { margin: 0 0 1rem; }
+          .history-fields:last-child { margin-bottom: 0; }
+
+          .history-fields > div {
+            display: grid;
+            grid-template-columns: minmax(5.5rem, auto) 1fr;
+            gap: 0.75rem;
+            padding: 0.45rem 0;
+            border-top: 1px solid #e1e7ec;
+          }
+
+          .history-fields dt { color: #425466; font-weight: 600; }
+          .history-fields dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+          .history-stderr { white-space: pre-wrap; }
+
+          .history-absent {
+            display: inline-block;
+            margin-left: 0.4rem;
+            padding: 0 0.45rem;
+            border: 1px dashed currentColor;
+            border-radius: 999px;
+            color: #5f3600;
+            font-size: 0.875rem;
+          }
+
+          .history-note { margin: 0 0 1rem; color: #425466; }
+
+          .history-pages {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            margin-top: 1rem;
+          }
+
           @media (max-width: 40rem) {
             .console-header,
             .console-session { align-items: stretch; flex-direction: column; }
@@ -449,6 +518,7 @@ module AgentDaemon
             .entity-diagnostics > div,
             .activity-timeline li dl > div { grid-template-columns: 1fr; gap: 0.1rem; }
             .activity-timeline > li { padding: 0.8rem; }
+            .history-fields > div { grid-template-columns: 1fr; gap: 0.1rem; }
           }
         CSS
 
@@ -960,12 +1030,33 @@ module AgentDaemon
         NO_CURSOR = [nil, nil, nil].freeze
         CURSOR_MAX_DIGITS = 19
 
-        def initialize(fleet:, activity_log:, live_updates:, output_buffers:, restart_control: nil)
+        # Story 5.5: a persisted run id, and the history page cursor
+        # `<started_at>|<id>` in the writer's iso8601(3) format. Anything else
+        # is a 404 before the reader is asked.
+        HISTORY_RUN_ID = /\A[1-9]\d{0,18}\z/
+        HISTORY_CURSOR = /\A(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\|([1-9]\d{0,18})\z/
+        HISTORY_RESULTS = %w[ok failed timeout killed incomplete running].freeze
+        HISTORY_ABSENT_BADGE = '<span class="history-absent">absent from current fleet</span>'
+        HISTORY_TRUNCATED_NOTE = '<p class="terminal-note">Only the retained tail is shown — earlier output ' \
+                                 "exceeded the per-run limit and was discarded.</p>"
+        HISTORY_INCOMPLETE_NOTE = '<p class="terminal-note">Captured output is incomplete — the history writer ' \
+                                  "lost some lines, so this is not a complete transcript.</p>"
+        HISTORY_NO_OUTPUT_NOTE = '<p class="terminal-note">No output was captured for this run.</p>'
+
+        # A reader call failed; the handler answers 503. Internal only.
+        class HistoryUnavailable < StandardError; end
+
+        # `history` is duck-typed and injected (a History::Reader in the
+        # master): console files never require history/* or sqlite3 (AD-5).
+        # nil means history is disabled or unavailable, and every history
+        # route then answers 503 "History unavailable".
+        def initialize(fleet:, activity_log:, live_updates:, output_buffers:, restart_control: nil, history: nil)
           @fleet = fleet
           @activity_log = activity_log
           @live_updates = live_updates
           @output_buffers = output_buffers
           @restart_control = restart_control
+          @history = history
         end
 
         def call(env)
@@ -979,6 +1070,10 @@ module AgentDaemon
           when "/entity"  then page_request?(request) ? entity_detail(request, env[Auth::SESSION_ENV_KEY]) : not_found
           when RESTART_PATH then restart(request, env[Auth::SESSION_ENV_KEY])
           when "/events"  then events(request, env)
+          when "/history" then page_request?(request) ? history_index(request, env[Auth::SESSION_ENV_KEY]) : not_found
+          when "/history/entity"
+            page_request?(request) ? history_entity(request, env[Auth::SESSION_ENV_KEY]) : not_found
+          when "/history/run" then page_request?(request) ? history_run(request, env[Auth::SESSION_ENV_KEY]) : not_found
           else                 not_found
           end
         rescue StandardError => e
@@ -1006,7 +1101,7 @@ module AgentDaemon
         # access decision here would be exactly the auth code this app must not
         # contain.
         def home(request, session)
-          html(request, layout(session, fleet_html))
+          html(request, layout(session, fleet_html, current: :fleet))
         end
 
         # GET /entity?id=<entity id>. A query parameter, not a path segment —
@@ -1250,9 +1345,15 @@ module AgentDaemon
         # operator-authored config — not agent-influenced today, but 2.4/2.5 put
         # genuinely agent-influenced values (work-item keys) into this same
         # page, so it escapes by habit rather than by threat model.
-        def layout(session, content)
+        #
+        # `current` marks the primary-nav link of the page being shown
+        # (aria-current), and `live: false` leaves LIVE_SCRIPT out: the
+        # history pages are static snapshots with no SSE (Story 5.5).
+        def layout(session, content, current: nil, live: true)
           username = session&.username.to_s
           csrf_token = session&.csrf_token.to_s
+          fleet_current = current == :fleet ? ' aria-current="page"' : ""
+          history_current = current == :history ? ' aria-current="page"' : ""
 
           <<~HTML
             <!DOCTYPE html>
@@ -1271,6 +1372,10 @@ module AgentDaemon
             <h1>agent-daemon console</h1>
             <p>Signed in as <strong>#{esc(username)}</strong></p>
             </div>
+            <nav class="console-nav" aria-label="Primary">
+            <a href="/"#{fleet_current}>Fleet</a>
+            <a href="/history"#{history_current}>History</a>
+            </nav>
             <div class="console-session">
             <form method="post" action="/auth/logout">
             <input type="hidden" name="_csrf" value="#{esc(csrf_token)}">
@@ -1280,7 +1385,7 @@ module AgentDaemon
             </header>
             <main id="console-content">
             #{content}</main>
-            #{LIVE_SCRIPT}
+            #{live ? LIVE_SCRIPT : ''}
             </body>
             </html>
           HTML
@@ -1436,6 +1541,7 @@ module AgentDaemon
         def entity_page(entry, session, restart_target)
           <<~HTML
             <p><a href="/">&larr; Fleet</a></p>
+            <p><a href="#{esc("/history/entity?id=#{Rack::Utils.escape(entry.id)}")}">Persisted history</a></p>
             <section aria-labelledby="entity-diagnostics-heading">
             <h2 id="entity-diagnostics-heading">#{esc(entry.name)}</h2>
             <dl class="entity-diagnostics">
@@ -1843,6 +1949,360 @@ module AgentDaemon
           css = stderr ? "terminal-stream-stderr" : "terminal-stream-stdout"
           label = stderr ? "err" : "out"
           %(<div class="terminal-line"><span class="terminal-stream #{css}">#{label}</span>#{esc(record.text)}</div>)
+        end
+
+        # --- Story 5.5: persisted history ---------------------------------
+        #
+        # Check order on every route: syntax (404) → reader present (503) →
+        # query (503 on failure, 404 when nothing resolves). A supplied id or
+        # cursor never reaches the body or a log line. The pages are static
+        # snapshots: rendered without LIVE_SCRIPT.
+
+        def history_index(request, session)
+          cursor = history_cursor_param(request)
+          return not_found if cursor == MALFORMED_PARAM
+          return no_history_reader(request, session) unless @history
+
+          page = read_history { @history.runs(cursor: cursor) }
+          current = current_entity_ids
+          body = <<~HTML
+            <section aria-labelledby="history-heading">
+            <h2 id="history-heading">Run history</h2>
+            <p class="history-note">Newest runs first. This page is a snapshot of the history store; reload it to see newer runs.</p>
+            #{history_run_list(page.runs, current)}#{history_pagination(page, cursor)}</section>
+          HTML
+          html(request, layout(session, body, current: :history, live: false))
+        rescue HistoryUnavailable
+          history_unavailable(request, session)
+        end
+
+        def history_entity(request, session)
+          id = entity_id_param(request)
+          return not_found unless id.is_a?(String)
+
+          cursor = history_cursor_param(request)
+          return not_found if cursor == MALFORMED_PARAM
+          return no_history_reader(request, session) unless @history
+
+          entity = read_history { @history.entity(id) }
+          entry = @fleet.find(id)
+          return not_found unless entity || entry
+
+          page = read_history { @history.runs(cursor: cursor, entity_key: id) }
+          actions, more = read_history { @history.restart_actions(id) }
+          body = history_entity_page(id, entity, entry, page, cursor, actions, more)
+          html(request, layout(session, body, live: false))
+        rescue HistoryUnavailable
+          history_unavailable(request, session)
+        end
+
+        def history_run(request, session)
+          id = history_run_id_param(request)
+          return not_found unless id
+          return no_history_reader(request, session) unless @history
+
+          run = read_history { @history.run(id) }
+          return not_found unless run
+
+          html(request, layout(session, history_run_page(run), live: false))
+        rescue HistoryUnavailable
+          history_unavailable(request, session)
+        end
+
+        # One log line naming the exception class only: a message could carry
+        # SQL, a path or a value. Nothing is retried inline and the writer is
+        # never touched; the reader reopens its own connection next call.
+        def read_history
+          yield
+        rescue StandardError => e
+          Log.error("[Console] history read failed: #{e.class}")
+          raise HistoryUnavailable
+        end
+
+        # History disabled, or its store never opened: the same unavailable
+        # page, and one log line with no exception to name.
+        def no_history_reader(request, session)
+          Log.error("[Console] history read failed: no history reader")
+          history_unavailable(request, session)
+        end
+
+        def history_unavailable(request, session)
+          body = <<~HTML
+            <section aria-labelledby="history-unavailable-heading">
+            <h2 id="history-unavailable-heading">History unavailable</h2>
+            <p>The history store cannot be read right now. The supervised fleet is unaffected: runners keep running, and the Fleet page still shows live state.</p>
+            </section>
+          HTML
+          [503, HTML_HEADERS.dup, request.head? ? [] : [layout(session, body, live: false)]]
+        end
+
+        # nil when absent, MALFORMED_PARAM for anything that is not exactly
+        # one well-formed cursor (including a query Rack refuses).
+        def history_cursor_param(request)
+          value = request.GET["cursor"]
+          return nil if value.nil?
+
+          match = value.is_a?(String) && HISTORY_CURSOR.match(value)
+          match ? [match[1], Integer(match[2], 10)].freeze : MALFORMED_PARAM
+        rescue *PARAM_ERRORS
+          MALFORMED_PARAM
+        end
+
+        def history_run_id_param(request)
+          value = request.GET["id"]
+          value.is_a?(String) && HISTORY_RUN_ID.match?(value) ? Integer(value, 10) : nil
+        rescue *PARAM_ERRORS
+          nil
+        end
+
+        # One registry read per page, not one per card.
+        def current_entity_ids
+          @fleet.entries.to_h { |entry| [entry.id, true] }
+        end
+
+        def history_entity_href(entity_key, cursor = nil)
+          query = "id=#{Rack::Utils.escape(entity_key)}"
+          query += "&cursor=#{Rack::Utils.escape(cursor_value(cursor))}" if cursor
+          esc("/history/entity?#{query}")
+        end
+
+        def history_run_href(id)
+          esc("/history/run?id=#{Rack::Utils.escape(id)}")
+        end
+
+        def cursor_value(cursor)
+          "#{cursor[0]}|#{cursor[1]}"
+        end
+
+        def history_entity_name(runner, kind)
+          (runner || kind).to_s
+        end
+
+        def history_time(value)
+          return EM_DASH if value.nil?
+
+          %(<time datetime="#{esc(value)}">#{esc(value)}</time>)
+        end
+
+        def history_result(result)
+          css = HISTORY_RESULTS.include?(result) ? result : "unknown"
+          %(<span class="outcome outcome-#{css}">#{esc(result)}</span>)
+        end
+
+        def history_absent_badge(entity_key, current)
+          current[entity_key] ? "" : HISTORY_ABSENT_BADGE
+        end
+
+        def history_value(value)
+          esc(value.nil? ? EM_DASH : value)
+        end
+
+        # role="list" for the same Safari/VoiceOver reason as entity_group.
+        def history_run_list(runs, current)
+          return "<p>No runs recorded.</p>\n" if runs.empty?
+
+          items = runs.map { |run| history_run_card(run, current) }.join
+          %(<ol class="history-runs" role="list">\n#{items}</ol>\n)
+        end
+
+        def history_run_card(run, current)
+          entity = %(<a href="#{history_entity_href(run.entity_key)}">) +
+                   "#{esc(history_entity_name(run.runner, run.kind))}</a>"
+          <<~HTML
+            <li><article>
+            <h3><a href="#{history_run_href(run.id)}">Run #{esc(run.id)}</a></h3>
+            <dl class="history-fields">
+            <div><dt>Result</dt><dd>#{history_result(run.result)}</dd></div>
+            <div><dt>Workflow</dt><dd>#{history_value(run.workflow)}</dd></div>
+            <div><dt>Entity</dt><dd>#{entity}#{history_absent_badge(run.entity_key, current)}</dd></div>
+            <div><dt>Work item</dt><dd>#{history_value(run.work_item)}</dd></div>
+            <div><dt>Attempt</dt><dd>#{history_value(run.attempt)}</dd></div>
+            <div><dt>Generation</dt><dd>#{history_value(run.generation)}</dd></div>
+            <div><dt>Started</dt><dd>#{history_time(run.started_at)}</dd></div>
+            </dl>
+            </article></li>
+          HTML
+        end
+
+        # Scoped to one entity when `entity_key` is given, else /history.
+        # A nil target cursor is the newest page.
+        def history_pagination(page, cursor, entity_key: nil)
+          href = lambda do |target|
+            entity_key ? history_entity_href(entity_key, target) : history_index_href(target)
+          end
+          links = []
+          links << %(<a href="#{href.call(nil)}">Newest runs</a>) if cursor
+          links << %(<a rel="next" href="#{href.call(page.next_cursor)}">Older runs</a>) if page.next_cursor
+          return "" if links.empty?
+
+          %(<nav class="history-pages" aria-label="History pages">\n#{links.join("\n")}\n</nav>\n)
+        end
+
+        def history_index_href(cursor)
+          return "/history" unless cursor
+
+          esc("/history?cursor=#{Rack::Utils.escape(cursor_value(cursor))}")
+        end
+
+        # `entity` is the persisted row, `entry` the current fleet entry;
+        # either may be nil, never both. A current entity with no rows yet
+        # renders the empty state.
+        def history_entity_page(entity_key, entity, entry, page, cursor, actions, more)
+          workflow = entity ? entity.workflow : entry.workflow
+          kind = entity ? entity.kind : entry.kind.to_s
+          name = entity ? history_entity_name(entity.runner, entity.kind) : entry.name
+          fleet = if entry
+                    %(<a href="#{esc("/entity?id=#{Rack::Utils.escape(entry.id)}")}">Current fleet entry</a>)
+                  else
+                    HISTORY_ABSENT_BADGE
+                  end
+          current = current_entity_ids
+
+          <<~HTML
+            <p><a href="/history">&larr; History</a></p>
+            <section aria-labelledby="history-entity-heading">
+            <h2 id="history-entity-heading">#{esc(name)}</h2>
+            <dl class="history-fields">
+            <div><dt>Workflow</dt><dd>#{history_value(workflow)}</dd></div>
+            <div><dt>Kind</dt><dd>#{esc(kind)}</dd></div>
+            <div><dt>Fleet</dt><dd>#{fleet}</dd></div>
+            </dl>
+            </section>
+            <section aria-labelledby="history-entity-runs-heading">
+            <h2 id="history-entity-runs-heading">Runs</h2>
+            #{history_run_list(page.runs, current)}#{history_pagination(page, cursor, entity_key: entity_key)}</section>
+            <section aria-labelledby="history-restarts-heading">
+            <h2 id="history-restarts-heading">Restart actions</h2>
+            #{history_restart_list(actions, more)}</section>
+          HTML
+        end
+
+        def history_restart_list(actions, more)
+          return "<p>No restart actions recorded.</p>\n" if actions.empty?
+
+          items = actions.map { |action| history_restart_item(action) }.join
+          note = more ? %(<p class="history-note">Only the newest #{actions.size} restart actions are shown.</p>\n) : ""
+          %(#{note}<ol class="history-restarts" role="list">\n#{items}</ol>\n)
+        end
+
+        def history_restart_item(action)
+          <<~HTML
+            <li><dl class="history-fields">
+            <div><dt>Actors</dt><dd>#{esc(history_actors(action.actors))}</dd></div>
+            <div><dt>Requested</dt><dd>#{history_time(action.requested_at)}</dd></div>
+            <div><dt>Completed</dt><dd>#{history_time(action.completed_at)}</dd></div>
+            <div><dt>Generation</dt><dd>#{history_value(action.source_generation)} → #{history_value(action.target_generation)}</dd></div>
+            </dl></li>
+          HTML
+        end
+
+        # The writer stores a JSON array; anything else is shown verbatim.
+        def history_actors(actors)
+          parsed = JSON.parse(actors.to_s)
+          parsed.is_a?(Array) ? parsed.map(&:to_s).join(", ") : actors.to_s
+        rescue JSON::ParserError
+          actors.to_s
+        end
+
+        def history_run_page(run)
+          entity = %(<a href="#{history_entity_href(run.entity_key)}">) +
+                   "#{esc(history_entity_name(run.runner, run.kind))}</a>"
+          absent = history_absent_badge(run.entity_key, current_entity_ids)
+
+          <<~HTML
+            <p><a href="/history">&larr; History</a></p>
+            <section aria-labelledby="history-run-heading">
+            <h2 id="history-run-heading">Run #{esc(run.id)}</h2>
+            <dl class="history-fields">
+            <div><dt>Result</dt><dd>#{history_result(run.result)}</dd></div>
+            <div><dt>Workflow</dt><dd>#{history_value(run.workflow)}</dd></div>
+            <div><dt>Entity</dt><dd>#{entity}#{absent}</dd></div>
+            <div><dt>Kind</dt><dd>#{history_value(run.kind)}</dd></div>
+            <div><dt>Generation</dt><dd>#{history_value(run.generation)}</dd></div>
+            <div><dt>Work item</dt><dd>#{history_value(run.work_item)}</dd></div>
+            <div><dt>Attempt</dt><dd>#{history_value(run.attempt)}</dd></div>
+            <div><dt>Started</dt><dd>#{history_time(run.started_at)}</dd></div>
+            <div><dt>Finished</dt><dd>#{history_time(run.finished_at)}</dd></div>
+            </dl>
+            <p><a href="#{history_entity_href(run.entity_key)}">Entity history</a> · <a href="/history">All runs</a></p>
+            </section>
+            #{history_transitions(run.events)}#{history_error_summary(run.error_summary)}#{history_output(run)}
+          HTML
+        end
+
+        def history_transitions(events)
+          body = if events.empty?
+                   "<p>No transitions recorded.</p>\n"
+                 else
+                   items = events.map do |event|
+                     <<~HTML
+                       <li><dl class="history-fields">
+                       <div><dt>Event</dt><dd>#{history_value(event.event)}</dd></div>
+                       <div><dt>Reason</dt><dd>#{history_value(event.reason)}</dd></div>
+                       <div><dt>Time</dt><dd>#{history_time(event.occurred_at)}</dd></div>
+                       </dl></li>
+                     HTML
+                   end.join
+                   %(<ol class="history-transitions" role="list">\n#{items}</ol>\n)
+                 end
+
+          <<~HTML
+            <section aria-labelledby="history-transitions-heading">
+            <h2 id="history-transitions-heading">Transitions</h2>
+            #{body}</section>
+          HTML
+        end
+
+        # Only a failed run carries a summary; NULL renders no section.
+        def history_error_summary(json)
+          return "" if json.nil?
+
+          parsed = begin
+            JSON.parse(json)
+          rescue JSON::ParserError
+            nil
+          end
+          body = if parsed.is_a?(Hash)
+                   <<~HTML
+                     <dl class="history-fields">
+                     <div><dt>Reason</dt><dd>#{history_value(parsed['reason'])}</dd></div>
+                     <div><dt>Attempt</dt><dd>#{history_value(parsed['attempt'])}</dd></div>
+                     <div><dt>Last stderr</dt><dd class="history-stderr">#{history_value(parsed['last_stderr'])}</dd></div>
+                     </dl>
+                   HTML
+                 else
+                   "<p>Error summary unreadable</p>\n"
+                 end
+
+          <<~HTML
+            <section aria-labelledby="history-error-heading">
+            <h2 id="history-error-heading">Error summary</h2>
+            #{body}</section>
+          HTML
+        end
+
+        # The terminal panel's markup and #terminal_line, without the live
+        # panel's id and data attributes: nothing streams into this one. No
+        # rows renders the note alone, never an empty scroll region.
+        def history_output(run)
+          notes = +""
+          notes << HISTORY_TRUNCATED_NOTE << "\n" if run.output_truncated
+          notes << HISTORY_INCOMPLETE_NOTE << "\n" if run.output_incomplete
+          panel = if run.output.empty?
+                    "#{HISTORY_NO_OUTPUT_NOTE}\n"
+                  else
+                    <<~HTML
+                      <div class="terminal-panel" tabindex="0" role="region" aria-labelledby="history-output-heading">
+                      <pre>#{run.output.map { |record| terminal_line(record) }.join}</pre>
+                      </div>
+                    HTML
+                  end
+
+          <<~HTML
+            <section aria-labelledby="history-output-heading">
+            <h2 id="history-output-heading">Captured output</h2>
+            #{notes}#{panel}</section>
+          HTML
         end
 
         def esc(value)

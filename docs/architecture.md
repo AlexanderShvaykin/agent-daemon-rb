@@ -730,6 +730,28 @@ reasons leave it NULL. `last_stderr` is the last *retained* stderr line: once
 last line, or null. The per-run cap bounds each run, not the store: total
 growth is bounded only by retention (Story 5.6). The metrics exporter remains assigned to Epic 6.
 
+The console reads history (Story 5.5) through a `History::Reader` the master
+builds next to the writer, only when the writer started, and injects into the
+console (`Master#history_reader`, `nil` when history is disabled or degraded at
+boot). It owns a second SQLite connection, never the writer's: WAL gives it a
+snapshot without blocking the single writer, while sharing the writer's
+connection would put console reads inside its transactions. The connection
+opens lazily on first use (`READWRITE` without `CREATE`, so a missing store
+raises and is never created), waits with `busy_handler_timeout`, and sets
+`PRAGMA query_only = ON`, so "the console never writes" is enforced by SQLite.
+One mutex serializes it across Puma threads; any query failure closes and drops
+the connection, and the next call reopens it. Runs are read newest first on
+`(started_at DESC, id DESC)` with exclusive seek pagination: the cursor is the
+last shown pair, `history.page_size` (default 50) rows per page, one extra row
+read only to decide whether an "Older runs" link exists, so runs inserted
+between pages never repeat. A run's `result` is its stored reason, else
+`incomplete` when `incomplete = 1`, else `running`: no finished event recorded
+and not marked incomplete. While the writer is healthy that means the run is
+still open; a writer that degraded mid-run leaves such rows `running` until the
+next master marks them `incomplete`. The reader closes before the writer stops
+at shutdown. The console files never require `history/*` or `sqlite3`; the
+reader is duck-typed.
+
 ### Layout
 
 One file per concern under `lib/agent_daemon/supervisor/`:
@@ -746,7 +768,7 @@ One file per concern under `lib/agent_daemon/supervisor/`:
 | `fleet.rb`               | Config roster left-joined with current registry state          |
 | `activity_log.rb`        | Per-entity recent events projected from the bounded bus         |
 | `console/`               | Rack/Puma UI, GitLab OAuth, authenticated SSE and restart controls |
-| `history/`               | Owner-only SQLite history store, its versioned schema, and the single writer thread (Epic 5) |
+| `history/`               | Owner-only SQLite history store, its versioned schema, the single writer thread, and the console's query-only reader (Epic 5) |
 
 ### Supervisor config
 
@@ -900,12 +922,46 @@ publishes the revalidation callable into the Rack environment and `GET /events`
 is its only caller. Page renders (`/`, `/entity`) validate the local session
 only, deliberately — a GitLab round-trip on the render path would put network
 latency in front of every page and would put access-control code inside `App`,
-which owns none by design. Because every rendered page carries the live-update
-script, a browser session loses access within one recheck interval; a client
-that never opens the stream (scripting disabled, a stolen cookie replayed by a
-CLI) keeps its already-issued session until `session_ttl` expires or it is
-destroyed. Shortening that window is a session-TTL decision, not a rendering
-one.
+which owns none by design. Because the fleet and entity pages carry the
+live-update script, a browser session on them loses access within one recheck
+interval; a client that never opens the stream (scripting disabled, a stolen
+cookie replayed by a CLI) keeps its already-issued session until
+`session_ttl` expires or it is destroyed. The persisted-history pages are the
+exception, because they carry no stream (see below). Shortening that window is
+a session-TTL decision, not a rendering one.
+
+**Persisted history pages** (Story 5.5) are server-rendered behind the same
+default-deny middleware, with no change to `Auth`. Because they carry no
+stream, `HistoryAuthorization` (`console/history_authorization.rb`), composed
+between `Auth` and `App` in `Server#build_app`, calls the revalidation callable
+on every request whose path is `/history` or under `/history/`: anything but
+`true` (including a missing callable or one that raises) is a 302 to
+`/auth/login` without reaching the app, and the failed check has already
+deleted the session. The GitLab round trip stays rate-limited to one per
+recheck interval, so a revoked operator loses persisted output within that
+interval rather than at `session_ttl`. Every other path passes straight
+through. Every page shares a primary
+`<nav aria-label="Primary">` (Fleet, History; the current page's link carries
+`aria-current="page"`). `GET /history` lists every persisted run newest first;
+`GET /history/entity?id=` lists one entity's runs and its newest `page_size`
+restart actions (coalesced actor set, request and completion time, source →
+target generation), and `/entity` links to it as "Persisted history"; `GET
+/history/run?id=` shows one run's identity, timestamps, transitions, error
+summary, and captured output in the terminal-panel markup, with separate text
+notices for a truncated beginning, incomplete capture, and no output. Paging
+uses `cursor=<started_at>|<id>`. The history pages are static snapshots
+rendered without the live-update script: that script refetches the current URL
+on every bus event, which here would re-run SQLite queries on each runner event
+for a record that does not change. Each route answers GET/HEAD only. A
+malformed run id, empty entity id, malformed cursor, or a query Rack refuses is
+the fixed non-disclosing 404, as is a well-formed id that resolves to nothing
+(an entity resolves if it has persisted rows or is in the current fleet; the
+latter with no rows renders an empty state). Entities absent from the current
+fleet stay listed with the text badge "absent from current fleet". When history
+is disabled or a reader call raises, the page is a 503 "History unavailable"
+inside the layout, and a read failure logs one `[Console] history read failed:
+<ExceptionClass>` line with no message, id or SQL; nothing is retried inline
+and the writer is never touched.
 
 `GET /events` uses Rack partial hijack. Its fixed invalidations are an initial
 `refresh`, one coalesced `refresh` when the registry revision, event cursor, or

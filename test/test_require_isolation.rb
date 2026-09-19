@@ -65,6 +65,22 @@ class TestRequireIsolation < Minitest::Test
     assert status.success?, "supervisor tree failed to load in isolation:\n#{out}"
   end
 
+  # Story 5.5: the history reader is injected into the console, duck-typed.
+  # Loading the console app must reach neither history/* nor sqlite3.
+  def test_the_console_app_requires_no_history_code_or_sqlite3
+    script = <<~RUBY
+      require "agent_daemon/supervisor/console/app"
+      bad = $LOADED_FEATURES.grep(%r{/agent_daemon/supervisor/history/})
+      bad.concat($LOADED_FEATURES.grep(%r{/sqlite3(/|\\.rb|\\.so|\\.bundle)}))
+      unless bad.empty?
+        warn "LEAKED: \#{bad.inspect}"
+        exit 1
+      end
+    RUBY
+    out, status = run_core_probe(script)
+    assert status.success?, "console app loaded history code:\n#{out}"
+  end
+
   def test_gemspec_declares_both_executables
     spec = Gem::Specification.load(File.expand_path("../agent_daemon.gemspec", __dir__))
     assert_includes spec.executables, "agent-daemon"

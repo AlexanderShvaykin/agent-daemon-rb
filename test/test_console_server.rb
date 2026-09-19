@@ -338,6 +338,14 @@ class TestConsoleServer < Minitest::Test
     assert_includes response.body, "wired-through-marker"
   end
 
+  # Auth -> HistoryAuthorization -> App: the history recheck sits inside the
+  # default-deny boundary, directly around the app.
+  def inner_app(server)
+    history_authorization = server.send(:build_app).instance_variable_get(:@app)
+    assert_instance_of AgentDaemon::Supervisor::Console::HistoryAuthorization, history_authorization
+    history_authorization.instance_variable_get(:@app)
+  end
+
   def test_the_server_forwards_restart_control_to_the_app
     restart_control = Object.new
     server = Server.new(
@@ -351,10 +359,38 @@ class TestConsoleServer < Minitest::Test
       log_writer: Puma::LogWriter.strings
     )
 
-    stack = server.send(:build_app)
-    app = stack.instance_variable_get(:@app)
+    app = inner_app(server)
 
     assert_same restart_control, app.instance_variable_get(:@restart_control)
+  end
+
+  def test_the_server_forwards_the_history_reader_to_the_app
+    history = Object.new
+    server = Server.new(
+      CONSOLE_CONFIG,
+      fleet: @fleet,
+      activity_log: @activity_log,
+      event_bus: @event_bus,
+      state_registry: @state_registry,
+      output_buffers: @output_buffers,
+      history: history,
+      log_writer: Puma::LogWriter.strings
+    )
+
+    app = inner_app(server)
+
+    assert_same history, app.instance_variable_get(:@history)
+  end
+
+  def test_the_default_console_factory_maps_history_through_to_the_app
+    history = Object.new
+    server = AgentDaemon::Supervisor::Master::CONSOLE_FACTORY.call(
+      CONSOLE_CONFIG, @fleet, @activity_log, @event_bus, @state_registry, @output_buffers, history: history
+    )
+
+    app = inner_app(server)
+
+    assert_same history, app.instance_variable_get(:@history)
   end
 
   # The same proof one hop further out: through the REAL default

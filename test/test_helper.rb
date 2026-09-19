@@ -109,3 +109,45 @@ class FakeServerError < Net::HTTPServerError
   # the fixture rather than on its own logic.
   def [](_name) = nil
 end
+
+# Story 5.5: seeds a history store by plain SQL, so reader and console tests
+# control every column (ties, NULLs, flags) without driving the writer. The
+# including test provides #seed_db, a connection to a migrated store.
+module HistorySeeding
+  def seed_entity(key, kind: "runner", workflow: "wf", runner: "a")
+    seed_db.execute("INSERT INTO supervised_entity (entity_key, kind, workflow, runner, first_seen_at) " \
+                    "VALUES (?, ?, ?, ?, ?)", [key, kind, workflow, runner, "2026-09-19T09:00:00.000Z"])
+    seed_db.last_insert_row_id
+  end
+
+  def seed_run(entity_row, started_at:, generation: 1, work_item: "TI-1", attempt: 1, finished_at: nil,
+               reason: nil, incomplete: 0, output_truncated: 0, output_incomplete: 0, error_summary: nil)
+    seed_db.execute("INSERT INTO run (entity_id, generation, work_item, attempt, started_at, finished_at, reason, " \
+                    "incomplete, output_truncated, output_incomplete, error_summary) " \
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [entity_row, generation, work_item, attempt, started_at, finished_at, reason, incomplete,
+                     output_truncated, output_incomplete, error_summary])
+    seed_db.last_insert_row_id
+  end
+
+  def seed_event(run_id, seq, event, occurred_at, reason: nil)
+    seed_db.execute("INSERT INTO run_event (run_id, seq, event, reason, occurred_at) VALUES (?, ?, ?, ?, ?)",
+                    [run_id, seq, event, reason, occurred_at])
+  end
+
+  def seed_output(run_id, seq, stream, text)
+    seed_db.execute("INSERT INTO run_output (run_id, seq, stream, text) VALUES (?, ?, ?, ?)",
+                    [run_id, seq, stream, text])
+  end
+
+  def seed_restart(entity_row, requested_at:, actors: ["operator"], completed_at: nil, source: 1, target: 2)
+    seed_db.execute("INSERT INTO restart_action (entity_id, source_generation, target_generation, actors, " \
+                    "requested_at, completed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    [entity_row, source, target, JSON.generate(actors), requested_at, completed_at])
+  end
+
+  # "2026-09-19T10:00:0N.000Z", the writer's iso8601(3) shape.
+  def at(second)
+    format("2026-09-19T10:%02d:%02d.000Z", second / 60, second % 60)
+  end
+end

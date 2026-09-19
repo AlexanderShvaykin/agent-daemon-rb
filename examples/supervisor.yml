@@ -67,8 +67,9 @@ workflows:
 # run is flagged incomplete. A failed run also gets a JSON error summary
 # (reason, attempt, last stderr line).
 #
-# page_size and the retention keys are validated now so a typo fails at load;
-# later releases read them.
+# page_size is the number of runs (and restart actions) per page of the
+# console's persisted-history view. The retention keys are validated now so a
+# typo fails at load; a later release reads them.
 #
 # history:
 #   enabled: true                          # default true
