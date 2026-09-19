@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-09-19
+
 ### Added
 - Supervisor history storage (Story 5.1). A new optional `history:` block in the supervisor config (`enabled`, `database_path`, `busy_timeout_ms`, plus the retry, flush, paging and retention keys later stories read), every key defaulted and range-checked into the single `ConfigError`. The default store is `<config dir>/history/history.sqlite3`; a relative `database_path` resolves against the supervisor config directory.
 - `AgentDaemon::Supervisor::History::Database` opens the store in WAL mode with a busy wait (see the Story 5.2 entry below) and `foreign_keys`, and runs versioned migrations in one `BEGIN IMMEDIATE` transaction keyed on `PRAGMA user_version`. Schema v1 holds `supervised_entity`, `run`, `run_event` and `restart_action`. A database newer than the code is refused, never downgraded.
