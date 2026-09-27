@@ -592,6 +592,10 @@ module AgentDaemon
                       "(0 disables thread context; anything above #{Pachca::Client::MAX_PAGE} is paged, one request per #{Pachca::Client::MAX_PAGE})"
           end
         end
+        # A string "false" would read as true in Ruby and switch the gate on.
+        if trigger.key?("threads_require_summon") && ![true, false].include?(trigger["threads_require_summon"])
+          errors << "runner #{runner_label.inspect}: trigger.threads_require_summon must be true or false"
+        end
         unless trigger["interval"].is_a?(Integer) && trigger["interval"] > 0
           errors << "runner #{runner_label.inspect}: trigger.interval must be a positive Integer"
         end
