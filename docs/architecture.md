@@ -223,6 +223,16 @@ most 50; a larger value is paged through the cursor, one request per 50, capped
 at 500. A failed fetch warns and answers without the context rather than
 failing the run.
 
+With `trigger.threads_require_summon: true` a reply in a thread is acted on only
+if the thread ever summoned the agent: some message in it names the agent, or
+the agent has posted in it (which covers the thread it opened by answering in
+the channel). Otherwise the event is acknowledged without a run — deciding that
+a conversation is not the agent's business costs a few reads here and a whole
+model run in the agent. Checked cheapest first (the reply, the message the
+thread hangs off, then the thread itself), and a thread found summoned is
+remembered for the life of the process. A failed read lets the message through:
+the agent can still stay silent, but a swallowed question cannot be recovered.
+
 ### Attachments (pachca)
 
 A message can carry files, and the runner puts them in front of the agent: every

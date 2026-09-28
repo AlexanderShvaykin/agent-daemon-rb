@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- `pachca` trigger: `threads_require_summon: true` ignores replies in threads that never summoned the agent — nobody named it there, and it has not posted there. A bot hears every thread in the chats it belongs to, and without this each reply costs a full agent run only for the agent to decide to stay silent. Posting counts as summoned so that a thread the agent opened by answering in the channel keeps working. Checked cheapest first — the reply itself, the message the thread hangs off, then the thread — and a summoned thread is remembered for the life of the process. A failed read lets the message through rather than swallowing it; a rate limit is still raised. Off by default.
+
 ## [0.23.0] - 2026-09-19
 
 ### Added

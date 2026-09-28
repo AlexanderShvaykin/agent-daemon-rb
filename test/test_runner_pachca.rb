@@ -431,6 +431,111 @@ class TestRunnerPachca < Minitest::Test
     rows.each_with_index.map { |(user_id, text), i| { "id" => 100 + i, "user_id" => user_id, "content" => text } }
   end
 
+  # --- threads the agent was never called into ----------------------------
+
+  def summon_gate(client)
+    build_runner(client, trigger_overrides: { "chats" => nil, "threads_require_summon" => true })
+  end
+
+  # Other people's conversation: the bot sees it through membership in the
+  # parent chat, and without the gate every reply there is a full agent run.
+  def test_a_thread_that_never_named_the_agent_is_acknowledged_without_a_run
+    client = StubPachcaClient.new([[thread_event]])
+    client.root = { "id" => 1_067_133_444, "user_id" => 333, "content" => "кто сегодня дежурит?" }
+    client.history = history_of([222, "я"], [333, "ок"])
+    runner = summon_gate(client)
+
+    runner.send(:iterate)
+
+    assert_empty backend(runner).prompts
+    assert_equal %w[01A], client.deleted
+  end
+
+  def test_a_thread_that_named_the_agent_earlier_is_answered
+    client = StubPachcaClient.new([[thread_event]])
+    client.history = history_of([222, "Горыныч, глянь логи"], [333, "ок"])
+
+    assert_equal %w[01A], fetch(summon_gate(client)).map { |e| e["id"] }
+  end
+
+  # The agent opened this thread itself, answering a question asked in the
+  # channel without its name. Nobody named it, yet the thread continues its
+  # answer.
+  def test_a_thread_the_agent_posted_in_is_answered
+    client = StubPachcaClient.new([[thread_event]])
+    client.root = { "id" => 1_067_133_444, "user_id" => 222, "content" => "сколько у нас пользователей?" }
+    client.history = history_of([BOT, "12 тысяч"])
+
+    assert_equal %w[01A], fetch(summon_gate(client)).map { |e| e["id"] }
+  end
+
+  def test_the_message_the_thread_hangs_off_can_summon
+    client = StubPachcaClient.new([[thread_event]])
+    client.root = { "id" => 1_067_133_444, "user_id" => 222, "content" => "@gorynych_bot, что с деплоем?" }
+
+    runner = summon_gate(client)
+
+    assert_equal %w[01A], fetch(runner).map { |e| e["id"] }
+    assert_nil client.message_queries, "found on the root message, the thread need not be read"
+  end
+
+  # Naming the agent in the reply itself is the cheapest case: no reads at all.
+  def test_naming_the_agent_in_the_reply_itself_summons_it
+    named = thread_event.tap { |e| e["payload"]["content"] = "Горыныч, а ты что думаешь?" }
+    client = StubPachcaClient.new([[named]])
+
+    assert_equal %w[01A], fetch(summon_gate(client)).map { |e| e["id"] }
+    assert_nil client.message_gets
+    assert_nil client.message_queries
+  end
+
+  # Once called in, always called in — the next reply costs no reads.
+  def test_a_summoned_thread_is_remembered
+    client = StubPachcaClient.new([[thread_event], [thread_event.merge("id" => "01B")]])
+    client.history = history_of([222, "Горыныч?"])
+    runner = summon_gate(client)
+
+    fetch(runner)
+    client.history = history_of([222, "ни слова"])
+    fetch(runner)
+
+    assert_equal 1, client.message_queries.size
+  end
+
+  def test_a_question_outside_a_thread_is_not_gated
+    client = StubPachcaClient.new([[event(id: "01A", content: "сколько у нас пользователей?")]])
+
+    assert_equal %w[01A], fetch(summon_gate(client)).map { |e| e["id"] }
+    assert_nil client.message_queries
+  end
+
+  def test_the_gate_is_off_by_default
+    client = StubPachcaClient.new([[thread_event]])
+    client.history = history_of([222, "ни слова"])
+    runner = build_runner(client, trigger_overrides: { "chats" => nil })
+
+    assert_equal %w[01A], fetch(runner).map { |e| e["id"] }
+  end
+
+  # The agent still decides whether to speak, and a question meant for it that
+  # got swallowed is the worse mistake.
+  def test_an_unreadable_thread_lets_the_message_through
+    client = StubPachcaClient.new([[thread_event]])
+    client.history_error = "boom"
+    runner = summon_gate(client)
+
+    log = capture_log { assert_equal %w[01A], fetch(runner).map { |e| e["id"] } }
+
+    assert_match(/could not tell whether thread/, log)
+  end
+
+  def test_a_rate_limit_is_not_mistaken_for_an_unreadable_thread
+    client = StubPachcaClient.new([[thread_event]])
+    client.history_error = AgentDaemon::RateLimitError.new(5, "429")
+
+    assert_raises(AgentDaemon::RateLimitError) { fetch(summon_gate(client)) }
+  end
+
   # "а почему?" in a thread is unreadable without what came before it.
   def test_a_threaded_question_gets_the_thread_transcript
     client = StubPachcaClient.new([[thread_event]])
