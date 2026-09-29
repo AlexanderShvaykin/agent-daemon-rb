@@ -579,7 +579,11 @@ Each runner tracks consecutive trigger failures (e.g. Tracker API errors, file
 glob I/O errors). After `MAX_CONSECUTIVE_ERRORS` (3) consecutive failures, the
 runner writes an error YAML file to `message_dir` with
 `task_key: "SYSTEM:<runner-name>"`, which the Messenger picks up and sends as a
-notification. The counter then resets.
+notification — once per outage. Further failures only log, and the first
+successful poll after a reported outage writes a `trigger_recovered` message of
+the same shape, so the chat hears when the outage started and when it ended,
+not an identical alert every three polls in between. A streak that ends below
+the threshold was never reported and announces nothing.
 
 Per-item failures use a separate attempt counter. After `max_attempts` (default
 3) failed backend invocations for the same work item, the item is skipped and

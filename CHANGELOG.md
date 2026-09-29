@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- A trigger outage is reported once, and its end is announced. Before, the `SYSTEM:<runner>` alert repeated every `MAX_CONSECUTIVE_ERRORS` failed polls for as long as the outage lasted — found in use, an upstream API answering 522 produced an identical alert every few minutes. Now the alert is written when the streak first reaches the threshold, later failures only log, and the first successful poll writes a `trigger_recovered` system message routed like the alert. A streak that ends below the threshold announces nothing, since it was never reported.
+- System message files carry a per-runner sequence number. Two written within the same millisecond — an alert and the recovery right after it — used to get the same name, and the second silently replaced the first.
+
 ## [0.23.0] - 2026-09-19
 
 ### Added

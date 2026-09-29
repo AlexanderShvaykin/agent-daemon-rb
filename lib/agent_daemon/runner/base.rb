@@ -24,6 +24,7 @@ module AgentDaemon
         @jitter = runner_config.fetch("trigger").fetch("jitter", 0)
         @attempts = Hash.new(0)
         @consecutive_errors = 0
+        @trigger_down = false
         @backoff = nil
         @backend = Backend.for(runner_config, shutdown_flag,
                                message_dir: message_dir, project_path: project_path,
@@ -90,8 +91,15 @@ module AgentDaemon
         raise
       end
 
+      # An outage is reported twice: once when it is declared, once when it
+      # ends. Re-alerting every MAX_CONSECUTIVE_ERRORS polls told the chat
+      # nothing new — found in use, an upstream API answering 522 for an
+      # hour produced one identical alert every few minutes. And silence
+      # alone would leave the reader unable to tell a fixed trigger from a
+      # still-broken one, so the recovery is announced too.
       def fetch_work_items_with_escalation
         items = fetch_work_items
+        announce_trigger_recovery if @trigger_down
         @consecutive_errors = 0
         items
       rescue AgentDaemon::RateLimitError => e
@@ -103,14 +111,28 @@ module AgentDaemon
         []
       rescue => e
         @consecutive_errors += 1
-        Log.error("[#{log_tag}] trigger error (#{@consecutive_errors}/#{MAX_CONSECUTIVE_ERRORS}): #{e.message}")
 
-        if @consecutive_errors >= MAX_CONSECUTIVE_ERRORS
+        if @trigger_down
+          Log.error("[#{log_tag}] trigger still failing (#{@consecutive_errors} in a row, already reported): #{e.message}")
+        else
+          Log.error("[#{log_tag}] trigger error (#{@consecutive_errors}/#{MAX_CONSECUTIVE_ERRORS}): #{e.message}")
+        end
+
+        if !@trigger_down && @consecutive_errors >= MAX_CONSECUTIVE_ERRORS
           create_error_message("trigger_error", error_text: e.message)
-          @consecutive_errors = 0
+          @trigger_down = true
         end
 
         []
+      end
+
+      def announce_trigger_recovery
+        Log.info("[#{log_tag}] trigger recovered after #{@consecutive_errors} failed polls")
+        write_system_message("trigger_recovered",
+                             "Runner #{@name} восстановился: опрос снова работает " \
+                             "после #{@consecutive_errors} неудачных попыток подряд.",
+                             summary: "Runner #{@name} recovered")
+        @trigger_down = false
       end
 
       def process_item(item)
@@ -272,15 +294,26 @@ module AgentDaemon
 
       def create_error_message(error_type, work_item: nil, error_text: nil)
         FileUtils.mkdir_p(@message_dir)
-        filename = "error-#{@name}-#{Time.now.strftime('%Y%m%d%H%M%S%L')}.yml"
-        path = ::File.join(@message_dir, filename)
         message = "Ошибка runner #{@name}: #{error_type}"
         message += "; work item #{work_item}" if work_item
         message += "."
         message += " #{error_text.to_s.strip.slice(0, 500)}" unless error_text.to_s.strip.empty?
+        path = write_system_message(error_type, message, summary: "Runner #{@name} error", work_item: work_item)
+        Log.warn("[#{log_tag}] Created error message file: #{path}")
+      end
+
+      # A SYSTEM:<runner> file for the Messenger, routed like any system alert
+      # — so a recovery lands where the outage it closes was reported.
+      def write_system_message(error_type, message, summary:, work_item: nil)
+        FileUtils.mkdir_p(@message_dir)
+        # The sequence keeps two messages written within one millisecond — an
+        # alert and the recovery that follows it — from overwriting each other.
+        @system_message_seq = (@system_message_seq || 0) + 1
+        filename = "error-#{@name}-#{Time.now.strftime('%Y%m%d%H%M%S%L')}-#{@system_message_seq}.yml"
+        path = ::File.join(@message_dir, filename)
         content = {
           "task_key"   => "SYSTEM:#{@name}",
-          "summary"    => "Runner #{@name} error",
+          "summary"    => summary,
           "message"    => message,
           "system_alert" => true,
           "runner"     => @name,
@@ -289,7 +322,7 @@ module AgentDaemon
         }
         content["work_item"] = work_item if work_item
         ::File.write(path, content.to_yaml)
-        Log.warn("[#{log_tag}] Created error message file: #{path}")
+        path
       end
 
       def base_template_variables
