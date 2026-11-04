@@ -201,6 +201,10 @@ runners:
   #     # pages through the cursor, one request per 50, capped at 500. The
   #     # default stays at one request because most threads never reach it.
   #     # context_messages: 50
+  #     # Skip replies in threads the agent was never called into: nobody named
+  #     # it there and it has not posted there. Acknowledged without a run.
+  #     # Off by default — the bot then hears every thread in its chats.
+  #     # threads_require_summon: false
   #     # event_types: [message_new]   # default
   #     # interval: 5                  # poll interval, seconds (default 5)
   #     # jitter: 1                    # random 0..jitter s per cycle (default 1)

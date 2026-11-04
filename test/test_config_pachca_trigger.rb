@@ -123,6 +123,12 @@ class TestConfigPachcaTrigger < Minitest::Test
     assert_match(/between 0 and 500/, error_for({"context_messages" => "20"}))
   end
 
+  # "false" in quotes is truthy in Ruby: accepted, it would switch the gate on.
+  def test_threads_require_summon_must_be_a_boolean
+    assert_equal true, load({"threads_require_summon" => true}).runners.first.dig("trigger", "threads_require_summon")
+    assert_match(/threads_require_summon must be true or false/, error_for({"threads_require_summon" => "false"}))
+  end
+
   def test_event_types_is_optional_but_validated_when_present
     assert_equal %w[button_click], load({"event_types" => %w[button_click]}).runners.first.dig("trigger", "event_types")
     assert_match(/trigger\.event_types must be a non-empty Array/, error_for({"event_types" => [""]}))

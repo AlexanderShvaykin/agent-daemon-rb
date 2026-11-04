@@ -82,6 +82,12 @@ module AgentDaemon
         # On by default: a bot in a group chat that reacts to every message is
         # in the way. Set it to false to get the indicator back on everything.
         @thinking_requires_mention = trigger.fetch("thinking_requires_mention", true)
+        # Off by default, so a runner that relied on hearing every thread keeps
+        # doing so. Threads found summoned are remembered for the life of the
+        # process: once called in, always called in, and the answer never has
+        # to be looked up twice.
+        @threads_require_summon = trigger.fetch("threads_require_summon", false)
+        @summoned_threads       = Set.new
         @download_attachments  = trigger.fetch("attachments", true)
         @max_attachment_bytes  = trigger.fetch("max_attachment_bytes", DEFAULT_MAX_ATTACHMENT_BYTES).to_i
         # Memoised per event: the summary is built for the prompt and the image
@@ -128,7 +134,7 @@ module AgentDaemon
         retry_settled_deletes
 
         fresh = @client.events(limit: @limit).reject { |event| acknowledged.include?(event["id"]) }
-        wanted, ignored = fresh.partition { |event| actionable?(event) }
+        wanted, ignored = fresh.partition { |event| actionable?(event) && summoned_in_thread?(event) }
 
         acknowledge_ignored(ignored)
         wanted
@@ -265,9 +271,11 @@ module AgentDaemon
       # none was wanted is a smaller fault than a chat that looks ignored.
       def addressed?(event)
         names = bot_names
-        return true if names.empty?
+        names.empty? || names_agent?(event["payload"], names)
+      end
 
-        content = event.dig("payload", "content").to_s.downcase
+      def names_agent?(message, names)
+        content = message.to_h["content"].to_s.downcase
         names.any? { |name| content.include?(name) }
       end
 
@@ -278,10 +286,11 @@ module AgentDaemon
         @bot_names = [user["first_name"], user["last_name"], user["nickname"]]
                      .filter_map { |name| name.to_s.strip.downcase }
                      .reject(&:empty?)
-        Log.info("[#{log_tag}] thinking indicator shows when named: #{@bot_names.join(", ")}")
+        Log.info("[#{log_tag}] the agent counts as named by: #{@bot_names.join(", ")}")
         @bot_names
       rescue => e
-        Log.warn("[#{log_tag}] could not resolve own name (#{e.message}); showing the indicator on every message")
+        Log.warn("[#{log_tag}] could not resolve own name (#{e.message}); " \
+                 "every message counts as naming the agent")
         @bot_names = []
       end
 
@@ -323,6 +332,60 @@ module AgentDaemon
         return false unless @allowed_users.empty? || @allowed_users.include?(user_id)
 
         true
+      end
+
+      # A thread nobody called the agent into is other people's conversation.
+      # The bot sees it anyway — membership in the parent chat is enough — and
+      # without this gate every reply there costs a full agent run, only for
+      # the agent to decide it has nothing to say. That decision is the
+      # daemon's to make, and it is cheap here: a few reads against minutes of
+      # a model.
+      #
+      # Summoned means the agent was named somewhere in the thread, or has
+      # posted in it. The second covers the thread the agent opened itself by
+      # answering a question asked in the channel: nobody named it there, yet
+      # the thread plainly continues its answer.
+      #
+      # Cheapest first: the message itself, then the message the thread hangs
+      # off, then the thread. Any failure opens the gate rather than closing
+      # it — the agent still decides whether to speak, and a question that was
+      # meant for it and got swallowed is the worse mistake. A rate limit is
+      # the exception: it is the poll's problem, not this message's.
+      def summoned_in_thread?(event)
+        return true unless @threads_require_summon
+
+        payload = event["payload"]
+        return true unless payload["entity_type"] == THREAD_ENTITY_TYPE
+
+        thread_id = payload["chat_id"]
+        return true if thread_id.nil? || @summoned_threads.include?(thread_id)
+
+        names = bot_names
+        return true if names.empty?
+
+        summoned = summons?(payload, names) ||
+                   summons?(root_message(payload), names) ||
+                   @client.messages(chat_id: thread_id, limit: MAX_CONTEXT_MESSAGES)
+                          .any? { |message| summons?(message, names) }
+
+        if summoned
+          @summoned_threads << thread_id
+        else
+          Log.debug("[#{log_tag}] #{event["id"]}: thread #{thread_id} never summoned the agent")
+        end
+        summoned
+      rescue ::AgentDaemon::RateLimitError
+        raise
+      rescue => e
+        Log.warn("[#{log_tag}] could not tell whether thread #{thread_id} summoned the agent " \
+                 "(#{e.message}); letting #{event["id"]} through")
+        true
+      end
+
+      def summons?(message, names)
+        return false if message.nil?
+
+        message["user_id"].to_i == @bot_user_id || names_agent?(message, names)
       end
 
       # A message posted in a thread carries the THREAD's chat id in chat_id,
