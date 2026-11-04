@@ -217,9 +217,67 @@ class TestRunnerTracker < Minitest::Test
     assert_equal true, payload["system_alert"]
     assert_equal "trigger_error", payload["error_type"]
     assert_includes payload["message"], "kaboom"
+  end
 
-    # Counter resets after escalation
-    assert_equal 0, runner.instance_variable_get(:@consecutive_errors)
+  def system_messages
+    Dir.glob(File.join(@message_dir, "error-default-*.yml")).sort.map { |f| YAML.safe_load_file(f) }
+  end
+
+  def flaky_tracker(failing)
+    tracker = Object.new
+    tracker.define_singleton_method(:search_issues) { |_q| failing[0] ? raise("HTTP 522") : [] }
+    tracker
+  end
+
+  # Found in use: an upstream API answering 522 for an hour produced one
+  # identical alert every three polls. The outage is one event, reported once.
+  def test_a_continuing_outage_is_reported_once
+    runner = build_runner([], tracker_stub: FailingTracker.new("HTTP 522"))
+
+    10.times { runner.send(:fetch_work_items_with_escalation) }
+
+    assert_equal %w[trigger_error], system_messages.map { |m| m["error_type"] }
+  end
+
+  # Silence alone would not tell a fixed trigger from a still-broken one.
+  def test_the_end_of_a_reported_outage_is_announced
+    failing = [true]
+    runner = build_runner([], tracker_stub: flaky_tracker(failing))
+
+    5.times { runner.send(:fetch_work_items_with_escalation) }
+    failing[0] = false
+    2.times { runner.send(:fetch_work_items_with_escalation) }
+
+    recovery = system_messages.last
+    assert_equal %w[trigger_error trigger_recovered], system_messages.map { |m| m["error_type"] }
+    assert_equal "SYSTEM:default", recovery["task_key"]
+    assert_equal true, recovery["system_alert"]
+    assert_includes recovery["message"], "5"
+  end
+
+  # A blip below the threshold was never reported, so there is nothing to close.
+  def test_an_unreported_blip_announces_no_recovery
+    failing = [true]
+    runner = build_runner([], tracker_stub: flaky_tracker(failing))
+
+    2.times { runner.send(:fetch_work_items_with_escalation) }
+    failing[0] = false
+    runner.send(:fetch_work_items_with_escalation)
+
+    assert_empty system_messages
+  end
+
+  def test_a_new_outage_after_recovery_is_reported_again
+    failing = [true]
+    runner = build_runner([], tracker_stub: flaky_tracker(failing))
+
+    3.times { runner.send(:fetch_work_items_with_escalation) }
+    failing[0] = false
+    runner.send(:fetch_work_items_with_escalation)
+    failing[0] = true
+    3.times { runner.send(:fetch_work_items_with_escalation) }
+
+    assert_equal %w[trigger_error trigger_recovered trigger_error], system_messages.map { |m| m["error_type"] }
   end
 
   def test_final_cli_failure_creates_one_system_alert
