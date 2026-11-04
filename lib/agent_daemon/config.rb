@@ -43,6 +43,9 @@ module AgentDaemon
     # Far slower than a chat trigger on purpose: nobody waits seconds for a
     # code review, and polling the notification inbox spends GitHub rate limit.
     GITHUB_TRIGGER_DEFAULTS     = { "interval" => 60, "jitter" => 5 }.freeze
+    # Same cadence as github: a mention is a person waiting, but not one
+    # watching a spinner, and the inbox is cheap to read rather than free.
+    BASECAMP_TRIGGER_DEFAULTS   = { "interval" => 60, "jitter" => 5 }.freeze
 
     # The whole `support:` vocabulary, at both the config and the runner level.
     # Closed on purpose: a typo'd key would otherwise vanish silently and the
@@ -53,7 +56,7 @@ module AgentDaemon
     # is rejected at load rather than turned into a javascript:/data: link.
     RUNBOOK_SCHEMES = %w[http https].freeze
 
-    VALID_TRIGGER_TYPES   = %w[tracker file mattermost pachca github].freeze
+    VALID_TRIGGER_TYPES   = %w[tracker file mattermost pachca github basecamp].freeze
     VALID_BACKENDS        = %w[claude opencode codex].freeze
     VALID_MESSENGER_TYPES = %w[webhook mattermost pachca].freeze
     # A runner's `env:` keys must be usable as environment variable names.
@@ -194,6 +197,8 @@ module AgentDaemon
         # Same as pachca: the ack is marking a notification read, so there are
         # no work dirs to place.
         deep_merge(GITHUB_TRIGGER_DEFAULTS, raw_trigger)
+      when "basecamp"
+        deep_merge(BASECAMP_TRIGGER_DEFAULTS, raw_trigger)
       else
         raw_trigger
       end
@@ -616,6 +621,29 @@ module AgentDaemon
                   value.all? { |item| item.is_a?(String) && !item.strip.empty? }
 
           errors << "runner #{runner_label.inspect}: trigger.#{key} must be a non-empty Array of non-empty Strings when present"
+        end
+        unless trigger["interval"].is_a?(Integer) && trigger["interval"] > 0
+          errors << "runner #{runner_label.inspect}: trigger.interval must be a positive Integer"
+        end
+      when "basecamp"
+        # No token key, and that is the point: Basecamp is OAuth 2.1, so the
+        # credential lives in the CLI's own store and is refreshed there. The
+        # daemon holds nothing, which also means a misconfigured host fails on
+        # the first poll rather than at load — there is nothing here to check.
+        #
+        # Both lists are optional and both narrow. allowed_users takes numeric
+        # person ids or display names, never email addresses: Basecamp masks
+        # those in API responses for everyone but the authenticated user, so a
+        # list of addresses would silently match nobody.
+        %w[projects allowed_users kinds].each do |key|
+          next unless trigger.key?(key)
+
+          value = trigger[key]
+          next if value.is_a?(Array) && !value.empty? &&
+                  value.all? { |item| (item.is_a?(String) && !item.strip.empty?) || positive_integer?(item) }
+
+          errors << "runner #{runner_label.inspect}: trigger.#{key} must be a non-empty Array of " \
+                    "non-empty Strings or positive Integers when present"
         end
         unless trigger["interval"].is_a?(Integer) && trigger["interval"] > 0
           errors << "runner #{runner_label.inspect}: trigger.interval must be a positive Integer"
