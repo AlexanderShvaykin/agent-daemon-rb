@@ -99,7 +99,7 @@ def user(id)
   raise @user_error if @user_error
 
   (@user_gets ||= []) << id
-  { "first_name" => "Горыныч", "last_name" => nil, "nickname" => "gorynych_bot" }
+  { "first_name" => "Помощник", "last_name" => nil, "nickname" => "helper_bot" }
 end
 
   def message(id)
@@ -453,7 +453,7 @@ class TestRunnerPachca < Minitest::Test
 
   def test_a_thread_that_named_the_agent_earlier_is_answered
     client = StubPachcaClient.new([[thread_event]])
-    client.history = history_of([222, "Горыныч, глянь логи"], [333, "ок"])
+    client.history = history_of([222, "Помощник, глянь логи"], [333, "ок"])
 
     assert_equal %w[01A], fetch(summon_gate(client)).map { |e| e["id"] }
   end
@@ -471,7 +471,7 @@ class TestRunnerPachca < Minitest::Test
 
   def test_the_message_the_thread_hangs_off_can_summon
     client = StubPachcaClient.new([[thread_event]])
-    client.root = { "id" => 1_067_133_444, "user_id" => 222, "content" => "@gorynych_bot, что с деплоем?" }
+    client.root = { "id" => 1_067_133_444, "user_id" => 222, "content" => "@helper_bot, что с деплоем?" }
 
     runner = summon_gate(client)
 
@@ -481,7 +481,7 @@ class TestRunnerPachca < Minitest::Test
 
   # Naming the agent in the reply itself is the cheapest case: no reads at all.
   def test_naming_the_agent_in_the_reply_itself_summons_it
-    named = thread_event.tap { |e| e["payload"]["content"] = "Горыныч, а ты что думаешь?" }
+    named = thread_event.tap { |e| e["payload"]["content"] = "Помощник, а ты что думаешь?" }
     client = StubPachcaClient.new([[named]])
 
     assert_equal %w[01A], fetch(summon_gate(client)).map { |e| e["id"] }
@@ -492,7 +492,7 @@ class TestRunnerPachca < Minitest::Test
   # Once called in, always called in — the next reply costs no reads.
   def test_a_summoned_thread_is_remembered
     client = StubPachcaClient.new([[thread_event], [thread_event.merge("id" => "01B")]])
-    client.history = history_of([222, "Горыныч?"])
+    client.history = history_of([222, "Помощник?"])
     runner = summon_gate(client)
 
     fetch(runner)
@@ -802,7 +802,7 @@ class TestRunnerPachca < Minitest::Test
   # until the answer lands; Pachca renders a live timer for a reaction named
   # agent-thinking, which is the native version of that acknowledgement.
   def test_the_indicator_goes_on_before_the_run_and_off_after_it
-    client = StubPachcaClient.new([[event(id: "01A", content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", content: "Помощник?")]])
     runner = build_runner(client)
 
     runner.send(:iterate)
@@ -825,7 +825,7 @@ class TestRunnerPachca < Minitest::Test
   end
 
   def test_the_nickname_counts_as_naming_the_agent
-    client = StubPachcaClient.new([[event(id: "01A", content: "спроси @gorynych_bot")]])
+    client = StubPachcaClient.new([[event(id: "01A", content: "спроси @helper_bot")]])
 
     build_runner(client).send(:iterate)
 
@@ -856,8 +856,8 @@ class TestRunnerPachca < Minitest::Test
 
   # Asked once, not once per message.
   def test_the_name_is_resolved_once
-    events = [event(id: "01A", content: "Горыныч?")]
-    client = StubPachcaClient.new([events, [event(id: "01B", content: "Горыныч?")]])
+    events = [event(id: "01A", content: "Помощник?")]
+    client = StubPachcaClient.new([events, [event(id: "01B", content: "Помощник?")]])
     runner = build_runner(client)
 
     2.times { runner.send(:iterate) }
@@ -869,7 +869,7 @@ class TestRunnerPachca < Minitest::Test
   # as a custom emoji id and answer 404, even though colons are exactly the form
   # it returns for stock shortcodes.
   def test_a_custom_reaction_is_named_bare_in_both_fields
-    client = StubPachcaClient.new([[event(id: "01A", content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", content: "Помощник?")]])
     build_runner(client).send(:iterate)
 
     _, _, code, name = client.reactions.first
@@ -880,7 +880,7 @@ class TestRunnerPachca < Minitest::Test
   # A stock emoji is the glyph alone; the API fills the name in itself, and
   # sending one would be the same mistake in reverse.
   def test_a_stock_emoji_is_sent_as_the_glyph_without_a_name
-    client = StubPachcaClient.new([[event(id: "01A", content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", content: "Помощник?")]])
     runner = build_runner(client, trigger_overrides: { "thinking_reaction" => "👀" })
 
     runner.send(:iterate)
@@ -891,7 +891,7 @@ class TestRunnerPachca < Minitest::Test
   end
 
   def test_the_indicator_is_attached_to_the_message_not_the_event
-    client = StubPachcaClient.new([[event(id: "01A", message_id: 555, content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", message_id: 555, content: "Помощник?")]])
     build_runner(client).send(:iterate)
 
     assert_equal [555, 555], client.reactions.map { |r| r[1] }
@@ -900,7 +900,7 @@ class TestRunnerPachca < Minitest::Test
   # Below max_attempts the question is still being worked on, so the indicator
   # stays up across the retry rather than flickering.
   def test_a_retry_keeps_the_indicator_up_and_does_not_re_add_it
-    events = [event(id: "01A", message_id: 555, content: "Горыныч?")]
+    events = [event(id: "01A", message_id: 555, content: "Помощник?")]
     client = StubPachcaClient.new([events, events])
     runner = build_runner(client, reasons: %i[failed ok])
 
@@ -912,7 +912,7 @@ class TestRunnerPachca < Minitest::Test
   # Shutdown rolled the attempt back, so the question is unanswered — but the
   # timer must not sit there over a process that is gone.
   def test_a_killed_run_takes_the_indicator_down
-    client = StubPachcaClient.new([[event(id: "01A", message_id: 555, content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", message_id: 555, content: "Помощник?")]])
     runner = build_runner(client, reasons: [:killed])
 
     runner.send(:iterate)
@@ -924,8 +924,8 @@ class TestRunnerPachca < Minitest::Test
   # one warning is worth more than one per message forever — and the run must
   # not fail over a courtesy.
   def test_a_missing_reaction_disables_the_indicator_once_and_never_fails_a_run
-    events = [event(id: "01A", message_id: 555, content: "Горыныч?")]
-    client = StubPachcaClient.new([events, [event(id: "01B", message_id: 556, content: "Горыныч?")]])
+    events = [event(id: "01A", message_id: 555, content: "Помощник?")]
+    client = StubPachcaClient.new([events, [event(id: "01B", message_id: 556, content: "Помощник?")]])
     client.fail_reactions!
     runner = build_runner(client)
 
@@ -938,7 +938,7 @@ class TestRunnerPachca < Minitest::Test
   end
 
   def test_the_indicator_can_be_turned_off_in_config
-    client = StubPachcaClient.new([[event(id: "01A", message_id: 555, content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", message_id: 555, content: "Помощник?")]])
     runner = build_runner(client, trigger_overrides: { "thinking_reaction" => nil })
 
     runner.send(:iterate)
@@ -967,7 +967,7 @@ class TestRunnerPachca < Minitest::Test
   # message has an attachment, so finding out costs one GET per acted-on item.
   def test_an_attachment_is_downloaded_and_named_in_the_prompt
     File.write(@template_path, "вопрос: {{message}}\nфайлы:\n{{files}}")
-    client = StubPachcaClient.new([[event(id: "01A", content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", content: "Помощник?")]])
     client.root = message_with_files(plain_file)
     runner = build_runner(client, trigger_overrides: { "chats" => nil })
 
@@ -985,11 +985,11 @@ class TestRunnerPachca < Minitest::Test
   # A picture reaches the model only through the CLI flag: opened through the
   # shell it is bytes.
   def test_an_image_is_handed_to_the_backend_and_a_plain_file_is_not
-    client = StubPachcaClient.new([[event(id: "01A", content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", content: "Помощник?")]])
     client.root = message_with_files(image_file, plain_file)
     runner = build_runner(client, trigger_overrides: { "chats" => nil })
 
-    images = runner.send(:run_images, event(id: "01A", content: "Горыныч?"))
+    images = runner.send(:run_images, event(id: "01A", content: "Помощник?"))
 
     assert_equal 1, images.size
     assert_match(/screen\.png\z/, images.first)
@@ -998,7 +998,7 @@ class TestRunnerPachca < Minitest::Test
   # Downloading it twice would double the traffic for nothing: the summary is
   # built for the prompt, the list for the backend, from one fetch.
   def test_attachments_are_fetched_once_per_event
-    client = StubPachcaClient.new([[event(id: "01A", content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", content: "Помощник?")]])
     client.root = message_with_files(image_file)
     runner = build_runner(client, trigger_overrides: { "chats" => nil })
 
@@ -1011,7 +1011,7 @@ class TestRunnerPachca < Minitest::Test
   # An answer written without the screenshot is worse than one written with it,
   # and far better than none at all.
   def test_a_failed_download_does_not_sink_the_run
-    client = StubPachcaClient.new([[event(id: "01A", content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", content: "Помощник?")]])
     client.root = message_with_files(image_file)
     client.download_failure = "storage refused"
     runner = build_runner(client, trigger_overrides: { "chats" => nil })
@@ -1025,11 +1025,11 @@ class TestRunnerPachca < Minitest::Test
   # The name comes from whoever sent the message: it may decide the basename
   # and nothing above it.
   def test_a_traversing_filename_cannot_escape_the_attachment_directory
-    client = StubPachcaClient.new([[event(id: "01A", content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", content: "Помощник?")]])
     client.root = message_with_files(plain_file(name: "../../etc/passwd"))
     runner = build_runner(client, trigger_overrides: { "chats" => nil })
 
-    downloaded = runner.send(:attachments, event(id: "01A", content: "Горыныч?"))
+    downloaded = runner.send(:attachments, event(id: "01A", content: "Помощник?"))
 
     assert_equal 1, downloaded.size
     # Filed by message id: a thread has several, and names can collide.
@@ -1072,23 +1072,23 @@ class TestRunnerPachca < Minitest::Test
   # A picture is expensive where a line of text is not. What does not fit is
   # still named in the transcript, with its path.
   def test_images_are_capped_and_the_question_own_files_win
-    client = StubPachcaClient.new([[event(id: "01A", content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", content: "Помощник?")]])
     client.root = message_with_files(image_file(name: "a.png"), image_file(name: "b.png"),
                                      image_file(name: "c.png"))
     runner = build_runner(client, trigger_overrides: { "chats" => nil, "max_images" => 2 })
 
-    images = runner.send(:run_images, event(id: "01A", content: "Горыныч?"))
+    images = runner.send(:run_images, event(id: "01A", content: "Помощник?"))
 
     assert_equal 2, images.size
     assert_match(/c\.png\z/, images.last)
   end
 
   def test_attachments_can_be_turned_off
-    client = StubPachcaClient.new([[event(id: "01A", content: "Горыныч?")]])
+    client = StubPachcaClient.new([[event(id: "01A", content: "Помощник?")]])
     client.root = message_with_files(image_file)
     runner = build_runner(client, trigger_overrides: { "chats" => nil, "attachments" => false })
 
-    assert_empty runner.send(:attachments, event(id: "01A", content: "Горыныч?"))
+    assert_empty runner.send(:attachments, event(id: "01A", content: "Помощник?"))
     assert_nil client.message_gets
   end
 
